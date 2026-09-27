@@ -72,17 +72,22 @@ hardening:
   (malformed digits and overflow reject the entry, not the run).
   Alignment follows the real GNU/Linux layout — stream position after
   `110 + name + NUL` aligned to 4 — verified against a frozen fixture
-  from an independent implementation. `namesize` is sanity-capped before
-  any allocation; entry walking is bounded by both a hard internal cap
-  and `max_archive_entries`; the `TRAILER!!!` entry structurally anchors
-  the end so a hostile archive cannot spin the walker. Archive truncation
-  mid-entry ends the walk and fails validation rather than emitting
-  unchecked children.
+  from an independent implementation. `namesize` has its own sanity cap
+  (names are not file data) and a name without its NUL terminator
+  rejects the entry. Entry walking is bounded by a hard internal cap AND
+  `max_archive_entries` counted over entries **scanned** — oversized
+  entries that skip child creation cannot bypass the limit. The
+  `TRAILER!!!` entry structurally anchors the end so a hostile archive
+  cannot spin the walker. Archive truncation mid-entry ends the walk and
+  fails validation rather than emitting unchecked children.
 - **CPIO crc variant**: stored per-entry checksums cover every entry's
   data field — regular files AND symlinks (whose target is the data) —
-  verified before type dispatch. Mismatch marks the entry and downgrades
-  the archive to `Damaged`: corruption is reported, never silently
-  accepted, and a tampered symlink target cannot yield `Validated`.
+  verified before type dispatch, **regardless of `max_child_size`**
+  (oversized entries are checksummed streaming in bounded chunks;
+  `max_child_size` only decides child exposure, never checksum success).
+  Mismatch marks the entry and downgrades the archive to `Damaged`:
+  corruption is reported, never silently accepted, and a tampered
+  symlink target cannot yield `Validated`.
 - **Special entries are never materialized**: symlinks keep their target
   as metadata; device nodes, FIFOs, and sockets are recognized and carry
   `host_materialization: forbidden`. No host special file is ever created.

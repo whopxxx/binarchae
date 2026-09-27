@@ -54,11 +54,20 @@ pub fn data_sum(data: &[u8]) -> u64 {
 }
 
 pub fn validate_first(src: &ByteSource) -> ctf_tools::engine::HandlerOutput {
+    validate_first_with_limits(src, |_| {})
+}
+
+pub fn validate_first_with_limits(
+    src: &ByteSource,
+    tune: impl FnOnce(&mut EngineLimits),
+) -> ctf_tools::engine::HandlerOutput {
     let h = ctf_tools::handlers::cpio::CpioHandler;
     let cands = h.find_candidates(src);
     assert!(!cands.is_empty(), "cpio candidate must exist");
+    let mut limits = EngineLimits::default();
+    tune(&mut limits);
     let mut b = Budget::default();
-    h.validate(src, cands[0], &EngineLimits::default(), &mut b)
+    h.validate(src, cands[0], &limits, &mut b)
         .expect("archive must validate")
 }
 
@@ -394,6 +403,143 @@ fn cpio_crc_symlink_checksum_tamper_is_damaged() {
             .map(String::as_str),
         Some("/bin/busybOx")
     );
+}
+
+/// C1 regression: the entry cap counts SCANNED entries, not children
+/// produced — oversized entries (filesize > max_child_size) that skip
+/// child creation must not bypass max_archive_entries.
+#[test]
+fn cpio_entry_limit_not_bypassed_by_oversized_entries() {
+    // 3 regular files of 2 bytes each; child cap of 1 byte hides them,
+    // entry cap of 2 must stop the 3rd entry.
+    let a = entry("a", b"aa", 0o100644, 1, 0, "070701");
+    let b = entry("b", b"bb", 0o100644, 2, 0, "070701");
+    let c = entry("c", b"cc", 0o100644, 3, 0, "070701");
+    let arch: Vec<u8> = a
+        .into_iter()
+        .chain(b)
+        .chain(c)
+        .chain(trailer("070701"))
+        .collect();
+    let src = ByteSource::from_vec(arch);
+    let h = ctf_tools::handlers::cpio::CpioHandler;
+    let cands = h.find_candidates(&src);
+    assert!(!cands.is_empty());
+    let limits = EngineLimits {
+        max_child_size: 1,
+        max_archive_entries: 2,
+        ..EngineLimits::default()
+    };
+    let mut budget = Budget::default();
+    let res = h.validate(&src, cands[0], &limits, &mut budget);
+    let reason = match &res {
+        Err(ctf_tools::Error::Validation { reason, .. }) => Some(reason.clone()),
+        Ok(out) => {
+            // A validated archive must not carry more than 2 children.
+            assert!(
+                out.artifacts[0].children.len() <= 2,
+                "more children than the cap would be a bypass"
+            );
+            None
+        }
+        Err(_) => None,
+    };
+    if let Some(reason) = reason {
+        assert!(
+            reason.contains("entry limit"),
+            "3rd entry must hit the entry limit (got: {reason})"
+        );
+    } else {
+        panic!("archive with 3 entries must exceed max_archive_entries=2");
+    }
+}
+
+/// C2 regression: a crc-variant entry larger than max_child_size must
+/// still get its checksum verified — skipping the check must not leave
+/// the archive Validated.
+#[test]
+fn cpio_oversized_crc_entry_checksum_still_verified() {
+    let data = b"0123456789abcdef"; // 16 bytes > max_child_size=8
+                                    // Deliberately WRONG stored checksum.
+    let bad: Vec<u8> = entry("big.bin", data, 0o100644, 1, 0xdeadbeef, "070702")
+        .into_iter()
+        .chain(trailer("070702"))
+        .collect();
+    let src = ByteSource::from_vec(bad);
+    let out = validate_first_with_limits(&src, |l| l.max_child_size = 8);
+    let art = &out.artifacts[0];
+    assert_ne!(
+        art.confidence,
+        Confidence::Validated,
+        "oversized entry with wrong checksum must not validate"
+    );
+    assert_eq!(art.confidence, Confidence::Damaged);
+    assert!(
+        art.metadata
+            .get("checksum_failures")
+            .is_some_and(|f| f.contains("big.bin")),
+        "failure must be attributed to the oversized entry"
+    );
+}
+
+/// C2 positive control: same oversized entry, CORRECT checksum, still
+/// oversized (child skipped) but the archive validates cleanly.
+#[test]
+fn cpio_oversized_crc_entry_correct_checksum_validates() {
+    let data = b"0123456789abcdef"; // 16 bytes > max_child_size=8
+    let sum: u64 = data.iter().map(|&b| b as u64).sum();
+    let good: Vec<u8> = entry("big.bin", data, 0o100644, 1, sum, "070702")
+        .into_iter()
+        .chain(trailer("070702"))
+        .collect();
+    let src = ByteSource::from_vec(good);
+    let out = validate_first_with_limits(&src, |l| l.max_child_size = 8);
+    let art = &out.artifacts[0];
+    assert_eq!(art.confidence, Confidence::Validated);
+    // Child is skipped (oversized), checksum still verified.
+    assert!(art.children.is_empty());
+}
+
+/// Hardening regression: a name buffer with no NUL terminator is
+/// malformed and must reject, not be silently accepted as a name.
+#[test]
+fn cpio_name_without_nul_rejected() {
+    let mut arch: Vec<u8> = Vec::new();
+    arch.extend_from_slice(b"070701");
+    // namesize = 3 ("ab" without NUL would be 2; declare 3 but put no 0).
+    for v in [1u64, 0o100644, 0, 0, 1, 0, 1, 0, 0, 0, 0, 3, 0] {
+        arch.extend_from_slice(hexf(v).as_bytes());
+    }
+    arch.extend_from_slice(b"abX"); // namesize bytes, NO NUL
+    arch.extend_from_slice(b"d"); // 1 data byte, no padding needed
+    arch.extend_from_slice(&trailer("070701"));
+    let src = ByteSource::from_vec(arch);
+    let h = ctf_tools::handlers::cpio::CpioHandler;
+    let cands = h.find_candidates(&src);
+    // The candidate AT the malformed entry (offset 0) must reject. (A
+    // candidate at the trailer offset can still legitimately parse a
+    // 0-entry archive; that is region decomposition's business, not
+    // this entry's.)
+    let first = cands
+        .iter()
+        .find(|c| c.offset == 0)
+        .expect("candidate at 0");
+    let res = h.validate(
+        &src,
+        *first,
+        &EngineLimits::default(),
+        &mut Budget::default(),
+    );
+    let err = res.expect_err("missing NUL in name must reject the entry");
+    match err {
+        ctf_tools::Error::Validation { reason, .. } => {
+            assert!(
+                reason.contains("NUL"),
+                "rejection must cite the NUL check: {reason}"
+            );
+        }
+        other => panic!("expected Validation error, got: {other:?}"),
+    }
 }
 
 /// B1 regression: registering a source-backed child must NOT copy its

@@ -102,8 +102,12 @@ impl Handler for CpioHandler {
             let _rdevmajor = field(9)?;
 
             // Name area: starts after the header, includes the NUL,
-            // padded to 4 bytes.
-            if namesize == 0 || namesize > limits.max_child_size {
+            // padded to 4 bytes. Capped by its OWN sanity bound (a name
+            // is not file data; tying it to max_child_size misfires —
+            // C2 test: max_child_size=8 rejects "big.bin\0"). Also
+            // bounded by the source length below.
+            const MAX_NAME: u64 = 4096;
+            if namesize == 0 || namesize > MAX_NAME {
                 return Err(Error::Validation {
                     format: "cpio",
                     reason: format!("implausible namesize {namesize}"),
@@ -120,11 +124,15 @@ impl Handler for CpioHandler {
             }
             let mut name_buf = vec![0u8; namesize as usize];
             src.read_at(name_start, &mut name_buf)?;
-            // The name excludes the trailing NUL.
-            let name_len = name_buf
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(name_buf.len());
+            // The name INCLUDES its terminating NUL per the format; a
+            // buffer with no NUL is a malformed entry, not a name.
+            // (Hardening: previously a missing NUL was silently accepted.)
+            let Some(name_len) = name_buf.iter().position(|&b| b == 0) else {
+                return Err(Error::Validation {
+                    format: "cpio",
+                    reason: format!("entry {entries_scanned}: name is missing its NUL terminator"),
+                });
+            };
             let name = String::from_utf8_lossy(&name_buf[..name_len]).into_owned();
 
             // B2: the name area is `110 + namesize` bytes of stream, then
@@ -154,7 +162,9 @@ impl Handler for CpioHandler {
             }
 
             entries_scanned += 1;
-            if entries_scanned > MAX_ENTRIES || children.len() >= limits.max_archive_entries {
+            // C1: cap on entries SCANNED, not children produced — oversized
+            // entries that skip child creation must not bypass the limit.
+            if entries_scanned > MAX_ENTRIES || entries_scanned > limits.max_archive_entries {
                 return Err(Error::Validation {
                     format: "cpio",
                     reason: format!("entry limit exceeded ({entries_scanned} entries)"),
@@ -196,14 +206,27 @@ impl Handler for CpioHandler {
             meta.insert("mtime".to_string(), mtime.to_string());
             meta.insert("entry_type".to_string(), type_name.to_string());
 
-            // B3: in the crc variant the `check` field covers the entry's
-            // DATA FIELD — the 32-bit byte sum — and that includes
-            // symlinks (whose target bytes ARE the data field). Verify
-            // here, before the type switch, so a tampered symlink target
-            // cannot yield a Validated archive.
+            // B3 + C2: in the crc variant the `check` field covers the
+            // entry's DATA FIELD — the 32-bit byte sum — and that includes
+            // symlinks (whose target bytes ARE the data field). Verify for
+            // EVERY entry regardless of max_child_size: `max_child_size`
+            // only decides whether a child artifact is exposed, it can
+            // never stand in for checksum success. The sum is computed
+            // streaming over a bounded slice (no unbounded allocation).
             if is_crc {
                 if filesize > limits.max_child_size {
-                    meta.insert("skipped".to_string(), "exceeds max child size".to_string());
+                    // Sum the oversized data field in bounded chunks.
+                    let sum = sum_bytes_streaming(src, data_start, filesize)?;
+                    if u64::from(sum) != check {
+                        checksum_failures
+                            .push(format!("{name}: stored {check:#x}, computed {sum:#x}"));
+                        meta.insert("cpio_checksum".to_string(), "mismatch".to_string());
+                    } else {
+                        meta.insert(
+                            "cpio_checksum".to_string(),
+                            "valid (oversized, not exposed)".to_string(),
+                        );
+                    }
                 } else {
                     let content = src.slice(data_start, filesize)?;
                     let sum = sum_bytes(&content)?;
@@ -426,12 +449,19 @@ fn pad4(v: u64) -> u64 {
 
 /// Sum of all bytes mod 2^32 (the CPIO `crc` variant checksum).
 fn sum_bytes(content: &ByteSource) -> Result<u32> {
+    sum_bytes_streaming(content, 0, content.len())
+}
+
+/// Streaming byte-sum over `len` bytes of `src` starting at `offset` —
+/// bounded memory regardless of `len` (C2: oversized entries still get
+/// their checksum verified).
+fn sum_bytes_streaming(src: &ByteSource, offset: u64, len: u64) -> Result<u32> {
     let mut sum: u32 = 0;
     let mut chunk = [0u8; 64 * 1024];
     let mut off = 0u64;
-    while off < content.len() {
-        let n = (content.len() - off).min(chunk.len() as u64) as usize;
-        content.read_at(off, &mut chunk[..n])?;
+    while off < len {
+        let n = (len - off).min(chunk.len() as u64) as usize;
+        src.read_at(offset + off, &mut chunk[..n])?;
         for &b in &chunk[..n] {
             sum = sum.wrapping_add(u32::from(b));
         }
