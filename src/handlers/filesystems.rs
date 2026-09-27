@@ -79,7 +79,7 @@ impl Handler for SquashfsHandler {
         &self,
         src: &ByteSource,
         candidate: Candidate,
-        limits: &crate::engine::EngineLimits,
+        _limits: &crate::engine::EngineLimits,
         _budget: &mut Budget,
     ) -> Result<HandlerOutput> {
         let base = candidate.offset;
