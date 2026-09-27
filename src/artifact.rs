@@ -205,9 +205,14 @@ impl ArtifactGraph {
             .collect()
     }
 
-    /// True if an artifact with identical content hash already exists.
+    /// True if a non-root artifact with identical content hash already
+    /// exists. The root stub is excluded: an artifact spanning exactly
+    /// the root region (e.g. a gzip over the whole file) legitimately
+    /// shares the root's hash without being a duplicate of it.
     pub fn has_hash(&self, hash: &str) -> bool {
-        self.artifacts.iter().any(|a| a.hash == hash)
+        self.artifacts
+            .iter()
+            .any(|a| a.parent.is_some() && a.hash == hash)
     }
 }
 

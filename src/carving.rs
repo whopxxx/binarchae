@@ -176,7 +176,6 @@ pub fn carve_with_rules(
             if !budget.charge(limits, len as u64) {
                 break;
             }
-            let bytes = data[start..end].to_vec();
             drafts.push(ArtifactDraft {
                 format: rule.name.clone(),
                 label: format!("carved {} ({} bytes)", rule.name, len),
@@ -198,7 +197,6 @@ pub fn carve_with_rules(
                 metadata: BTreeMap::new(),
                 warnings: vec!["recovered by generic carving".to_string()],
                 errors: Vec::new(),
-                inline_bytes: Some(bytes),
                 children: Vec::new(),
             });
         }

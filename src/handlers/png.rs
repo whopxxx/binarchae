@@ -122,7 +122,6 @@ impl Handler for PngHandler {
         }
         metadata.insert("chunk_types".to_string(), chunks.join(","));
 
-        let bytes = src.slice(base, size)?.read_all()?;
         Ok(HandlerOutput {
             artifacts: vec![ArtifactDraft {
                 format: "png".to_string(),
@@ -140,7 +139,6 @@ impl Handler for PngHandler {
                 metadata,
                 warnings: Vec::new(),
                 errors: Vec::new(),
-                inline_bytes: Some(bytes),
                 children: Vec::new(),
             }],
         })

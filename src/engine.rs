@@ -47,15 +47,21 @@ impl Default for EngineLimits {
     }
 }
 
-/// Mutable budget shared across the whole run.
-#[derive(Debug, Default, Clone)]
+/// Run-wide byte budget shared by the whole analysis. Handlers charge it
+/// *during* decompression (per chunk), never after the fact; it is passed
+/// by `&mut` and never cloned, so every charge is visible run-wide.
+#[derive(Debug, Default)]
 pub struct Budget {
     pub expanded_bytes: u64,
 }
 
 impl Budget {
+    /// Charge `n` expanded bytes. Fails (without partial accounting)
+    /// when the run-wide limit would be exceeded.
     pub(crate) fn charge(&mut self, limits: &EngineLimits, n: u64) -> bool {
-        let next = self.expanded_bytes.saturating_add(n);
+        let Some(next) = self.expanded_bytes.checked_add(n) else {
+            return false;
+        };
         if next > limits.max_total_expanded_bytes {
             return false;
         }
@@ -84,9 +90,6 @@ pub struct ArtifactDraft {
     pub metadata: BTreeMap<String, String>,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
-    /// Bytes of the artifact body available for recursion/extraction,
-    /// when the handler already has them in memory.
-    pub inline_bytes: Option<Vec<u8>>,
     /// Child artifacts decompressed/extracted by this handler.
     pub children: Vec<ChildDraft>,
 }
@@ -122,6 +125,9 @@ pub trait Handler: Send + Sync {
     /// Structural validation + boundary determination for one candidate.
     /// Returns Err on validation failure (false positive candidate) —
     /// the engine records this and moves on without aborting.
+    ///
+    /// Implementations must charge `budget` incrementally while expanding
+    /// attacker-controlled data, so bombs are cut off mid-stream.
     fn validate(
         &self,
         src: &ByteSource,
@@ -148,11 +154,13 @@ pub fn builtin_handlers() -> Vec<Box<dyn Handler>> {
 pub struct RecursiveEngine {
     pub limits: EngineLimits,
     pub handlers: Vec<Box<dyn Handler>>,
+    /// Extra user-defined carving rules (CLI --carving-rules).
+    pub carving_rules: Vec<crate::carving::CarveRule>,
     /// Content hashes already recursively processed (dedup). Multiple
     /// logical artifacts may share bytes; recursive work happens once.
     processed_hashes: std::collections::HashSet<String>,
-    /// In-memory bytes for artifacts produced/decoded this run, keyed by
-    /// content hash. Powers extraction without re-parsing.
+    /// In-memory bytes for handler-produced children, keyed by content
+    /// hash. Powers extraction without re-parsing.
     pub byte_cache: std::collections::HashMap<String, Vec<u8>>,
 }
 
@@ -161,6 +169,7 @@ impl RecursiveEngine {
         RecursiveEngine {
             limits,
             handlers: builtin_handlers(),
+            carving_rules: Vec::new(),
             processed_hashes: std::collections::HashSet::new(),
             byte_cache: std::collections::HashMap::new(),
         }
@@ -172,17 +181,22 @@ impl RecursiveEngine {
     }
 
     /// Analyze a root source and return the full artifact graph.
-    pub fn analyze(&mut self, src: &ByteSource) -> ArtifactGraph {
+    ///
+    /// With `recurse = false` only the top-level region is scanned;
+    /// children and trailing/leading regions are registered but not
+    /// recursively analyzed. This is the CLI default (`-r` enables
+    /// recursion).
+    pub fn analyze(&mut self, src: &ByteSource, recurse: bool) -> ArtifactGraph {
         let mut graph = ArtifactGraph::new();
         let mut budget = Budget::default();
         let root_id = self.register_root_stub(&mut graph, src);
-        self.scan_region(src, root_id, 0, &mut graph, &mut budget);
+        self.scan_region(src, root_id, 0, recurse, &mut graph, &mut budget);
         graph
     }
 
     fn register_root_stub(&mut self, graph: &mut ArtifactGraph, src: &ByteSource) -> ArtifactId {
-        let bytes = src.read_prefix(64 * 1024).unwrap_or_default();
-        let hash = content_hash(&bytes);
+        // B2: content identity covers the WHOLE source, streamed.
+        let hash = src.hash_all();
         let artifact = Artifact {
             id: 0,
             parent: None,
@@ -213,12 +227,12 @@ impl RecursiveEngine {
         src: &ByteSource,
         parent_id: ArtifactId,
         depth: u32,
+        recurse: bool,
         graph: &mut ArtifactGraph,
         budget: &mut Budget,
     ) {
         if depth > self.limits.max_depth {
-            let p = graph.get_mut(parent_id);
-            if let Some(p) = p {
+            if let Some(p) = graph.get_mut(parent_id) {
                 p.warnings.push(format!(
                     "recursion depth limit {} reached; region not scanned",
                     self.limits.max_depth
@@ -231,27 +245,21 @@ impl RecursiveEngine {
         }
 
         // Collect drafts from every handler; handler errors are isolated.
-        let mut drafts: Vec<(RelationKind, ArtifactDraft)> = Vec::new();
+        // The budget is passed by &mut: charges from every handler and
+        // every candidate accumulate into the SAME run-wide budget.
+        let mut drafts: Vec<ArtifactDraft> = Vec::new();
         for handler in &self.handlers {
             for candidate in handler.find_candidates(src) {
-                let mut local_budget = budget.clone();
-                match handler.validate(src, candidate, &self.limits, &mut local_budget) {
+                match handler.validate(src, candidate, &self.limits, budget) {
                     Ok(output) => {
-                        for mut draft in output.artifacts {
-                            if let Some(bytes) = &draft.inline_bytes {
-                                if !budget_charge_ok(budget, &self.limits, bytes.len() as u64) {
-                                    draft
-                                        .warnings
-                                        .push("max-total-expanded-bytes limit hit".to_string());
-                                    continue;
-                                }
-                            }
-                            drafts.push((RelationKind::Contains, draft));
+                        for draft in output.artifacts {
+                            drafts.push(draft);
                         }
                     }
                     Err(e) => {
-                        // Candidate was a false positive / malformed. Record
-                        // nothing; unrelated scanning continues.
+                        // Candidate was a false positive / malformed / hit
+                        // a limit. Record nothing; unrelated scanning
+                        // continues.
                         let _ = e;
                     }
                 }
@@ -261,28 +269,67 @@ impl RecursiveEngine {
         // Generic carving fallback only when structural handlers found
         // nothing in this region.
         if drafts.is_empty() {
-            if let Ok(extra) = crate::carving::carve_region(src, &self.limits, budget) {
+            let mut rules = crate::carving::builtin_rules();
+            rules.extend(self.carving_rules.iter().cloned());
+            if let Ok(extra) = crate::carving::carve_with_rules(src, &self.limits, budget, &rules) {
                 for draft in extra {
-                    drafts.push((RelationKind::CarvedFrom, draft));
+                    drafts.push(draft);
                 }
             }
         }
 
-        // Register artifacts + recurse into children.
-        for (relation, draft) in drafts {
+        // Register artifacts + recurse. Region decomposition model:
+        //   [0, first.offset)               -> LeadingData of parent
+        //   first structure (+ overlaps)    -> Contains of parent
+        //   [first.end, len)                -> TrailingData of first
+        // Drafts beyond the first structure's end are NOT registered at
+        // this level — they are rediscovered inside the trailing region,
+        // which keeps provenance hierarchical (PNG -> trailing -> ZIP).
+        drafts.sort_by_key(|d| (d.offset, u64::MAX - d.size));
+
+        // Leading data before the first structure.
+        if let Some(first) = drafts.first() {
+            if recurse && first.offset > 0 && depth < self.limits.max_depth {
+                self.register_unexplained(
+                    src,
+                    parent_id,
+                    0,
+                    first.offset,
+                    RelationKind::LeadingData,
+                    depth,
+                    recurse,
+                    graph,
+                    budget,
+                );
+            }
+        }
+
+        let mut first_end: Option<u64> = None;
+
+        for draft in drafts {
             if graph.len() >= self.limits.max_artifacts {
                 break;
             }
-            let hash = content_hash(draft.inline_bytes.as_deref().unwrap_or(&[]));
-            // Cache the bytes for extraction.
-            if let Some(bytes) = &draft.inline_bytes {
-                self.byte_cache.insert(hash.clone(), bytes.clone());
+            // Only drafts overlapping the FIRST structure's extent belong
+            // to this level; later ones live in the trailing region.
+            if let Some(end) = first_end {
+                if draft.offset >= end {
+                    break;
+                }
             }
-            let duplicate = graph.has_hash(&hash);
+
+            // B2: content identity = hash of the artifact's actual source
+            // region (streamed, zero-copy via shared backing).
+            let region = src.slice(draft.offset, draft.size);
+            let hash = match &region {
+                Ok(r) => r.hash_all(),
+                Err(_) => content_hash(&[]),
+            };
+            let duplicate = graph.has_hash(&hash) || self.processed_hashes.contains(&hash);
             let mut artifact = Artifact {
                 id: 0,
                 parent: Some(parent_id),
-                relation: Some(relation),
+                relation: Some(RelationKind::Contains),
                 format: draft.format,
                 label: draft.label,
                 offset: draft.offset,
@@ -290,7 +337,7 @@ impl RecursiveEngine {
                 hash,
                 confidence: draft.confidence,
                 evidence: draft.evidence,
-                extraction: if draft.inline_bytes.is_some() || !draft.children.is_empty() {
+                extraction: if !draft.children.is_empty() {
                     ExtractionStatus::InMemory
                 } else {
                     ExtractionStatus::NotExtracted
@@ -304,36 +351,32 @@ impl RecursiveEngine {
                     "duplicate content; recursion skipped (provenance preserved)".to_string(),
                 );
             }
-            let child_id = graph.push_child(parent_id, relation, artifact);
+            let child_id = graph.push_child(parent_id, RelationKind::Contains, artifact);
 
-            if duplicate
-                || self
-                    .processed_hashes
-                    .contains(&graph.get(child_id).unwrap().hash)
-            {
+            let end = draft.offset + draft.size;
+            first_end = Some(match first_end {
+                Some(e) => e.max(end),
+                None => end,
+            });
+
+            if duplicate {
                 continue;
             }
-            self.processed_hashes
-                .insert(graph.get(child_id).unwrap().hash.clone());
+            self.processed_hashes.insert(
+                graph
+                    .get(child_id)
+                    .map(|a| a.hash.clone())
+                    .unwrap_or_default(),
+            );
 
-            // Recurse into inline artifact bytes.
-            if let Some(bytes) = draft.inline_bytes {
-                if let Ok(region) = src.slice(draft.offset, draft.size) {
-                    let _ = region; // region scan uses inline bytes when present
-                }
-                if let Ok(child_src) = ByteSource::from_vec(bytes).into_child_of(src) {
-                    self.scan_region(&child_src, child_id, depth + 1, graph, budget);
-                }
-            }
             // Register + recurse into handler-produced children.
             for child in draft.children {
                 if graph.len() >= self.limits.max_artifacts {
                     break;
                 }
                 let chash = content_hash(&child.bytes);
-                // Cache the child bytes for extraction.
                 self.byte_cache.insert(chash.clone(), child.bytes.clone());
-                let cdup = graph.has_hash(&chash);
+                let cdup = graph.has_hash(&chash) || self.processed_hashes.contains(&chash);
                 let mut ca = Artifact {
                     id: 0,
                     parent: Some(child_id),
@@ -355,24 +398,98 @@ impl RecursiveEngine {
                         .push("duplicate content; recursion skipped".to_string());
                 }
                 let cid = graph.push_child(child_id, child.relation, ca);
-                if !cdup && depth < self.limits.max_depth {
+                if recurse && !cdup && depth < self.limits.max_depth {
                     let region = ByteSource::from_vec(child.bytes);
-                    self.scan_region(&region, cid, depth + 2, graph, budget);
+                    self.scan_region(&region, cid, depth + 1, recurse, graph, budget);
+                }
+            }
+
+            // Recurse into the artifact's own source region (finds
+            // structures inside structurally-claimed regions). Gated on
+            // `recurse` like every other recursion.
+            if recurse && depth < self.limits.max_depth {
+                if let Ok(r) = region {
+                    self.scan_region(&r, child_id, depth + 1, recurse, graph, budget);
+                }
+            }
+        }
+
+        // Trailing data after the first structure's extent: first-class
+        // artifact under that structure, recursively scanned so that
+        // appended ZIPs etc. become ITS descendants.
+        if recurse && depth < self.limits.max_depth {
+            if let Some(end) = first_end {
+                if end < src.len() {
+                    self.register_unexplained(
+                        src,
+                        parent_id,
+                        end,
+                        src.len(),
+                        RelationKind::TrailingData,
+                        depth,
+                        recurse,
+                        graph,
+                        budget,
+                    );
                 }
             }
         }
     }
-}
 
-fn budget_charge_ok(budget: &mut Budget, limits: &EngineLimits, n: u64) -> bool {
-    budget.charge(limits, n)
-}
-
-impl ByteSource {
-    /// Marker helper so the engine can construct region sources inline;
-    /// the child relationship is handled through `slice` in production
-    /// paths. This keeps recursion simple for in-memory children.
-    fn into_child_of(self, _parent: &ByteSource) -> std::result::Result<ByteSource, ()> {
-        Ok(self)
+    /// Register an unexplained region (leading/trailing data) as a
+    /// first-class artifact and recursively scan it. The child artifacts
+    /// found inside (e.g. an appended ZIP) become descendants of the
+    /// trailing/leading node, preserving provenance.
+    #[allow(clippy::too_many_arguments)]
+    fn register_unexplained(
+        &mut self,
+        src: &ByteSource,
+        parent_id: ArtifactId,
+        start: u64,
+        end: u64,
+        relation: RelationKind,
+        depth: u32,
+        recurse: bool,
+        graph: &mut ArtifactGraph,
+        budget: &mut Budget,
+    ) {
+        if end <= start || graph.len() >= self.limits.max_artifacts {
+            return;
+        }
+        let Ok(region) = src.slice(start, end - start) else {
+            return;
+        };
+        let hash = region.hash_all();
+        let artifact = Artifact {
+            id: 0,
+            parent: Some(parent_id),
+            relation: Some(relation),
+            format: "raw".to_string(),
+            label: format!(
+                "{} region ({} bytes @{})",
+                match relation {
+                    RelationKind::TrailingData => "trailing data",
+                    RelationKind::LeadingData => "leading data",
+                    _ => "unexplained",
+                },
+                end - start,
+                start
+            ),
+            offset: start,
+            size: end - start,
+            hash,
+            confidence: Confidence::Heuristic,
+            evidence: Evidence::facts([
+                "unexplained bytes outside validated structures".to_string()
+            ]),
+            extraction: ExtractionStatus::NotExtracted,
+            metadata: BTreeMap::new(),
+            warnings: Vec::new(),
+            errors: Vec::new(),
+        };
+        let id = graph.push_child(parent_id, relation, artifact);
+        if depth < self.limits.max_depth {
+            self.scan_region(&region, id, depth + 1, recurse, graph, budget);
+        }
     }
 }

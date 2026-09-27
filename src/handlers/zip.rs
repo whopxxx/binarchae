@@ -1,15 +1,25 @@
 //! ZIP handler: native inspection and extraction via the `zip` crate,
 //! behind this project-owned abstraction. Encrypted archives are
 //! recognized distinctly. Safe-path rules are enforced at extraction.
+//!
+//! Boundary logic (B7): the archive end is anchored on the End of
+//! Central Directory record (EOCD) — the last valid `PK\x05\x06` whose
+//! comment length is consistent with the bytes that follow. The
+//! artifact spans from the first signature to the EOCD end, so appended
+//! data after the ZIP stays discoverable as trailing data.
 
-use crate::artifact::{Confidence, Evidence};
+use crate::artifact::{Confidence, Evidence, RelationKind};
 use crate::bytesource::ByteSource;
 use crate::engine::{ArtifactDraft, Budget, Candidate, ChildDraft, Handler, HandlerOutput};
 use crate::error::{Error, Result};
 use crate::handlers::find_all;
 use std::collections::BTreeMap;
+use std::io::Read;
 
 pub struct ZipHandler;
+
+const EOCD_MIN: usize = 22; // EOCD record minimum size
+const EOCD_SIG: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
 
 impl Handler for ZipHandler {
     fn format(&self) -> &'static str {
@@ -32,10 +42,8 @@ impl Handler for ZipHandler {
         src: &ByteSource,
         candidate: Candidate,
         limits: &crate::engine::EngineLimits,
-        _budget: &mut Budget,
+        budget: &mut Budget,
     ) -> Result<HandlerOutput> {
-        // Read the whole candidate region (from signature to source end);
-        // the zip crate needs seeking, so materialize bounded bytes.
         if src.len() > limits.max_child_size {
             return Err(Error::Validation {
                 format: "zip",
@@ -44,13 +52,24 @@ impl Handler for ZipHandler {
         }
         let data = src.read_all()?;
         let rel = candidate.offset as usize;
-        if rel >= data.len() {
+        if rel + 4 > data.len() {
             return Err(Error::Validation {
                 format: "zip",
                 reason: "candidate out of range".into(),
             });
         }
-        let cursor = std::io::Cursor::new(&data[rel..]);
+
+        // B7: find the EOCD that terminates this archive.
+        let archive_end = find_eocd_end(&data, rel)?;
+        if archive_end <= rel {
+            return Err(Error::Validation {
+                format: "zip",
+                reason: "EOCD precedes candidate".into(),
+            });
+        }
+
+        // Parse via the zip crate on exactly the archive bytes.
+        let cursor = std::io::Cursor::new(&data[rel..archive_end]);
         let mut archive = zip::ZipArchive::new(cursor).map_err(|e| Error::Validation {
             format: "zip",
             reason: format!("central directory invalid: {e}"),
@@ -64,10 +83,16 @@ impl Handler for ZipHandler {
             });
         }
 
+        // B1: entries are decoded incrementally; each output chunk is
+        // charged against the run-wide budget and bounded by the ratio
+        // cap BEFORE the buffer grows further, so bombs are cut off
+        // mid-stream instead of after a full unbounded allocation.
         let mut children: Vec<ChildDraft> = Vec::new();
         let mut names: Vec<String> = Vec::new();
         let mut encrypted = false;
         let mut warnings: Vec<String> = Vec::new();
+        let mut total_expanded: u64 = 0;
+        let compressed_hint = (archive_end - rel) as u64;
 
         for i in 0..entry_count {
             let mut entry = archive.by_index(i).map_err(|e| Error::Validation {
@@ -79,24 +104,51 @@ impl Handler for ZipHandler {
 
             if entry.encrypted() {
                 encrypted = true;
-                // Do not attempt to decrypt; record the entry distinctly.
                 warnings.push(format!("entry {raw_name:?} is encrypted"));
                 continue;
             }
 
+            // Ratio cap per entry based on archive size so far.
+            let entry_cap = limits.max_child_size.min(
+                limits
+                    .max_expansion_ratio
+                    .saturating_mul(compressed_hint.max(1)),
+            );
             let mut buf = Vec::new();
-            if std::io::copy(&mut entry, &mut buf).is_err() {
-                warnings.push(format!("entry {raw_name:?} failed to decompress"));
-                continue;
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                match entry.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total_expanded += n as u64;
+                        if total_expanded > entry_cap {
+                            return Err(Error::LimitExceeded {
+                                limit: "compression-expansion-ratio/child-size",
+                                detail: format!(
+                                    "zip entries exceeded {entry_cap} bytes (archive {compressed_hint})"
+                                ),
+                            });
+                        }
+                        if !budget.charge(limits, n as u64) {
+                            return Err(Error::LimitExceeded {
+                                limit: "max-total-expanded-bytes",
+                                detail: format!("zip entry {raw_name:?} +{n}"),
+                            });
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        warnings.push(format!("entry {raw_name:?} failed to decompress: {e}"));
+                        break;
+                    }
+                }
             }
-            if buf.len() as u64 > limits.max_child_size {
-                warnings.push(format!(
-                    "entry {raw_name:?} exceeds max child size; skipped"
-                ));
+            if buf.is_empty() {
                 continue;
             }
             children.push(ChildDraft {
-                relation: crate::artifact::RelationKind::Contains,
+                relation: RelationKind::Contains,
                 label: format!("zip entry {raw_name}"),
                 format_hint: "raw",
                 bytes: buf,
@@ -113,10 +165,8 @@ impl Handler for ZipHandler {
             metadata.insert("entry_names".to_string(), names.join("\n"));
         }
 
-        // Boundary: archive ends at the end of the central directory +
-        // comment. The zip crate consumed everything we gave it from the
-        // first signature; use the region end as the structural boundary.
-        let size = src.len() - candidate.offset;
+        // B7: exact boundary — from the first signature to the EOCD end.
+        let size = (archive_end - rel) as u64;
 
         Ok(HandlerOutput {
             artifacts: vec![ArtifactDraft {
@@ -128,13 +178,48 @@ impl Handler for ZipHandler {
                 evidence: Evidence::facts([
                     "central directory parsed".to_string(),
                     format!("{entry_count} entries read"),
+                    "EOCD-anchored boundary".to_string(),
                 ]),
                 metadata,
                 warnings,
                 errors: Vec::new(),
-                inline_bytes: None,
                 children,
             }],
         })
     }
+}
+
+/// Find the archive end: scan backwards for the last EOCD signature whose
+/// comment length is consistent with the bytes that follow it. The EOCD
+/// ends at `sig + 22 + comment_len`; anything after that is not part of
+/// this archive.
+fn find_eocd_end(data: &[u8], from: usize) -> Result<usize> {
+    if data.len() < EOCD_MIN {
+        return Err(Error::Validation {
+            format: "zip",
+            reason: "region too short for EOCD".into(),
+        });
+    }
+    // Walk backwards over EOCD candidates; the LAST well-formed one wins
+    // (an EOCD buried inside a comment is shadowed by the real one).
+    let mut i = data.len() - EOCD_MIN;
+    loop {
+        if i >= from && data[i..i + 4] == EOCD_SIG {
+            let comment_len = u16::from_le_bytes([data[i + 20], data[i + 21]]) as usize;
+            let eocd_end = i + EOCD_MIN + comment_len;
+            if eocd_end <= data.len() {
+                return Ok(eocd_end);
+            }
+            // comment_len overruns the region: stale signature inside
+            // appended data; keep scanning backwards.
+        }
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+    }
+    Err(Error::Validation {
+        format: "zip",
+        reason: "no well-formed EOCD found".into(),
+    })
 }

@@ -91,7 +91,6 @@ impl Handler for PdfHandler {
             metadata.insert("eof_offset".to_string(), e.to_string());
         }
 
-        let bytes = src.slice(base, size)?.read_all()?;
         Ok(HandlerOutput {
             artifacts: vec![ArtifactDraft {
                 format: "pdf".to_string(),
@@ -107,7 +106,6 @@ impl Handler for PdfHandler {
                     Vec::new()
                 },
                 errors: Vec::new(),
-                inline_bytes: Some(bytes),
                 children: Vec::new(),
             }],
         })

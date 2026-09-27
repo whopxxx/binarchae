@@ -77,7 +77,24 @@ fn run(cli: &Cli) -> i32 {
     };
 
     let mut engine = RecursiveEngine::new(limits);
-    let graph = engine.analyze(&src);
+    // B5: --carving-rules is real — TOML is loaded and fed to the engine.
+    if let Some(rules_path) = &cli.carving_rules {
+        match std::fs::read_to_string(rules_path) {
+            Ok(text) => match ctf_tools::carving::parse_user_rules(&text) {
+                Ok(rules) => engine.carving_rules = rules,
+                Err(e) => {
+                    eprintln!("error: invalid carving rules {}: {e}", rules_path.display());
+                    return 2;
+                }
+            },
+            Err(e) => {
+                eprintln!("error: cannot read {}: {e}", rules_path.display());
+                return 2;
+            }
+        }
+    }
+    // B5: recursion only with -r/--recurse. Default = top-level scan.
+    let graph = engine.analyze(&src, cli.recurse);
     let byte_cache = engine.byte_cache.clone();
 
     let mut report = Report::new(

@@ -132,7 +132,6 @@ impl Handler for TarHandler {
                 metadata,
                 warnings,
                 errors: Vec::new(),
-                inline_bytes: None,
                 children,
             }],
         })

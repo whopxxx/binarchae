@@ -45,6 +45,45 @@ fn make_png() -> Vec<u8> {
     png
 }
 
+/// A structurally valid PNG with a large pseudorandom IDAT. Deflate must
+/// use huffman coding on it, so the PNG signature does NOT survive as a
+/// literal byte run inside gzip/deflate streams — nested-discovery tests
+/// then genuinely depend on recursion, not on byte luck.
+fn make_png_large() -> Vec<u8> {
+    fn chunk(ctype: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(ctype);
+        out.extend_from_slice(data);
+        let mut crc_input = ctype.to_vec();
+        crc_input.extend_from_slice(data);
+        out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+        out
+    }
+    // xorshift32: deterministic, high entropy, no external crates.
+    let mut state: u32 = 0x1234_5678;
+    let mut idat = Vec::with_capacity(8 * 1024);
+    for _ in 0..8 * 1024 {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        idat.push((state >> 24) as u8);
+    }
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&256u32.to_be_bytes()); // width
+    ihdr.extend_from_slice(&8u32.to_be_bytes()); // height
+    ihdr.push(8);
+    ihdr.push(0);
+    ihdr.push(0);
+    ihdr.push(0);
+    ihdr.push(0);
+    png.extend_from_slice(&chunk(b"IHDR", &ihdr));
+    png.extend_from_slice(&chunk(b"IDAT", &idat));
+    png.extend_from_slice(&chunk(b"IEND", &[]));
+    png
+}
+
 /// Minimal ZIP containing one stored (uncompressed) file.
 fn make_zip(name: &str, content: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -123,8 +162,8 @@ fn make_xz(content: &[u8]) -> Vec<u8> {
 /// LZMA2Reader. This keeps the fixture deterministic and tool-free.
 fn xz_container(content: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    // Stream header: magic + flags(00 04 = CRC32 check) + CRC32(flags).
-    out.extend_from_slice(&[0xfd, b'7', b'z', b'X', b'Z', 0x00, 0x00, 0x04]);
+    // Stream header: magic + flags(00 01 = CRC32 check) + CRC32(flags).
+    out.extend_from_slice(&[0xfd, b'7', b'z', b'X', b'Z', 0x00, 0x00, 0x01]);
     out.extend_from_slice(&crc32(&out[6..8]).to_le_bytes());
 
     // Block header: size byte (0x08 => 8*4=32 bytes), flags 0x00 (1 filter,
@@ -167,16 +206,17 @@ fn xz_container(content: &[u8]) -> Vec<u8> {
     index.extend_from_slice(&icrc.to_le_bytes());
     out.extend_from_slice(&index);
 
-    // Footer: CRC32(index), flags (00 04), backward size, magic.
+    // Stream Footer per spec (B4): CRC32(4) over the following 8 bytes,
+    // stream flags (CRC32 check, must match header), backward size (index size/4 - 1),
+    // footer magic "YZ".
     let backward_size = ((index.len() as u32 / 4) - 1).to_le_bytes();
     let mut fbody = Vec::new();
-    fbody.extend_from_slice(&0x00u32.to_le_bytes()); // placeholder CRC
-    fbody.extend_from_slice(&[0x00, 0x04]);
+    fbody.extend_from_slice(&[0x00, 0x01]); // stream flags (CRC32 check), match header
     fbody.extend_from_slice(&backward_size);
+    fbody.extend_from_slice(&[0x59, 0x5a]); // "YZ" footer magic
     let fcrc = crc32(&fbody);
     out.extend_from_slice(&fcrc.to_le_bytes());
-    out.extend_from_slice(&fbody[4..]);
-    out.extend_from_slice(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]);
+    out.extend_from_slice(&fbody);
     out
 }
 
@@ -236,7 +276,7 @@ fn png_boundary_detection() {
     data.extend_from_slice(b"TRAILING-JUNK-AFTER-IEND");
     let src = ByteSource::from_vec(data);
     let mut e = engine();
-    let g = e.analyze(&src);
+    let g = e.analyze(&src, true);
     let png_art = g
         .artifacts
         .iter()
@@ -247,6 +287,8 @@ fn png_boundary_detection() {
 }
 
 /// (2) PNG with trailing ZIP discovered from the trailing-data child.
+/// B8/B3 regression: requires a REAL TrailingData edge in the graph with
+/// the ZIP as its descendant — not merely "zip offset > png size".
 #[test]
 fn png_trailing_zip_discovered() {
     let png = make_png();
@@ -255,21 +297,47 @@ fn png_trailing_zip_discovered() {
     data.extend_from_slice(&zip);
     let src = ByteSource::from_vec(data);
     let mut e = engine();
-    let g = e.analyze(&src);
+    let g = e.analyze(&src, true);
     let png_art = g.artifacts.iter().find(|a| a.format == "png").unwrap();
-    // The engine should recurse into the region after IEND and find ZIP.
+
+    // The graph must contain a trailing-data artifact immediately after
+    // the validated PNG boundary.
+    let trailing: Vec<_> = g
+        .artifacts
+        .iter()
+        .filter(|a| a.relation == Some(RelationKind::TrailingData))
+        .collect();
+    assert!(
+        !trailing.is_empty(),
+        "graph must contain a TrailingData artifact"
+    );
+    let t = trailing[0];
+    assert_eq!(t.offset, png_art.size, "trailing region starts at IEND");
+    assert_eq!(
+        t.size,
+        zip.len() as u64,
+        "trailing region spans exactly the appended ZIP"
+    );
+
+    // The ZIP must be a DESCENDANT of the trailing-data node (provenance),
+    // not a sibling of the PNG.
+    let zip_in_trailing = g.children(t.id).iter().any(|(_, a)| a.format == "zip");
+    assert!(
+        zip_in_trailing,
+        "zip must be a child of the trailing-data artifact"
+    );
     let zip_art = g
         .artifacts
         .iter()
-        .filter(|a| a.format == "zip")
-        .find(|a| a.offset >= png_art.size)
-        .expect("zip found in trailing region");
-    assert!(zip_art.confidence == Confidence::Validated);
-    // And the zip entry should surface as a child artifact.
-    assert!(g
-        .artifacts
-        .iter()
-        .any(|a| a.label.contains("flag.txt") || a.label.contains("decompressed")));
+        .find(|a| a.format == "zip")
+        .expect("zip found");
+    assert_eq!(zip_art.confidence, Confidence::Validated);
+    // ZIP boundary must be exact: it must not swallow anything beyond EOCD.
+    assert_eq!(
+        zip_art.size,
+        zip.len() as u64,
+        "zip size must equal the actual archive, not region-to-end"
+    );
 }
 
 /// (3) ZIP extraction with normal nested paths.
@@ -280,7 +348,7 @@ fn zip_nested_path_entries() {
     data.extend_from_slice(&zip);
     let src = ByteSource::from_vec(data);
     let mut e = engine();
-    let g = e.analyze(&src);
+    let g = e.analyze(&src, true);
     let zip_art = g
         .artifacts
         .iter()
@@ -316,7 +384,7 @@ fn gzip_child_recursive() {
     let gz = make_gzip(&inner);
     let src = ByteSource::from_vec(gz);
     let mut e = engine();
-    let g = e.analyze(&src);
+    let g = e.analyze(&src, true);
     let gz_art = g.artifacts.iter().find(|a| a.format == "gzip").unwrap();
     let children = g.children(gz_art.id);
     assert!(
@@ -339,7 +407,7 @@ fn xz_child_recursive() {
     let xz = make_xz(&inner);
     let src = ByteSource::from_vec(xz);
     let mut e = engine();
-    let g = e.analyze(&src);
+    let g = e.analyze(&src, true);
     let xz_art = g
         .artifacts
         .iter()
@@ -358,7 +426,7 @@ fn tar_child_extraction() {
     let tar = make_tar(&[("dir/", b""), ("dir/hello.txt", b"hello tar")]);
     let src = ByteSource::from_vec(tar);
     let mut e = engine();
-    let g = e.analyze(&src);
+    let g = e.analyze(&src, true);
     let tar_art = g
         .artifacts
         .iter()
@@ -370,74 +438,240 @@ fn tar_child_extraction() {
 }
 
 /// (8) Duplicate-content dedup without losing parent provenance.
+/// B8/B2 regression: hashes must be of the ACTUAL gzip regions (not the
+/// empty-bytes hash all region-backed artifacts used to share), and the
+/// duplicates must still register with distinct provenance.
 #[test]
 fn dedup_preserves_provenance() {
-    let inner = make_png();
+    let inner = make_png_large();
     let gz1 = make_gzip(&inner);
     let gz2 = make_gzip(&inner);
-    let mut data = gz1;
+    let mut data = gz1.clone();
     data.extend_from_slice(&gz2);
     let src = ByteSource::from_vec(data);
     let mut e = engine();
-    let g = e.analyze(&src);
-    // Two gzip artifacts (distinct offsets) — both registered.
-    let gzs: Vec<_> = g.artifacts.iter().filter(|a| a.format == "gzip").collect();
-    assert_eq!(gzs.len(), 2, "both gzip streams registered");
-    // Both share identical content hash (identical payloads).
+    let g = e.analyze(&src, true);
+    // The two top-level gzip streams: the root-level one and the one
+    // inside the trailing-data region. Both are registered even though
+    // their bytes are identical.
+    let root_gz = g
+        .artifacts
+        .iter()
+        .find(|a| a.format == "gzip" && a.parent == Some(0))
+        .expect("root-level gzip registered");
+    let trailing = g
+        .artifacts
+        .iter()
+        .find(|a| a.relation == Some(RelationKind::TrailingData))
+        .expect("trailing-data region exists");
+    let trailing_gz = g
+        .children(trailing.id)
+        .into_iter()
+        .find(|(_, a)| a.format == "gzip")
+        .map(|(_, a)| a)
+        .expect("trailing-region gzip registered");
+    let gzs = [root_gz, trailing_gz];
+    // B2: identical content → identical hash, and that hash must equal
+    // the hash of the real gzip bytes (not the empty-bytes hash).
+    let expected = ByteSource::from_vec(gz1.clone()).hash_all();
+    assert_eq!(gzs[0].hash, expected, "hash must cover the actual region");
     assert_eq!(gzs[0].hash, gzs[1].hash);
-    // But each retains its own parent/provenance.
-    assert_ne!(gzs[0].offset, gzs[1].offset);
-    // Identical decompressed children: recursion performed once but both
-    // logical artifacts exist.
-    let children: Vec<_> = g
+    assert_ne!(
+        gzs[0].hash,
+        blake3::Hasher::new().finalize().to_hex().to_string(),
+        "region-backed artifact must not hash to BLAKE3(empty)"
+    );
+    // Distinct provenance preserved: identical bytes, but each node
+    // hangs off a DIFFERENT parent (root region vs trailing region).
+    assert_ne!(
+        gzs[0].parent, gzs[1].parent,
+        "duplicate content must retain per-occurrence provenance"
+    );
+    assert_ne!(
+        gzs[0].id, gzs[1].id,
+        "duplicates are separate logical artifacts"
+    );
+    // A DIFFERENT-format region-backed artifact must hash differently
+    // (the old bug collapsed every archive to the same empty hash).
+    let png_art = g.artifacts.iter().find(|a| a.format == "png");
+    if let Some(p) = png_art {
+        assert_ne!(
+            gzs[0].hash, p.hash,
+            "different regions must not share a hash"
+        );
+    }
+}
+
+/// (8b) Non-recursing analyze registers artifacts but skips recursion
+/// (B5 regression: default CLI mode vs -r are genuinely different).
+/// Nested content is wrapped in gzip (deflate destroys byte structure),
+/// so the inner PNG is only reachable by decompressing.
+#[test]
+fn no_recurse_mode_differs_from_recurse() {
+    let inner = make_png_large();
+    let gz = make_gzip(&inner);
+    let mut outer_bytes = b"prefix bytes before the archive".to_vec();
+    outer_bytes.extend_from_slice(&gz);
+    let src = ByteSource::from_vec(outer_bytes);
+    let mut e1 = engine();
+    let shallow = e1.analyze(&src, false);
+    let mut e2 = engine();
+    let deep = e2.analyze(&src, true);
+
+    // Shallow: gzip found, decompressed child registered, but the PNG
+    // inside the decompressed payload is NOT analyzed further.
+    let gz_art = shallow
+        .artifacts
+        .iter()
+        .find(|a| a.format == "gzip")
+        .expect("gzip found");
+    assert!(!shallow.children(gz_art.id).is_empty());
+    let png_below = shallow
         .edges
         .iter()
-        .filter(|e| e.relation == RelationKind::DecompressedFrom)
-        .collect();
-    assert!(!children.is_empty());
+        .filter(|e| e.parent == gz_art.id)
+        .filter_map(|e| shallow.get(e.child))
+        .any(|a| a.format == "png");
+    assert!(
+        !png_below,
+        "shallow mode must not analyze inside decompressed payloads"
+    );
+    // Deep: PNG found under the gzip's decompressed child.
+    let deep_gz = deep
+        .artifacts
+        .iter()
+        .find(|a| a.format == "gzip")
+        .expect("gzip found in deep mode");
+    let png_in_deep = deep
+        .edges
+        .iter()
+        .filter(|e| e.parent == deep_gz.id)
+        .filter_map(|e| deep.get(e.child))
+        .any(|a| a.format == "png");
+    assert!(
+        png_in_deep,
+        "recursive mode must analyze the decompressed payload"
+    );
 }
 
-/// (9) Recursion-depth limit.
+/// (9) Recursion-depth limit. B8 regression: honest assertions. The
+/// depth limit's contract: at max_depth the engine registers an
+/// artifact's direct children but scans NOTHING beyond them, and it
+/// records a depth warning on the artifact whose region went unscanned.
+/// (Direct signature-scan hits at shallow offsets are legal at any depth
+/// — the depth contract is about region *descendants*, which we verify
+/// by comparing graph sizes: a deeper limit must produce a strictly
+/// larger or equal graph, and the depth-limited graph must carry the
+/// depth warning.)
 #[test]
 fn depth_limit_enforced() {
-    let limits = EngineLimits {
-        max_depth: 1,
+    let inner = make_png_large();
+    let gz = make_gzip(&inner);
+    let src = ByteSource::from_vec(gz);
+
+    // Depth 0: root gzip found and its direct handler-children are
+    // registered, but NOTHING is scanned beyond them — the decompressed
+    // payload must have no descendants of its own.
+    let limits0 = EngineLimits {
+        max_depth: 0,
         ..EngineLimits::default()
     };
-    // gzip(gzip(gzip(...))) — deep chain would exceed depth 1.
-    let payload = make_gzip(b"flag{deep}");
-    let src = ByteSource::from_vec(payload);
-    let mut e = RecursiveEngine::new(limits);
-    let g = e.analyze(&src);
-    // The root gzip is analyzed, but its child is not recursively scanned.
-    let gz = g.artifacts.iter().find(|a| a.format == "gzip").unwrap();
-    for (r, child) in g.children(gz.id) {
-        let _ = r;
-        let _ = child;
+    let mut e0 = RecursiveEngine::new(limits0);
+    let g0 = e0.analyze(&src, true);
+    let gz0 = g0
+        .artifacts
+        .iter()
+        .find(|a| a.format == "gzip")
+        .expect("gzip found even at depth 0");
+    let gz0_children = g0.children(gz0.id);
+    assert!(
+        gz0_children
+            .iter()
+            .any(|(r, _)| *r == RelationKind::DecompressedFrom),
+        "handler-produced children are registered regardless of depth"
+    );
+    for (_, child) in &gz0_children {
+        assert!(
+            g0.children(child.id).is_empty(),
+            "depth 0 must leave the decompressed payload unanalyzed"
+        );
     }
-    // The warning about depth should be on the parent.
-    assert!(gz.warnings.is_empty() || true); // depth warnings recorded
-    assert!(g.len() >= 2);
+
+    // Generous depth: decompressed child + its analyzed payload exist.
+    let mut e2 = engine();
+    let g2 = e2.analyze(&src, true);
+    let gz2 = g2
+        .artifacts
+        .iter()
+        .find(|a| a.format == "gzip")
+        .expect("gzip found");
+    assert!(
+        !g2.children(gz2.id).is_empty(),
+        "default depth must analyze the decompressed payload"
+    );
+    assert!(
+        g2.len() > g0.len(),
+        "unrestricted graph must be strictly larger than the depth-0 graph"
+    );
 }
 
-/// (10) Max-expanded-bytes / compression-ratio limit.
+/// (10) Max-expanded-bytes / compression-ratio limit. B8 regression: the
+/// limit must actually refuse the expansion — the gzip artifact either
+/// fails validation entirely (no artifact) or carries an explicit
+/// limit warning, AND in no case does the decompressed child appear.
 #[test]
 fn expansion_limit_enforced() {
-    let big = vec![0u8; 1_000_000]; // highly compressible
+    let big = vec![0u8; 1_000_000]; // highly compressible: ~1000x ratio
     let gz = make_gzip(&big);
     let limits = EngineLimits {
         max_child_size: 10_000,
+        max_expansion_ratio: 10, // 10x cap: bomb is 1000x
         ..EngineLimits::default()
     };
     let src = ByteSource::from_vec(gz);
     let mut e = RecursiveEngine::new(limits);
-    let g = e.analyze(&src);
-    // Gzip must be recognized, but the expansion must be refused.
-    let gz_art = g.artifacts.iter().find(|a| a.format == "gzip");
+    let g = e.analyze(&src, true);
+
+    // In no acceptable outcome does a 1,000,000-byte child get through.
+    let huge_child = g.artifacts.iter().any(|a| a.size >= 1_000_000);
     assert!(
-        gz_art.is_none()
-            || g.children(gz_art.unwrap().id).is_empty()
-            || gz_art.unwrap().warnings.iter().any(|w| w.contains("limit"))
+        !huge_child,
+        "decompressed payload above the cap must never be registered"
+    );
+    // The gzip artifact was either rejected (limit error) or flagged.
+    if let Some(gz_art) = g.artifacts.iter().find(|a| a.format == "gzip") {
+        assert!(
+            gz_art.warnings.iter().any(|w| w.contains("limit")) || g.children(gz_art.id).is_empty(),
+            "accepted gzip must carry a limit warning or have no children"
+        );
+    }
+}
+
+/// (10b) Run-wide budget: charges accumulate ACROSS handlers/artifacts.
+/// Two large gzip streams must jointly exceed a budget that either alone
+/// would fit (B1 regression).
+#[test]
+fn budget_is_run_wide() {
+    let big1 = vec![0xAAu8; 60_000];
+    let big2 = vec![0xBBu8; 60_000];
+    let mut data = make_gzip(&big1);
+    data.extend_from_slice(&make_gzip(&big2));
+    let limits = EngineLimits {
+        max_total_expanded_bytes: 100_000, // each stream fits; both don't
+        ..EngineLimits::default()
+    };
+    let src = ByteSource::from_vec(data);
+    let mut e = RecursiveEngine::new(limits);
+    let g = e.analyze(&src, true);
+    let total_children: u64 = g
+        .artifacts
+        .iter()
+        .filter(|a| a.relation == Some(RelationKind::DecompressedFrom))
+        .map(|a| a.size)
+        .sum();
+    assert!(
+        total_children < 120_000,
+        "run-wide budget must cap combined expansion (got {total_children})"
     );
 }
 
@@ -450,7 +684,7 @@ fn malformed_candidate_isolated() {
     data.extend_from_slice(&make_zip("real.txt", b"real"));
     let src = ByteSource::from_vec(data);
     let mut e = engine();
-    let g = e.analyze(&src);
+    let g = e.analyze(&src, true);
     assert!(
         g.artifacts.iter().any(|a| a.format == "zip"),
         "zip must still be found despite malformed png candidate"
@@ -468,7 +702,7 @@ fn overlapping_artifacts_coexist() {
     data.extend_from_slice(&zip);
     let src = ByteSource::from_vec(data);
     let mut e = engine();
-    let g = e.analyze(&src);
+    let g = e.analyze(&src, true);
     // Both the PDF and the ZIP are reported (even if boundaries differ).
     assert!(g.artifacts.iter().any(|a| a.format == "pdf"));
     assert!(g.artifacts.iter().any(|a| a.format == "zip"));
@@ -480,7 +714,7 @@ fn json_round_trip() {
     let gz = make_gzip(make_png().as_slice());
     let src = ByteSource::from_vec(gz);
     let mut e = engine();
-    let graph = e.analyze(&src);
+    let graph = e.analyze(&src, true);
     let report = ctf_tools::report::Report::new("fixture.gz", src.len(), graph);
     let json = report.to_json_pretty().unwrap();
     let back = ctf_tools::report::Report::from_json(&json).unwrap();
@@ -515,17 +749,19 @@ terminate_on_next_header = false
 }
 
 /// End-to-end: PNG -> trailing data -> ZIP -> member -> child artifact.
+/// B8 regression: asserts the full provenance chain through graph edges.
 #[test]
 fn e2e_png_trailing_zip_member() {
     let png = make_png();
     let member = make_gzip(b"flag{e2e-nested}");
     let zip = make_zip("deep/flag.gz", &member);
-    let mut data = png;
+    let mut data = png.clone();
     data.extend_from_slice(b"--extra junk--");
     data.extend_from_slice(&zip);
+    let total_len = data.len() as u64;
     let src = ByteSource::from_vec(data);
     let mut e = engine();
-    let g = e.analyze(&src);
+    let g = e.analyze(&src, true);
 
     // Validated PNG at offset 0.
     let png_art = g
@@ -534,20 +770,32 @@ fn e2e_png_trailing_zip_member() {
         .find(|a| a.format == "png" && a.offset == 0)
         .expect("validated png");
     assert_eq!(png_art.confidence, Confidence::Validated);
+    assert_eq!(png_art.size, png.len() as u64);
 
-    // ZIP discovered after the PNG boundary.
-    let zip_art = g
+    // Trailing-data artifact spans junk + ZIP, parented to the PNG.
+    let trailing = g
         .artifacts
         .iter()
-        .find(|a| a.format == "zip")
-        .expect("zip after trailing");
-    assert!(zip_art.offset >= png_art.size);
+        .find(|a| a.relation == Some(RelationKind::TrailingData))
+        .expect("trailing data artifact");
+    assert_eq!(trailing.offset, png_art.size);
+    assert_eq!(trailing.size, total_len - png.len() as u64);
 
-    // Recursive: some artifact mentions the member content chain.
-    assert!(
-        g.len() >= 3,
-        "nested chain should produce multiple artifacts"
-    );
+    // ZIP is a descendant of trailing data (edge check, not offset guess).
+    let zip_id = g
+        .children(trailing.id)
+        .iter()
+        .find(|(_, a)| a.format == "zip")
+        .map(|(_, a)| a.id)
+        .expect("zip under trailing data");
+
+    // The gzip member is reachable two levels below the zip.
+    let zip_children = g.children(zip_id);
+    let has_member = zip_children
+        .iter()
+        .any(|(_, a)| a.label.contains("flag.gz"));
+    assert!(has_member, "zip member must appear under the zip node");
+    assert!(g.len() >= 4, "full chain produces >= 4 artifacts");
 }
 
 /// Extraction status/registration sanity across the vertical slice.
@@ -556,7 +804,7 @@ fn extraction_status_records() {
     let gz = make_gzip(make_png().as_slice());
     let src = ByteSource::from_vec(gz);
     let mut e = engine();
-    let g = e.analyze(&src);
+    let g = e.analyze(&src, true);
     let gz_art = g.artifacts.iter().find(|a| a.format == "gzip").unwrap();
     assert_eq!(gz_art.extraction, ExtractionStatus::InMemory);
 }

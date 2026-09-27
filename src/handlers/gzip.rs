@@ -1,5 +1,12 @@
 //! gzip handler: structural detection + native decompression with
 //! resource limits (expansion ratio, child size).
+//!
+//! Boundary logic (B7): the header layout is parsed explicitly
+//! (FEXTRA/FNAME/FCOMMENT variable fields), then the deflate stream is
+//! decoded with an exact consumed-byte count, and the 8-byte trailer
+//! (CRC32 + ISIZE) is verified against the decompressed output. The
+//! artifact boundary is therefore `header_end + deflate_bytes + 8`,
+//! which supports trailing data after the gzip member.
 
 use crate::artifact::{Confidence, Evidence, RelationKind};
 use crate::bytesource::ByteSource;
@@ -10,41 +17,6 @@ use std::collections::BTreeMap;
 use std::io::Read;
 
 pub struct GzipHandler;
-
-/// Tracks how many compressed bytes the decoder consumed.
-struct CountingReader<'a> {
-    inner: &'a [u8],
-    read: usize,
-}
-
-impl<'a> CountingReader<'a> {
-    fn new(inner: &'a [u8]) -> Self {
-        CountingReader { inner, read: 0 }
-    }
-    fn count(&self) -> usize {
-        self.read
-    }
-}
-
-impl<'a> Read for CountingReader<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.get(self.read..).map_or(0, |rest| {
-            let n = n_min(rest.len(), buf.len());
-            buf[..n].copy_from_slice(&rest[..n]);
-            n
-        });
-        self.read += n;
-        Ok(n)
-    }
-}
-
-fn n_min(a: usize, b: usize) -> usize {
-    if a < b {
-        a
-    } else {
-        b
-    }
-}
 
 impl Handler for GzipHandler {
     fn format(&self) -> &'static str {
@@ -82,24 +54,68 @@ impl Handler for GzipHandler {
             });
         }
         let flags = hdr[3];
-        let reserved = flags & 0xE0;
-        if reserved != 0 {
+        if flags & 0xE0 != 0 {
             return Err(Error::Validation {
                 format: "gzip",
                 reason: "reserved flag bits set".into(),
             });
         }
+        if flags & 0x02 != 0 {
+            // FHCRC would need its own verification; treat as unsupported
+            // rather than silently mis-parsing the layout.
+            return Err(Error::Validation {
+                format: "gzip",
+                reason: "FHCRC members not supported".into(),
+            });
+        }
 
-        let payload = src.slice(base, src.len() - base)?;
-        let data = payload.read_all()?;
-        let mut counting = CountingReader::new(&data[..]);
-        let mut decoder = flate2::read::MultiGzDecoder::new(&mut counting);
+        // Walk the optional header fields in order (RFC 1952 §2.3.1).
+        let mut off = base + 10u64;
+        if flags & 0x04 != 0 {
+            // FEXTRA: 2-byte XLEN + XLEN bytes.
+            if off + 2 > src.len() {
+                return Err(Error::Validation {
+                    format: "gzip",
+                    reason: "FEXTRA truncated".into(),
+                });
+            }
+            let mut xb = [0u8; 2];
+            src.read_at(off, &mut xb)?;
+            let xlen = u16::from_le_bytes(xb) as u64;
+            off += 2 + xlen;
+        }
+        if flags & 0x08 != 0 {
+            // FNAME: zero-terminated.
+            off = skip_cstring(src, off)?;
+        }
+        if flags & 0x10 != 0 {
+            // FCOMMENT: zero-terminated.
+            off = skip_cstring(src, off)?;
+        }
+        if off > src.len() {
+            return Err(Error::Validation {
+                format: "gzip",
+                reason: "optional header fields truncated".into(),
+            });
+        }
+        let header_end = off;
 
-        // Decompress with a hard cap so bombs fail fast.
+        // Decode the deflate stream with exact consumed-byte accounting.
+        let compressed_len = src.len() - header_end;
         let cap = limits
             .max_child_size
-            .min(limits.max_expansion_ratio.saturating_mul(data.len() as u64))
+            .min(
+                limits
+                    .max_expansion_ratio
+                    .saturating_mul(compressed_len.max(1)),
+            )
             .min(u64::from(u32::MAX - 1));
+
+        let deflate_region = src.slice(header_end, compressed_len)?;
+        let deflate_data = deflate_region.read_all()?;
+        let mut counting = CountingReader::new(&deflate_data);
+        let mut decoder = flate2::read::DeflateDecoder::new(&mut counting);
+
         let mut out = Vec::new();
         let mut chunk = [0u8; 64 * 1024];
         loop {
@@ -110,8 +126,7 @@ impl Handler for GzipHandler {
                         return Err(Error::LimitExceeded {
                             limit: "compression-expansion-ratio/child-size",
                             detail: format!(
-                                "gzip output exceeded {cap} bytes (compressed {})",
-                                data.len()
+                                "gzip output exceeded {cap} bytes (compressed {compressed_len})"
                             ),
                         });
                     }
@@ -125,10 +140,15 @@ impl Handler for GzipHandler {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
-                    return Err(Error::Decompression(format!("gzip stream: {e}")));
+                    return Err(Error::Decompression(format!("deflate stream: {e}")));
                 }
             }
         }
+        // total_in() counts only the bytes the deflate stream actually
+        // consumed (the reader's read count includes read-ahead over the
+        // trailer, which would corrupt boundary math).
+        let deflate_consumed = decoder.total_in() as usize;
+        drop(decoder);
         if out.is_empty() {
             return Err(Error::Validation {
                 format: "gzip",
@@ -136,23 +156,49 @@ impl Handler for GzipHandler {
             });
         }
 
-        // Trailer: ISIZE = uncompressed size mod 2^32.
-        let consumed = counting.count();
-        let isize_off = base as usize + consumed + 4;
-        let mut metadata = BTreeMap::new();
-        metadata.insert("uncompressed_size".to_string(), out.len().to_string());
-        if isize_off + 4 <= data.len() {
-            let isize_val = u32::from_le_bytes([
-                data[isize_off],
-                data[isize_off + 1],
-                data[isize_off + 2],
-                data[isize_off + 3],
-            ]);
-            metadata.insert("isize_field".to_string(), isize_val.to_string());
+        // Trailer: CRC32(4) + ISIZE(4), verified against the output.
+        let trailer_start = header_end + deflate_consumed as u64;
+        if trailer_start + 8 > src.len() {
+            return Err(Error::Validation {
+                format: "gzip",
+                reason: "trailer truncated".into(),
+            });
+        }
+        let mut trailer = [0u8; 8];
+        src.read_at(trailer_start, &mut trailer)?;
+        let stored_crc = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+        let stored_isize = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
+        let mut h = crc32fast::Hasher::new();
+        h.update(&out);
+        let actual_crc = h.finalize();
+        if stored_crc != actual_crc {
+            return Err(Error::Validation {
+                format: "gzip",
+                reason: format!(
+                    "trailer CRC32 mismatch: stored {stored_crc:#x}, got {actual_crc:#x}"
+                ),
+            });
+        }
+        if stored_isize != (out.len() as u32) {
+            return Err(Error::Validation {
+                format: "gzip",
+                reason: format!(
+                    "ISIZE mismatch: stored {stored_isize}, actual {}",
+                    out.len() as u32
+                ),
+            });
         }
 
-        // Boundary: header + consumed deflate data + 8-byte trailer.
-        let size = (consumed + 18) as u64;
+        let mut metadata = BTreeMap::new();
+        metadata.insert("uncompressed_size".to_string(), out.len().to_string());
+        metadata.insert("isize_field".to_string(), stored_isize.to_string());
+        if flags & 0x08 != 0 {
+            metadata.insert("has_name_field".to_string(), "true".to_string());
+        }
+
+        // B7: exact boundary = header_end + deflate + 8-byte trailer.
+        // Bytes after this belong to the parent region's trailing data.
+        let size = trailer_start + 8 - base;
 
         Ok(HandlerOutput {
             artifacts: vec![ArtifactDraft {
@@ -162,13 +208,13 @@ impl Handler for GzipHandler {
                 size,
                 confidence: Confidence::Validated,
                 evidence: Evidence::facts([
-                    "gzip header + flags valid".to_string(),
-                    "deflate stream + CRC32/ISIZE trailer consumed".to_string(),
+                    "gzip header + optional fields walked".to_string(),
+                    "deflate stream consumed exactly".to_string(),
+                    "trailer CRC32 + ISIZE verified".to_string(),
                 ]),
                 metadata,
                 warnings: Vec::new(),
                 errors: Vec::new(),
-                inline_bytes: None,
                 children: vec![ChildDraft {
                     relation: RelationKind::DecompressedFrom,
                     label: format!("decompressed payload ({} bytes)", out.len()),
@@ -180,5 +226,51 @@ impl Handler for GzipHandler {
                 }],
             }],
         })
+    }
+}
+
+/// Skip a NUL-terminated string starting at `off`. Returns the offset
+/// just past the terminator.
+fn skip_cstring(src: &ByteSource, mut off: u64) -> Result<u64> {
+    loop {
+        if off >= src.len() {
+            return Err(Error::Validation {
+                format: "gzip",
+                reason: "unterminated string in header".into(),
+            });
+        }
+        let mut b = [0u8; 1];
+        src.read_at(off, &mut b)?;
+        off += 1;
+        if b[0] == 0 {
+            return Ok(off);
+        }
+    }
+}
+
+/// Tracks how many compressed bytes the decoder consumed.
+struct CountingReader<'a> {
+    inner: &'a [u8],
+    read: usize,
+}
+
+impl<'a> CountingReader<'a> {
+    fn new(inner: &'a [u8]) -> Self {
+        CountingReader { inner, read: 0 }
+    }
+}
+
+impl Read for CountingReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = match self.inner.get(self.read..) {
+            Some(rest) => {
+                let n = rest.len().min(buf.len());
+                buf[..n].copy_from_slice(&rest[..n]);
+                n
+            }
+            None => 0,
+        };
+        self.read += n;
+        Ok(n)
     }
 }

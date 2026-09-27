@@ -137,7 +137,6 @@ impl Handler for JpegHandler {
             metadata.insert("height".to_string(), h.to_string());
         }
 
-        let bytes = src.slice(base, size)?.read_all()?;
         Ok(HandlerOutput {
             artifacts: vec![ArtifactDraft {
                 format: "jpeg".to_string(),
@@ -163,7 +162,6 @@ impl Handler for JpegHandler {
                 metadata,
                 warnings: Vec::new(),
                 errors: Vec::new(),
-                inline_bytes: Some(bytes),
                 children: Vec::new(),
             }],
         })

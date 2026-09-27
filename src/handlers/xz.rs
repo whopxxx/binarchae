@@ -1,7 +1,15 @@
 //! XZ handler: structural detection + native decompression with
 //! resource limits. The XZ container walk (stream header, block
-//! headers, LZMA2 filter chaining, CRC32 checks) is project-owned;
-//! only the raw LZMA2 decoder comes from `lzma-rust`.
+//! headers, index, stream footer) is project-owned per the XZ format
+//! spec; only the raw LZMA2 decoder comes from `lzma-rust`.
+//!
+//! Stream layout per the spec (https://tukaani.org/xz/xz-file-format.txt):
+//!   Stream Header: magic(6) + stream flags(2) + CRC32(4)   = 12 bytes
+//!   Blocks / Index: index = 0x00 + records + padding + CRC32
+//!   Stream Footer:  CRC32(4) + stream flags(2) + backward size(4)
+//!                   + footer magic "YZ"(2)                  = 12 bytes
+//! The stream ends at the footer's `YZ` magic, and the footer's stream
+//! flags must match the header's.
 
 use crate::artifact::{Confidence, Evidence, RelationKind};
 use crate::bytesource::ByteSource;
@@ -14,7 +22,10 @@ use std::io::Read;
 
 pub struct XzHandler;
 
-const STREAM_HEADER: [u8; 6] = [0xfd, b'7', b'z', b'X', b'Z', 0x00];
+/// Stream Header magic (first 6 bytes of a stream).
+pub const STREAM_HEADER_MAGIC: [u8; 6] = [0xfd, b'7', b'z', b'X', b'Z', 0x00];
+/// Stream Footer magic (last 2 bytes of a stream): "YZ".
+pub const STREAM_FOOTER_MAGIC: [u8; 2] = [0x59, 0x5a];
 
 impl Handler for XzHandler {
     fn format(&self) -> &'static str {
@@ -22,7 +33,7 @@ impl Handler for XzHandler {
     }
 
     fn find_candidates(&self, src: &ByteSource) -> Vec<Candidate> {
-        find_all(src, &STREAM_HEADER)
+        find_all(src, &STREAM_HEADER_MAGIC)
             .into_iter()
             .map(|offset| Candidate { offset })
             .collect()
@@ -36,8 +47,7 @@ impl Handler for XzHandler {
         budget: &mut Budget,
     ) -> Result<HandlerOutput> {
         let base = candidate.offset;
-        // Minimal XZ stream: 12-byte header + at least one block +
-        // 12-byte index + 12-byte footer.
+        // Minimal XZ stream: 12-byte header + block + index + 12-byte footer.
         if base + 36 > src.len() {
             return Err(Error::Validation {
                 format: "xz",
@@ -47,21 +57,34 @@ impl Handler for XzHandler {
 
         let payload = src.slice(base, src.len() - base)?;
         let data = payload.read_all()?;
-        if data[0..6] != STREAM_HEADER {
+        if data[0..6] != STREAM_HEADER_MAGIC {
             return Err(Error::Validation {
                 format: "xz",
                 reason: "bad magic".into(),
             });
         }
-        // Stream flags must be 00 04 / check type; CRC32 of flags at 8..12.
-        if data[6] != 0 || data[7] != 0x04 {
+        let header_flags = [data[6], data[7]];
+        if header_flags[0] != 0 {
             return Err(Error::Validation {
                 format: "xz",
-                reason: format!("unsupported stream flags {:#x}{:#x}", data[6], data[7]),
+                reason: format!("reserved first flags byte {:#x}", header_flags[0]),
+            });
+        }
+        // CRC32 of the stream flags, validating the header structure.
+        let header_crc = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        if crc32(&header_flags) != header_crc {
+            return Err(Error::Validation {
+                format: "xz",
+                reason: "stream header CRC32 mismatch".into(),
             });
         }
 
-        // Walk blocks: each starts with a size byte (0x00 = index).
+        // Locate the stream footer: scan for `YZ` such that the 12 bytes
+        // ending there form a footer whose flags match the header and
+        // whose backward size and CRC32 are self-consistent.
+        let footer_pos = self.find_valid_footer(&data, &header_flags)?;
+
+        // Walk blocks between header end and index start.
         let mut off = 12usize;
         let mut decompressed: Vec<u8> = Vec::new();
         let mut block_count = 0u32;
@@ -70,28 +93,19 @@ impl Handler for XzHandler {
             .min(limits.max_expansion_ratio.saturating_mul(data.len() as u64))
             .min(u64::from(u32::MAX - 1));
 
-        loop {
-            if off >= data.len() {
-                return Err(Error::Validation {
-                    format: "xz",
-                    reason: "stream ended without index/footer".into(),
-                });
-            }
+        while off < footer_pos {
             if data[off] == 0x00 {
                 // Index indicator: block walk finished.
                 break;
             }
             // Per XZ spec: real header size = (byte + 1) * 4.
             let hs = (data[off] as usize + 1) * 4;
-            if hs < 8 || off + hs > data.len() {
-                // The LZMA2 decoder read-ahead makes exact block boundary
-                // arithmetic unreliable; if the next region doesn't parse
-                // as a block header, stop walking and fall back to the
-                // footer-based boundary below.
-                break;
+            if hs < 8 || off + hs > footer_pos {
+                return Err(Error::Validation {
+                    format: "xz",
+                    reason: "invalid block header size".into(),
+                });
             }
-            // Block header must end with CRC32 (we tolerate without check
-            // for carving-tolerance but verify real flag bit).
             let flags = data[off + 1];
             let has_compressed_size = flags & 0x40 != 0;
             let has_uncompressed_size = flags & 0x80 != 0;
@@ -100,6 +114,19 @@ impl Handler for XzHandler {
                 return Err(Error::Validation {
                     format: "xz",
                     reason: format!("unsupported filter chain of {n_filters}"),
+                });
+            }
+            // Block header CRC32 (last 4 bytes of the header).
+            let hcrc_expected = u32::from_le_bytes([
+                data[off + hs - 4],
+                data[off + hs - 3],
+                data[off + hs - 2],
+                data[off + hs - 1],
+            ]);
+            if crc32(&data[off..off + hs - 4]) != hcrc_expected {
+                return Err(Error::Validation {
+                    format: "xz",
+                    reason: "block header CRC32 mismatch".into(),
                 });
             }
             // Parse filter id after optional sizes: variable-length ints.
@@ -120,24 +147,22 @@ impl Handler for XzHandler {
                     reason: format!("unsupported filter id {filter_id:#x}"),
                 });
             }
-            // Skip filter props (2-byte dict size for LZMA2) + padding + CRC32.
-            let _props = *data.get(p + 1).unwrap_or(&0);
+            // LZMA2 filter props are exactly 1 byte: the dictionary size
+            // code, which LZMA2Reader interprets itself.
+            let dict_size = data.get(p + 1).copied().unwrap_or(0x16) as u32;
             let body_start = off + hs;
-            if body_start >= data.len() {
+            if body_start >= footer_pos {
                 return Err(Error::Validation {
                     format: "xz",
                     reason: "block body missing".into(),
                 });
             }
 
-            // Find block end: LZMA2 end marker (0x00) then padding to 4-byte
-            // alignment. We feed the decoder and stop at its end marker.
-            // LZMA2 filter props are exactly 1 byte: the dictionary size
-            // code, which LZMA2Reader interprets itself.
-            let dict_size = data.get(p + 1).copied().unwrap_or(0x16) as u32;
+            // Decompress the LZMA2 stream incrementally under the budget.
             let mut block_out = Vec::new();
+            let consumed;
             {
-                let lzma2 = LZMA2Reader::new(&data[body_start..], dict_size, None);
+                let lzma2 = LZMA2Reader::new(&data[body_start..footer_pos], dict_size, None);
                 let mut chunk = [0u8; 64 * 1024];
                 let mut reader = lzma2;
                 loop {
@@ -164,22 +189,16 @@ impl Handler for XzHandler {
                         }
                     }
                 }
-                // consumed = LZMA2 bytes incl. end marker:
-                // slice length minus what the decoder left unread.
-                let slice_len = data.len() - body_start;
+                // consumed = LZMA2 bytes incl. end marker: slice length
+                // minus what the decoder left unread (read-ahead aware).
+                let slice_len = footer_pos - body_start;
                 let remaining = reader.into_inner().len();
-                let consumed = slice_len.saturating_sub(remaining);
-                off = body_start + consumed;
+                consumed = slice_len.saturating_sub(remaining);
             }
-            // Padding to 4-byte boundary + (CRC32/CRC64/SHA check field).
-            let check_size = match data[7] {
-                0x01 => 4,  // CRC32
-                0x04 => 8,  // CRC64
-                0x0a => 32, // SHA-256
-                _ => 0,
-            };
+            // Block padding to 4-byte boundary + check field.
+            let check_size = check_size_for(header_flags[1]);
             let pad = (4 - (block_out.len() % 4)) % 4;
-            off += pad + check_size;
+            off = body_start + consumed + pad + check_size;
             block_count += 1;
             if block_count > 64 {
                 return Err(Error::Validation {
@@ -188,9 +207,6 @@ impl Handler for XzHandler {
                 });
             }
             decompressed.extend_from_slice(&block_out);
-            if off >= data.len() {
-                break;
-            }
         }
 
         if decompressed.is_empty() {
@@ -207,16 +223,9 @@ impl Handler for XzHandler {
         );
         metadata.insert("blocks".to_string(), block_count.to_string());
 
-        // Boundary: approximate stream end at the footer we stopped before;
-        // conservative: use consumed offset + index + footer (24 bytes).
-        // Boundary: locate the stream footer magic after the walk start;
-        // stream ends at footer end (footer = CRC32(4) + flags(2) +
-        // backward size(4) + magic(6) = 12 bytes).
-        let footer_from = off.min(data.len());
-        let size = match find_from_usize(&data, footer_from, &STREAM_HEADER) {
-            Some(pos) => (pos + 12) as u64,
-            None => (off as u64 + 24).min(data.len() as u64),
-        };
+        // B4: exact, spec-compliant boundary — the stream ends at the
+        // footer's YZ magic (2 bytes).
+        let size = (footer_pos + 12) as u64;
 
         Ok(HandlerOutput {
             artifacts: vec![ArtifactDraft {
@@ -226,13 +235,13 @@ impl Handler for XzHandler {
                 size,
                 confidence: Confidence::Validated,
                 evidence: Evidence::facts([
-                    "XZ stream header valid".to_string(),
+                    "stream header magic + CRC32 valid".to_string(),
                     format!("{block_count} block(s) decompressed"),
+                    "stream footer YZ magic + flags match header".to_string(),
                 ]),
                 metadata,
                 warnings: Vec::new(),
                 errors: Vec::new(),
-                inline_bytes: None,
                 children: vec![ChildDraft {
                     relation: RelationKind::DecompressedFrom,
                     label: format!("decompressed payload ({} bytes)", decompressed.len()),
@@ -245,6 +254,72 @@ impl Handler for XzHandler {
             }],
         })
     }
+}
+
+impl XzHandler {
+    /// Find the stream footer: a `YZ` occurrence where
+    ///   footer[0..4]   = CRC32(footer[4..12])
+    ///   footer[4..6]   = header stream flags
+    ///   footer[10..12] = YZ
+    /// and the index backward size is consistent. Returns the offset of
+    /// the footer start.
+    fn find_valid_footer(&self, data: &[u8], header_flags: &[u8; 2]) -> Result<usize> {
+        if data.len() < 24 {
+            return Err(Error::Validation {
+                format: "xz",
+                reason: "stream too short for index+footer".into(),
+            });
+        }
+        let mut search = 12usize;
+        while let Some(rel) = find_from_usize(data, search, &STREAM_FOOTER_MAGIC) {
+            // Footer layout: [CRC32(4)][flags(2)][backward size(4)][YZ(2)].
+            // `rel` points at YZ, so the footer starts 10 bytes earlier.
+            let Some(fstart) = rel.checked_sub(10) else {
+                search = rel + 1;
+                continue;
+            };
+            if fstart < 12 {
+                search = rel + 1;
+                continue;
+            }
+            let flags = [data[fstart + 4], data[fstart + 5]];
+            if flags != *header_flags {
+                search = rel + 1;
+                continue;
+            }
+            let crc_ok = crc32(&data[fstart + 4..fstart + 12])
+                == u32::from_le_bytes([
+                    data[fstart],
+                    data[fstart + 1],
+                    data[fstart + 2],
+                    data[fstart + 3],
+                ]);
+            if !crc_ok {
+                search = rel + 1;
+                continue;
+            }
+            return Ok(fstart);
+        }
+        Err(Error::Validation {
+            format: "xz",
+            reason: "no valid stream footer (YZ + matching flags + CRC32)".into(),
+        })
+    }
+}
+
+fn check_size_for(check_id: u8) -> usize {
+    match check_id {
+        0x01 => 4,  // CRC32
+        0x04 => 8,  // CRC64
+        0x0a => 32, // SHA-256
+        _ => 0,     // None / unsupported: treated as absent
+    }
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut h = crc32fast::Hasher::new();
+    h.update(data);
+    h.finalize()
 }
 
 /// Find `needle` in `hay[from..]`, returning the absolute index.
