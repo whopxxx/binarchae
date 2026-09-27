@@ -895,3 +895,50 @@ fn duplicate_container_keeps_children() {
         );
     }
 }
+
+/// F1 regression: a draft validated (and charged) at the root level but
+/// deferred to a trailing region must NOT be billed twice. PNG + appended
+/// gzip (~60 KiB output) under a 90 KiB total budget succeeds only when
+/// the gzip expansion is billed once.
+#[test]
+fn deferred_trailing_expansion_billed_once() {
+    let png = make_png();
+    let payload = vec![0x77u8; 60 * 1024]; // incompressible-ish, ~60KiB out
+    let gz = make_gzip(&payload);
+    let mut data = png.clone();
+    data.extend_from_slice(&gz);
+    let src = ByteSource::from_vec(data);
+
+    let limits = EngineLimits {
+        max_total_expanded_bytes: 90 * 1024,
+        max_expansion_ratio: 1_000, // keep the ratio cap out of the way
+        ..EngineLimits::default()
+    };
+    let mut e = RecursiveEngine::new(limits);
+    let g = e.analyze(&src, true);
+
+    // The trailing-region gzip must be discovered with its full payload.
+    let trailing = g
+        .artifacts
+        .iter()
+        .find(|a| a.relation == Some(RelationKind::TrailingData))
+        .expect("trailing region exists");
+    let gz_in_trailing = g
+        .children(trailing.id)
+        .into_iter()
+        .find(|(_, a)| a.format == "gzip")
+        .map(|(_, a)| a)
+        .expect("gzip discovered inside trailing region");
+    let decompressed: u64 = g
+        .children(gz_in_trailing.id)
+        .iter()
+        .filter(|(r, _)| *r == RelationKind::DecompressedFrom)
+        .map(|(_, a)| a.size)
+        .sum();
+    assert_eq!(
+        decompressed,
+        60 * 1024,
+        "trailing gzip must fully decompress: double billing would have \
+         pushed 120KiB past the 90KiB cap and truncated/refused it"
+    );
+}

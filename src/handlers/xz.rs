@@ -171,8 +171,12 @@ impl Handler for XzHandler {
                     reason: format!("unsupported LZMA2 property size {props_size}"),
                 });
             }
-            // The single LZMA2 property byte is the dictionary size code.
-            let dict_size = data.get(props_start).copied().unwrap_or(0x16) as u32;
+            // The single LZMA2 property byte is the dictionary size CODE
+            // (spec §5.3.1.2): real byte size = (2 | (code & 1)) <<
+            // (code/2 + 11). lzma-rust's LZMA2Reader expects the actual
+            // byte count, not the encoded code.
+            let dict_code = data.get(props_start).copied().unwrap_or(0x16) as u32;
+            let dict_size = (2u32 | (dict_code & 1)) << (dict_code / 2 + 11);
             let body_start = off + hs;
             if body_start >= footer_pos {
                 return Err(Error::Validation {
@@ -230,18 +234,13 @@ impl Handler for XzHandler {
                         break;
                     }
                     if control >= 0x80 {
-                        // LZMA chunk: uncompressed size 2B + compressed size 2B.
-                        let usz = u16::from_be_bytes([
-                            *data.get(q + 1).ok_or(Error::Validation {
-                                format: "xz",
-                                reason: "truncated LZMA2 chunk".into(),
-                            })?,
-                            *data.get(q + 2).ok_or(Error::Validation {
-                                format: "xz",
-                                reason: "truncated LZMA2 chunk".into(),
-                            })?,
-                        ]) as usize
-                            + 1;
+                        // LZMA chunk (F2): control(1) + uncompressed size
+                        // (2B, output-side only — it does NOT occupy
+                        // input) + compressed size (2B), then exactly
+                        // `csz` bytes of range-coded input. Header is 5
+                        // bytes, plus 1 more props byte only when the
+                        // chunk carries new properties (control >= 0xC0;
+                        // this includes 0xE0 dict-reset chunks).
                         let csz = u16::from_be_bytes([
                             *data.get(q + 3).ok_or(Error::Validation {
                                 format: "xz",
@@ -253,13 +252,8 @@ impl Handler for XzHandler {
                             })?,
                         ]) as usize
                             + 1;
-                        // LZMA chunk: control(1) + usz(2) + csz(2) header,
-                        // then compressed bytes. (A new-props chunk carries
-                        // 1 extra props byte but the range coder consumed
-                        // span works out identically for our boundary math.)
-                        let hdr = 6;
-                        q += hdr + usz + csz;
-                        let _ = usz;
+                        let hdr = if control >= 0xC0 { 6 } else { 5 };
+                        q += hdr + csz;
                     } else if control == 0x01 || control == 0x02 {
                         // Uncompressed chunk: 1B control + 2B size-1 + data.
                         let sz = u16::from_be_bytes([
@@ -574,5 +568,67 @@ mod tests {
             )
             .expect("parses with trailing bytes");
         assert_eq!(out.artifacts[0].size, 80);
+    }
+
+    /// F2 regression: a REAL compressed LZMA2 chunk (control >= 0x80),
+    /// frozen from XZ Utils 5.8.3 (`xz -z --check=crc32` over
+    /// `msg*8 + 300 random bytes`). Verifies: (a) the body chunk really
+    /// is range-coded, (b) the full 788-byte payload round-trips,
+    /// (c) the stream boundary is exact, (d) the LZMA chunk walk consumed
+    /// exactly header+csz (5-byte header when no new props, 6 with).
+    const STD_XZ_LZMA_HEX: &str = "fd377a585a0000016922de3604c08203940621011600000000000000b4fc7de9e00313017a5d00331b084758477a2aeb4c936f658d77db64f5867c4d26669bb5df78a682e97b1c156e604ac38dc14d19c4b6b00823e216a0cb92ca12f57bca04ccfab8b20c3b76d162f663cd21deacc76b6fc4d42bc177b53a656870fb38d6eae341a762a180ee7a7254e7514463090799cd2541cd952927b4fc796156403fb618d78ceab98a75377bc5f6852b5c58d82e55a5d92ddc5b6d388fc3f68667bcdd76fbc57684ddefe8d23ac65dbc5d8a53a7b99d853542e0bcd4d9e94c91029e6718ec5cd8f43df0d45b0eb2ef4685a9098a50bfc2e53ff8dce95fd3843e89d1632aa71738abecd1cfc0d9482a2d9299a9c52bb1bf1c798c9571373e43f8a8c5a7f206eaac2a20ff6e36c7e024db7f09a0da857000d08c08211310a0ad210201b6ebff64df4f4c15243d88ca4cee8be213a778caefa375cdfb31d6457e12bc2841bc717445901fec8799708eb76ed747c7d769d6d927ee24364e43d9b0176d7fbf262ee87ab44d52af70cd8d8763694679c4f0243c1e2296f04a4ed236318d4d34a500000037de4ea400019a03940600006991a70e3e300d8b020000000001595a";
+
+    #[test]
+    fn parses_real_compressed_lzma2_chunk() {
+        let data: Vec<u8> = (0..STD_XZ_LZMA_HEX.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&STD_XZ_LZMA_HEX[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(data.len(), 448);
+
+        // (a) The body chunk is genuinely range-coded: control >= 0x80.
+        // Block header is 20 bytes (first byte 0x04 => (4+1)*4), so the
+        // LZMA2 body starts at 32.
+        let control = data[32];
+        assert!(
+            control >= 0x80,
+            "fixture must use a compressed LZMA chunk, got {control:#x}"
+        );
+        // This chunk carries new properties (0xE0 = 0x80|0x60): 6B header.
+        assert_eq!(control, 0xE0);
+        let csz = u16::from_be_bytes([data[35], data[36]]) as usize + 1;
+        let usz = (((control & 0x1F) as usize) << 16)
+            + u16::from_be_bytes([data[33], data[34]]) as usize
+            + 1;
+        assert_eq!(usz, 788);
+        // LZMA2 body = 6B header + csz compressed bytes + end marker(1).
+        assert_eq!(32 + 6 + csz + 1, 418);
+
+        let src = ByteSource::from_vec(data);
+        let h = XzHandler;
+        let mut budget = Budget::default();
+        let out = h
+            .validate(
+                &src,
+                Candidate { offset: 0 },
+                &crate::engine::EngineLimits::default(),
+                &mut budget,
+            )
+            .expect("compressed-chunk fixture must parse");
+
+        // (c) Exact footer-anchored boundary.
+        assert_eq!(out.artifacts[0].size, 448);
+
+        // (b) Full payload round-trips: 8x the marker message + noise.
+        let payload = &out.artifacts[0].children[0].bytes;
+        assert_eq!(payload.len(), 788);
+        let marker = b"flag{xz-compressed-chunk-larger-payload-for-real-lzma-coding}";
+        for (i, chunk) in payload.chunks(marker.len()).enumerate() {
+            if i < 8 {
+                assert_eq!(chunk, marker, "repeated marker segment {i}");
+            }
+        }
+        // The trailing 300 bytes are random; assert they are not all zero.
+        assert!(payload[488..].iter().any(|&b| b != 0));
     }
 }

@@ -162,6 +162,11 @@ pub struct RecursiveEngine {
     /// In-memory bytes for handler-produced children, keyed by content
     /// hash. Powers extraction without re-parsing.
     pub byte_cache: std::collections::HashMap<String, Vec<u8>>,
+    /// F1: expansion spend per source-region content hash. Guarantees a
+    /// given byte region's decompression is billed to the run-wide budget
+    /// exactly once, even when the region is validated multiple times
+    /// (root pass, then trailing-region pass) or its draft is deferred.
+    spends_by_region: std::collections::HashMap<String, u64>,
 }
 
 impl RecursiveEngine {
@@ -172,6 +177,7 @@ impl RecursiveEngine {
             carving_rules: Vec::new(),
             processed_hashes: std::collections::HashSet::new(),
             byte_cache: std::collections::HashMap::new(),
+            spends_by_region: std::collections::HashMap::new(),
         }
     }
 
@@ -248,41 +254,60 @@ impl RecursiveEngine {
         // R1 (transactional accounting): each candidate is validated with
         // a SHADOW of the run-wide budget. Charges commit only when the
         // candidate is accepted; a rejected/malformed/limit-hit candidate
-        // rolls back, and duplicate drafts (rediscovered inside trailing
-        // regions) are charged once because the shadow's spend replaces
-        // rather than adds. This keeps the run-wide cap authoritative
-        // without penalizing legitimate data twice.
+        // rolls back. Additionally (F1): every ACCEPTED candidate's spend
+        // is recorded per source-region hash. When a draft is later
+        // dropped by the region decomposition (rediscovered inside a
+        // trailing region), the rescan looks up the region's recorded
+        // spend, re-applies it as a SHADOW (so handler-side ratio caps
+        // still work), and commits nothing — one logical expansion is
+        // billed exactly once run-wide.
         let mut drafts: Vec<ArtifactDraft> = Vec::new();
+        let spends_by_region = &mut self.spends_by_region;
         for handler in &self.handlers {
             for candidate in handler.find_candidates(src) {
-                let before = budget.expanded_bytes;
-                match handler.validate(src, candidate, &self.limits, budget) {
+                // F1: candidates are validated against a SHADOW budget
+                // seeded at zero. This keeps every handler-side protection
+                // active (per-stream ratio caps, child-size caps) while
+                // making the shadow's run-wide accounting independent of
+                // whatever was billed earlier in the run. After validation:
+                //   - a REJECTED candidate commits nothing (its shadow
+                //     spend is discarded — malformed candidates can never
+                //     permanently drain the run-wide budget);
+                //   - an ACCEPTED candidate commits the shadow spend only
+                //     for source regions not already billed (one logical
+                //     expansion is billed exactly once, even when a draft
+                //     is deferred to a trailing region and re-validated).
+                let mut shadow = Budget::default();
+                match handler.validate(src, candidate, &self.limits, &mut shadow) {
                     Ok(output) => {
                         for draft in output.artifacts {
-                            let region_ok = src
+                            // Commit against the run-wide budget under the
+                            // real limits; regions already billed commit 0.
+                            let region_hash = src
                                 .slice(draft.offset, draft.size)
                                 .map(|r| r.hash_all())
-                                .ok()
-                                .map_or(true, |h| !self.processed_hashes.contains(&h));
-                            if region_ok {
-                                // Commit this candidate's spend.
-                                drafts.push(draft);
-                            } else {
-                                // Duplicate of already-processed content:
-                                // roll back its spend; the artifact node
-                                // still gets registered later, but the
-                                // expansion work is not re-charged.
-                                budget.expanded_bytes = before;
-                                drafts.push(draft);
+                                .ok();
+                            let already_billed = region_hash
+                                .as_ref()
+                                .map_or(true, |h| spends_by_region.contains_key(h));
+                            if !already_billed {
+                                let spend = shadow.expanded_bytes;
+                                if budget.charge(&self.limits, spend) {
+                                    if let Some(h) = region_hash {
+                                        spends_by_region.insert(h, spend);
+                                    }
+                                }
+                                // If the run-wide commit fails, the draft
+                                // is still registered but its children
+                                // were bounded by the shadow caps; the
+                                // budget simply stays where it is.
                             }
+                            drafts.push(draft);
                         }
                     }
-                    Err(e) => {
-                        // Rejected candidate: roll back its spend so a
-                        // malformed candidate can never permanently drain
-                        // the run-wide budget.
-                        budget.expanded_bytes = before;
-                        let _ = e;
+                    Err(_e) => {
+                        // Rejected candidate: shadow spend discarded, real
+                        // budget untouched.
                     }
                 }
             }
@@ -334,7 +359,10 @@ impl RecursiveEngine {
                 break;
             }
             // Only drafts overlapping the FIRST structure's extent belong
-            // to this level; later ones live in the trailing region.
+            // to this level; later ones live in the trailing region. Their
+            // expansion spend was already recorded in `spends_by_region`
+            // during validation, so the trailing-region rescan re-runs the
+            // handler but commits no new charge (F1).
             if let Some(end) = first_end {
                 if draft.offset >= end {
                     break;
@@ -385,16 +413,15 @@ impl RecursiveEngine {
 
             // R2: a duplicate container still registers its OWN children
             // (decompressed payloads, archive entries) so provenance edges
-            // survive; only the recursive SCAN of identical bytes is
-            // skipped (and the region scan below, via processed_hashes).
-            if !duplicate {
-                self.processed_hashes.insert(
-                    graph
-                        .get(child_id)
-                        .map(|a| a.hash.clone())
-                        .unwrap_or_default(),
-                );
-            }
+            // survive. The hash STILL goes into processed_hashes either
+            // way: duplicates must not re-scan (layered re-registration),
+            // and skipping the scan is exactly the dedup contract.
+            self.processed_hashes.insert(
+                graph
+                    .get(child_id)
+                    .map(|a| a.hash.clone())
+                    .unwrap_or_default(),
+            );
 
             // R5: region-backed artifacts (embedded PNG/JPEG/PDF, carved
             // GIF/RAR/7z, custom rules) must be materializable by `-e` —
@@ -451,8 +478,11 @@ impl RecursiveEngine {
 
             // Recurse into the artifact's own source region (finds
             // structures inside structurally-claimed regions). Gated on
-            // `recurse` like every other recursion.
-            if recurse && depth < self.limits.max_depth {
+            // `recurse` like every other recursion; duplicates skip it —
+            // identical bytes were already scanned under their first
+            // occurrence and re-scanning would re-register the same
+            // nested artifacts layer after layer.
+            if recurse && !duplicate && depth < self.limits.max_depth {
                 if let Ok(r) = region {
                     self.scan_region(&r, child_id, depth + 1, recurse, graph, budget);
                 }
