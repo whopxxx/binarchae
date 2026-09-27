@@ -4,6 +4,7 @@
 pub mod archives;
 pub mod compression;
 pub mod cpio;
+pub mod disk;
 pub mod exec;
 pub mod gzip;
 pub mod jpeg;
