@@ -94,6 +94,15 @@ materialization (extraction pulls exact bytes on demand; analysis never
 requires a temp file). Source-backed children are **not** billed as
 decompression expansion — they add no new bytes to the world.
 
+Materialization is lazy end to end. At registration the engine stores a
+zero-copy `ByteSource` handle in a region cache keyed by content hash —
+it does **not** read the bytes into memory. Only when extraction
+materializes an artifact does the engine read through the handle (for a
+file-backed input this reads the file lazily at that moment). Analysis of
+a multi-gigabyte firmware image therefore performs no per-child bulk
+copies; owned decompressed bytes still go to the in-memory byte cache as
+before.
+
 ## Recursion model
 
 The same `RecursiveEngine` analyzes root and child regions. After

@@ -95,7 +95,6 @@ fn run(cli: &Cli) -> i32 {
     }
     // B5: recursion only with -r/--recurse. Default = top-level scan.
     let graph = engine.analyze(&src, cli.recurse);
-    let byte_cache = engine.byte_cache.clone();
 
     let mut report = Report::new(
         cli.input
@@ -124,7 +123,7 @@ fn run(cli: &Cli) -> i32 {
     let _ = std::io::stdout().flush();
 
     if cli.extract {
-        match materialize(cli, &report, &byte_cache) {
+        match materialize(cli, &report, &engine) {
             Ok(dir) => println!("extracted to {}", dir.display()),
             Err(e) => {
                 eprintln!("error: extraction failed: {e}");
@@ -137,11 +136,7 @@ fn run(cli: &Cli) -> i32 {
 
 /// Materialize artifacts under `<input>.extracted/` with a deterministic
 /// layout, plus report.json and tree.txt.
-fn materialize(
-    cli: &Cli,
-    report: &Report,
-    byte_cache: &std::collections::HashMap<String, Vec<u8>>,
-) -> std::io::Result<PathBuf> {
+fn materialize(cli: &Cli, report: &Report, engine: &RecursiveEngine) -> std::io::Result<PathBuf> {
     let out_root = PathBuf::from(format!("{}.extracted", cli.input.display()));
     std::fs::create_dir_all(&out_root)?;
     let artifacts_dir = out_root.join("artifacts");
@@ -174,7 +169,7 @@ fn materialize(
                         std::fs::create_dir_all(parent)?;
                     }
                     let dest = dedup_path(&dest);
-                    if let Some(bytes) = read_artifact_bytes(report, child, byte_cache) {
+                    if let Some(bytes) = read_artifact_bytes(child, engine) {
                         std::fs::write(dest, bytes)?;
                         wrote_any = true;
                     }
@@ -183,7 +178,7 @@ fn materialize(
             let _ = relation;
         }
         if !wrote_any {
-            if let Some(bytes) = read_artifact_bytes(report, artifact, byte_cache) {
+            if let Some(bytes) = read_artifact_bytes(artifact, engine) {
                 let dest = dedup_path(&dir.join("body.bin"));
                 std::fs::write(dest, bytes)?;
             }
@@ -229,12 +224,12 @@ fn child_label_name(a: &ctf_tools::artifact::Artifact) -> Option<String> {
 }
 
 fn read_artifact_bytes(
-    _report: &Report,
     a: &ctf_tools::artifact::Artifact,
-    byte_cache: &std::collections::HashMap<String, Vec<u8>>,
+    engine: &RecursiveEngine,
 ) -> Option<Vec<u8>> {
-    // Byte materialization comes from the engine's in-memory byte cache,
-    // keyed by content hash. See docs/architecture.md for the streaming
-    // extraction roadmap.
-    byte_cache.get(&a.hash).cloned()
+    // B1: bytes are pulled lazily at materialization time. Owned
+    // decompressed payloads come from byte_cache; source-backed regions
+    // (firmware payloads, CPIO files, embedded/carved regions) are read
+    // through their stored zero-copy handle — analysis never copied them.
+    engine.cached_bytes(&a.hash)
 }

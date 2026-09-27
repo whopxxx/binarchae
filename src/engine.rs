@@ -200,6 +200,11 @@ pub struct RecursiveEngine {
     /// In-memory bytes for handler-produced children, keyed by content
     /// hash. Powers extraction without re-parsing.
     pub byte_cache: std::collections::HashMap<String, Vec<u8>>,
+    /// B1: handles for materializable byte regions (handler children and
+    /// region-backed artifacts), keyed by content hash. Registration is
+    /// zero-copy: the engine stores the ByteSource view, and bytes are
+    /// only read when extraction actually materializes them.
+    pub region_cache: std::collections::HashMap<String, ByteSource>,
     /// F1: expansion spend per source-region content hash. Guarantees a
     /// given byte region's decompression is billed to the run-wide budget
     /// exactly once, even when the region is validated multiple times
@@ -215,13 +220,27 @@ impl RecursiveEngine {
             carving_rules: Vec::new(),
             processed_hashes: std::collections::HashSet::new(),
             byte_cache: std::collections::HashMap::new(),
+            region_cache: std::collections::HashMap::new(),
             spends_by_region: std::collections::HashMap::new(),
         }
     }
 
-    /// Bytes recorded for an artifact hash, if any.
-    pub fn cached_bytes(&self, hash: &str) -> Option<&Vec<u8>> {
-        self.byte_cache.get(hash)
+    /// Bytes recorded for an artifact hash, if any. Reads the stored
+    /// region handle lazily; used by tests and extraction. Prefer
+    /// [`RecursiveEngine::region_handle`] when a streaming write is
+    /// possible — this materializes the full region in memory.
+    pub fn cached_bytes(&self, hash: &str) -> Option<Vec<u8>> {
+        self.byte_cache
+            .get(hash)
+            .cloned()
+            .or_else(|| self.region_cache.get(hash).and_then(|r| r.read_all().ok()))
+    }
+
+    /// Zero-copy handle for a materializable region, keyed by content
+    /// hash. Extraction reads through this handle (or streams it) at
+    /// materialization time — analysis never copies the bytes.
+    pub fn region_handle(&self, hash: &str) -> Option<&ByteSource> {
+        self.region_cache.get(hash)
     }
 
     /// Analyze a root source and return the full artifact graph.
@@ -472,21 +491,20 @@ impl RecursiveEngine {
                     .unwrap_or_default(),
             );
 
-            // R5: region-backed artifacts (embedded PNG/JPEG/PDF, carved
-            // GIF/RAR/7z, custom rules) must be materializable by `-e` —
-            // cache their region bytes, bounded by max_child_size.
+            // R5 + B1: region-backed artifacts (embedded PNG/JPEG/PDF,
+            // carved GIF/RAR/7z, custom rules) must be materializable by
+            // `-e`. Store the zero-copy region handle; bytes are read only
+            // when extraction materializes them.
             if draft.size <= self.limits.max_child_size {
                 if let Ok(r) = &region {
-                    if let Ok(bytes) = r.read_all() {
-                        self.byte_cache
-                            .entry(
-                                graph
-                                    .get(child_id)
-                                    .map(|a| a.hash.clone())
-                                    .unwrap_or_default(),
-                            )
-                            .or_insert(bytes);
-                    }
+                    self.region_cache
+                        .entry(
+                            graph
+                                .get(child_id)
+                                .map(|a| a.hash.clone())
+                                .unwrap_or_default(),
+                        )
+                        .or_insert_with(|| r.clone());
                 }
             }
 
@@ -496,17 +514,19 @@ impl RecursiveEngine {
                     break;
                 }
                 let chash = child.content.hash();
-                // H1: the byte_cache stays keyed by content hash, so the
-                // real payload exists exactly once in memory regardless of
-                // how many logical occurrences reference it.
+                // B1 + H1: the region cache stays keyed by content hash, so
+                // the real payload handle exists exactly once regardless of
+                // how many logical occurrences reference it. Owned bytes
+                // still go to byte_cache (they exist in memory anyway);
+                // source-backed regions store a handle with NO read.
                 match &child.content {
                     ChildContent::Owned(bytes) => {
                         self.byte_cache.insert(chash.clone(), bytes.clone());
                     }
                     ChildContent::Source(src) => {
-                        if let Ok(bytes) = src.read_all() {
-                            self.byte_cache.entry(chash.clone()).or_insert(bytes);
-                        }
+                        self.region_cache
+                            .entry(chash.clone())
+                            .or_insert_with(|| src.clone());
                     }
                 }
                 let cdup = graph.has_hash(&chash) || self.processed_hashes.contains(&chash);

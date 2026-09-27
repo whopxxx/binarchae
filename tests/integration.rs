@@ -841,7 +841,7 @@ fn region_backed_artifacts_are_extractable() {
         .expect("embedded png found");
     let cached = e.cached_bytes(&png_art.hash).expect("png bytes cached");
     assert_eq!(
-        cached, &png,
+        cached, png,
         "region-backed artifact bytes must be recoverable for extraction"
     );
 }

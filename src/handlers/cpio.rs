@@ -127,12 +127,29 @@ impl Handler for CpioHandler {
                 .unwrap_or(name_buf.len());
             let name = String::from_utf8_lossy(&name_buf[..name_len]).into_owned();
 
-            let name_area = pad4(namesize);
-            let data_start = name_start + name_area;
+            // B2: the name area is `110 + namesize` bytes of stream, then
+            // the CURRENT POSITION is aligned to 4 (GNU cpio / Linux
+            // initramfs: `cpio_header + filename + "\0" + ALGN(4) + data`).
+            // The 110-byte header is 2 mod 4, so padding relative to the
+            // position differs from padding relative to namesize alone.
+            let name_area_abs = ENTRY_HEADER
+                .checked_add(namesize)
+                .ok_or(Error::Validation {
+                    format: "cpio",
+                    reason: "name offset overflow".into(),
+                })?;
+            let name_pad = (4 - (name_area_abs % 4)) % 4;
+            let data_start = name_start
+                .checked_add(namesize)
+                .and_then(|p| p.checked_add(name_pad))
+                .ok_or(Error::Validation {
+                    format: "cpio",
+                    reason: "data offset overflow".into(),
+                })?;
 
             if name == TRAILER_NAME {
-                // Archive ends after the trailer's name area (aligned).
-                archive_end = Some(name_start + name_area);
+                // Archive ends after the trailer's aligned name area.
+                archive_end = Some(data_start);
                 break;
             }
 
@@ -179,6 +196,27 @@ impl Handler for CpioHandler {
             meta.insert("mtime".to_string(), mtime.to_string());
             meta.insert("entry_type".to_string(), type_name.to_string());
 
+            // B3: in the crc variant the `check` field covers the entry's
+            // DATA FIELD — the 32-bit byte sum — and that includes
+            // symlinks (whose target bytes ARE the data field). Verify
+            // here, before the type switch, so a tampered symlink target
+            // cannot yield a Validated archive.
+            if is_crc {
+                if filesize > limits.max_child_size {
+                    meta.insert("skipped".to_string(), "exceeds max child size".to_string());
+                } else {
+                    let content = src.slice(data_start, filesize)?;
+                    let sum = sum_bytes(&content)?;
+                    if u64::from(sum) != check {
+                        checksum_failures
+                            .push(format!("{name}: stored {check:#x}, computed {sum:#x}"));
+                        meta.insert("cpio_checksum".to_string(), "mismatch".to_string());
+                    } else {
+                        meta.insert("cpio_checksum".to_string(), "valid".to_string());
+                    }
+                }
+            }
+
             match ftype {
                 0o100000 => {
                     // Regular file: source-backed slice + recursive target.
@@ -186,17 +224,6 @@ impl Handler for CpioHandler {
                         meta.insert("skipped".to_string(), "exceeds max child size".to_string());
                     } else {
                         let content = src.slice(data_start, filesize)?;
-                        // CRC variant: verify the data checksum.
-                        if is_crc {
-                            let sum = sum_bytes(&content)?;
-                            if u64::from(sum) != check {
-                                checksum_failures
-                                    .push(format!("{name}: stored {check:#x}, computed {sum:#x}"));
-                                meta.insert("cpio_checksum".to_string(), "mismatch".to_string());
-                            } else {
-                                meta.insert("cpio_checksum".to_string(), "valid".to_string());
-                            }
-                        }
                         meta.insert("filesize".to_string(), filesize.to_string());
                         children.push(ChildDraft {
                             relation: RelationKind::Contains,
@@ -392,7 +419,7 @@ fn parse_hex(bytes: &[u8]) -> Result<u64> {
     Ok(value)
 }
 
-/// Round up to a 4-byte boundary.
+/// Round up to a 4-byte boundary (data areas: filesize then pad).
 fn pad4(v: u64) -> u64 {
     (4 - (v % 4)) % 4 + v
 }
