@@ -22,19 +22,14 @@ use crate::error::{Error, Result};
 use crate::handlers::find_all;
 use std::collections::BTreeMap;
 
-const SECTOR: u64 = 512;
-
 pub struct FatHandler;
 
 /// A parsed BPB.
 struct Bpb {
     bytes_per_sector: u64,
     sectors_per_cluster: u32,
-    reserved_sectors: u32,
-    fat_count: u32,
     root_entries: u32,
     total_sectors: u64,
-    fat_size_sectors: u64,
     root_cluster: u32,
     fat_type: &'static str,
     cluster_size: u64,
@@ -150,11 +145,8 @@ impl FatHandler {
         Ok(Bpb {
             bytes_per_sector: bps,
             sectors_per_cluster: spc,
-            reserved_sectors: reserved,
-            fat_count,
             root_entries,
             total_sectors,
-            fat_size_sectors: fat_size,
             root_cluster,
             fat_type,
             cluster_size,
@@ -409,7 +401,7 @@ impl FatHandler {
             // reconstructed owned bytes.
             let chain = Self::walk_chain(src, bpb, base, entry.cluster)?;
             let size = entry.size as u64;
-            let contiguous = chain.len() > 0 && chain.windows(2).all(|w| w[1] == w[0] + 1);
+            let contiguous = !chain.is_empty() && chain.windows(2).all(|w| w[1] == w[0] + 1);
             let mut meta = BTreeMap::new();
             meta.insert("path".to_string(), child_path.clone());
             meta.insert("type".to_string(), "file".to_string());
