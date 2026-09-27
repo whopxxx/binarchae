@@ -25,7 +25,9 @@
 
 use crate::artifact::{Confidence, Evidence, RelationKind};
 use crate::bytesource::ByteSource;
-use crate::engine::{ArtifactDraft, Budget, Candidate, ChildDraft, Handler, HandlerOutput};
+use crate::engine::{
+    ArtifactDraft, Budget, Candidate, ChildContent, ChildDraft, Handler, HandlerOutput,
+};
 use crate::error::{Error, Result};
 use crate::handlers::find_all;
 use lzma_rust::LZMA2Reader;
@@ -301,6 +303,7 @@ impl Handler for XzHandler {
             });
         }
 
+        let decompressed_size = decompressed.len() as u64;
         let mut metadata = BTreeMap::new();
         metadata.insert(
             "uncompressed_size".to_string(),
@@ -331,7 +334,8 @@ impl Handler for XzHandler {
                     relation: RelationKind::DecompressedFrom,
                     label: format!("decompressed payload ({} bytes)", decompressed.len()),
                     format_hint: "raw",
-                    bytes: decompressed,
+                    content: ChildContent::Owned(decompressed),
+                    size: decompressed_size,
                     metadata: BTreeMap::new(),
                     warnings: Vec::new(),
                     entry_name: None,
@@ -510,7 +514,7 @@ mod tests {
         let art = &out.artifacts[0];
         assert_eq!(art.size, 80);
         assert_eq!(art.confidence, Confidence::Validated);
-        let payload = &art.children[0].bytes;
+        let payload = art.children[0].content.to_bytes().unwrap_or_default();
         assert_eq!(payload, b"flag{xz-std-fixture}");
     }
 
@@ -620,7 +624,10 @@ mod tests {
         assert_eq!(out.artifacts[0].size, 448);
 
         // (b) Full payload round-trips: 8x the marker message + noise.
-        let payload = &out.artifacts[0].children[0].bytes;
+        let payload = out.artifacts[0].children[0]
+            .content
+            .to_bytes()
+            .unwrap_or_default();
         assert_eq!(payload.len(), 788);
         let marker = b"flag{xz-compressed-chunk-larger-payload-for-real-lzma-coding}";
         for (i, chunk) in payload.chunks(marker.len()).enumerate() {

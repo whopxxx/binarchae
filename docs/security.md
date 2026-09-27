@@ -56,6 +56,50 @@ Work is additionally deduplicated by content hash (BLAKE3): identical
 bytes are recursively processed once, which also bounds self-referential
 quines and repeated payloads.
 
+## Firmware/initramfs handlers (M2)
+
+The uImage and CPIO handlers follow the same rules, with format-specific
+hardening:
+
+- **uImage**: all offsets/sizes use checked arithmetic; `ih_size` must
+  both fit the limits and lie inside the source, so a declared petabyte
+  payload is rejected instead of truncating trailing scanning. Header CRC
+  is verified with the CRC field zeroed before anything else is trusted.
+  A data-CRC failure yields an honestly-marked `Damaged` artifact whose
+  payload is *not* recursed. Unknown enum values stay numeric — no parser
+  path can panic on them.
+- **CPIO**: every header field is ASCII hex parsed with a checked decoder
+  (malformed digits and overflow reject the entry, not the run).
+  Alignment follows the real GNU/Linux layout — stream position after
+  `110 + name + NUL` aligned to 4 — verified against a frozen fixture
+  from an independent implementation. `namesize` has its own sanity cap
+  (names are not file data) and a name without its NUL terminator
+  rejects the entry. Entry walking is bounded by a hard internal cap AND
+  `max_archive_entries` counted over entries **scanned** — oversized
+  entries that skip child creation cannot bypass the limit. The
+  `TRAILER!!!` entry structurally anchors the end so a hostile archive
+  cannot spin the walker. Archive truncation mid-entry ends the walk and
+  fails validation rather than emitting unchecked children.
+- **CPIO crc variant**: stored per-entry checksums cover every entry's
+  data field — regular files AND symlinks (whose target is the data) —
+  verified before type dispatch, **regardless of `max_child_size`**
+  (oversized entries are checksummed streaming in bounded chunks;
+  `max_child_size` only decides child exposure, never checksum success).
+  Mismatch marks the entry and downgrades the archive to `Damaged`:
+  corruption is reported, never silently accepted, and a tampered
+  symlink target cannot yield `Validated`.
+- **Special entries are never materialized**: symlinks keep their target
+  as metadata; device nodes, FIFOs, and sockets are recognized and carry
+  `host_materialization: forbidden`. No host special file is ever created.
+- **Source-backed children are zero-copy views**, so exposing a huge
+  embedded file as an artifact costs no allocation and cannot be used to
+  inflate memory via dedup or recursion — the bytes already existed in the
+  input. Registration stores only a handle; bytes are read at
+  materialization time, so analysis memory does not scale with the number
+  or size of embedded files. They are not charged as decompression
+  expansion; owned children (decompression output) continue to use the
+  run-wide expansion budget.
+
 ## Out of scope for the analysis process
 
 - No shell-outs to external extraction tools on any supported path.

@@ -10,7 +10,9 @@
 
 use crate::artifact::{Confidence, Evidence, RelationKind};
 use crate::bytesource::ByteSource;
-use crate::engine::{ArtifactDraft, Budget, Candidate, ChildDraft, Handler, HandlerOutput};
+use crate::engine::{
+    ArtifactDraft, Budget, Candidate, ChildContent, ChildDraft, Handler, HandlerOutput,
+};
 use crate::error::{Error, Result};
 use crate::handlers::find_all;
 use std::collections::BTreeMap;
@@ -198,6 +200,7 @@ impl Handler for GzipHandler {
 
         // B7: exact boundary = header_end + deflate + 8-byte trailer.
         // Bytes after this belong to the parent region's trailing data.
+        let out_size = out.len() as u64;
         let size = trailer_start + 8 - base;
 
         Ok(HandlerOutput {
@@ -217,9 +220,10 @@ impl Handler for GzipHandler {
                 errors: Vec::new(),
                 children: vec![ChildDraft {
                     relation: RelationKind::DecompressedFrom,
-                    label: format!("decompressed payload ({} bytes)", out.len()),
+                    label: format!("decompressed payload ({out_size} bytes)"),
                     format_hint: "raw",
-                    bytes: out,
+                    content: ChildContent::Owned(out),
+                    size: out_size,
                     metadata: BTreeMap::new(),
                     warnings: Vec::new(),
                     entry_name: None,

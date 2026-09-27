@@ -10,7 +10,9 @@
 
 use crate::artifact::{Confidence, Evidence, RelationKind};
 use crate::bytesource::ByteSource;
-use crate::engine::{ArtifactDraft, Budget, Candidate, ChildDraft, Handler, HandlerOutput};
+use crate::engine::{
+    ArtifactDraft, Budget, Candidate, ChildContent, ChildDraft, Handler, HandlerOutput,
+};
 use crate::error::{Error, Result};
 use crate::handlers::find_all;
 use std::collections::BTreeMap;
@@ -147,11 +149,13 @@ impl Handler for ZipHandler {
             if buf.is_empty() {
                 continue;
             }
+            let buf_size = buf.len() as u64;
             children.push(ChildDraft {
                 relation: RelationKind::Contains,
                 label: format!("zip entry {raw_name}"),
                 format_hint: "raw",
-                bytes: buf,
+                content: ChildContent::Owned(buf),
+                size: buf_size,
                 metadata: BTreeMap::new(),
                 warnings: Vec::new(),
                 entry_name: Some(raw_name),

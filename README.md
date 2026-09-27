@@ -69,8 +69,13 @@ entropy: 0x0(4.05)
 | gzip | native decompression, resource limits |
 | XZ | native container walk + LZMA2, resource limits |
 | TAR | native entry extraction, safe-path rules |
+| U-Boot uImage (legacy) | 64-byte header validation (header+data CRC), exact boundary, IH_TYPE_MULTI components |
+| CPIO newc/crc | native entry walk, TRAILER!!! boundary, per-entry checksum (crc variant) |
 | GIF/RAR/7z | generic carving fallback (recovery only) |
 
+Handler children are either **owned bytes** (decompression output) or
+**source-backed regions** (zero-copy views into the parent input) — the
+latter is what makes firmware/initramfs containers cheap to analyze.
 See [docs/capabilities.md](docs/capabilities.md) for the full matrix,
 [docs/architecture.md](docs/architecture.md) for the engine design, and
 [docs/security.md](docs/security.md) for the extraction safety model.
