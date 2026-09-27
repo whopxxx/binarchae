@@ -37,7 +37,8 @@ offset is a typed `Error::OutOfBounds`, never a panic.
   **Overlapping artifacts coexist**: the graph never discards one
   structurally valid artifact merely because another overlaps it.
 - `RelationKind` — contains, embedded-in, carved-from, decompressed-from,
-  trailing-data, leading-data, overlap.
+  trailing-data, leading-data, overlap, partition-of, filesystem-entry,
+  reconstructed-from, memory-range, database-record.
 - `Confidence` — validated / recovered / partial / damaged / heuristic.
   There are deliberately **no floating-point confidence scores**: a claim
   is an explainable state backed by `Evidence::Facts` (human-readable
@@ -61,11 +62,19 @@ find_candidates()          fast signature scan (candidates, NOT proof)
 - Handlers own their format's boundary logic (PNG via IEND walk, JPEG via
   marker walk, PDF via %%EOF, ZIP via central directory, gzip via trailer,
   XZ via footer, TAR via 512-byte header chain, uImage via
-  `64 + ih_size`, CPIO via the `TRAILER!!!` entry).
-- Third-party crates (`zip`, `tar`, `flate2`, `lzma-rust`) sit behind the
-  project-owned `Handler` trait; only `handlers::*` may touch them.
-  uImage and CPIO are fully native (CRC32 via `crc32fast`) and depend on
-  no container crate at all.
+  `64 + ih_size`, CPIO via the `TRAILER!!!` entry, PCAP via the record
+  chain, SQLite via the b-tree page walk, GPT via CRC-verified header and
+  entry arrays, FAT via the BPB/cluster-chain layout).
+- Third-party crates (`zip`, `tar`, `flate2`, `sevenz-rust2`, `cab`,
+  `zstd`, `bzip2`, ...) sit behind the project-owned `Handler` trait;
+  only `handlers::*` may touch them. uImage, CPIO, GPT/MBR, FAT, SQLite,
+  PCAP/PCAPNG, Minidump, DTB, and Android boot are fully native parsers
+  with no container-crate dependency.
+- **Recovery handlers register last** and are contractually forbidden
+  from claiming regions a primary handler validated: `ZipSalvageHandler`
+  stands down when an intact EOCD exists. Structural parsing stays
+  authoritative; salvage only fires on damaged input and always stamps
+  `Confidence::Recovered`.
 
 ## Child content: owned vs source-backed
 
@@ -137,9 +146,29 @@ recursion pass, while the graph faithfully records every occurrence.
 | max_child_size | 64 MiB |
 | max_archive_entries | 4096 |
 | max_expansion_ratio | 200× |
+| max_records | 100 000 |
+| max_partitions | 128 |
+| max_streams | 1024 |
+| max_reconstructed_bytes | 64 MiB |
+| max_sqlite_pages | 65 536 |
+| max_registry_cells | 1 000 000 |
+| max_string_candidates | 4096 |
+| max_fs_entries | 65 536 |
 
 A shared `Budget` charges decompressed/carved bytes across the whole run;
 handlers check it before accepting expansion.
+
+## Fuzzing & benchmarks
+
+- `fuzz/` — cargo-fuzz harness with three targets: whole-engine scanning
+  under tightened limits, direct per-handler `validate()` on arbitrary
+  (offset, bytes), and untrusted TOML carving-rule parsing. Invariant:
+  any input must end in a bounded graph or a typed rejection — never a
+  panic, OOB read, or hang.
+- `benches/scan_bench.rs` — criterion benchmarks over representative
+  fixture classes (single image, nested gzip, 500-entry archive,
+  high-entropy no-hit blob) to catch throughput regressions in the scan
+  loop and signature search.
 
 ## Extraction layout
 

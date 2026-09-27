@@ -58,20 +58,35 @@ Example output on a PNG with an appended ZIP:
 entropy: 0x0(4.05)
 ```
 
-## Current supported formats
+## Supported formats (M3 core roadmap)
 
-| Format | Support level |
-|---|---|
-| PNG | structural chunk walk, IEND-proven boundary, trailing-data detection |
-| JPEG | marker-aware validation, EOI boundary |
-| PDF | structural validation, honest validated/heuristic status |
-| ZIP | native inspection + extraction, encrypted-entry recognition |
-| gzip | native decompression, resource limits |
-| XZ | native container walk + LZMA2, resource limits |
-| TAR | native entry extraction, safe-path rules |
-| U-Boot uImage (legacy) | 64-byte header validation (header+data CRC), exact boundary, IH_TYPE_MULTI components |
-| CPIO newc/crc | native entry walk, TRAILER!!! boundary, per-entry checksum (crc variant) |
-| GIF/RAR/7z | generic carving fallback (recovery only) |
+Structural parsing across the core CTF format space — no magic-only
+stubs for the major formats:
+
+- **Archives/compression**: ZIP, gzip, XZ, zlib, bzip2, Zstd, LZ4, TAR,
+  CPIO (newc/crc), AR, DEB, CAB, 7z (extraction; encrypted detected);
+  Brotli/deflate via nesting (no signature exists — stated honestly).
+- **Images/media**: PNG, JPEG, GIF, BMP, TIFF, WebP, RIFF (WAV/AVI),
+  MP3 (strict frame validation), FLAC.
+- **Executables**: ELF, PE, Mach-O, WASM, OLE/CFB, RTF.
+- **Disks/filesystems**: MBR (+EBR chains), GPT (CRC-verified), FAT12/16/32
+  (LFN, fragmented-file reconstruction), ISO9660; NTFS/ext/SquashFS/UBI
+  superblock-level (documented Partial).
+- **Firmware**: uImage (legacy, CRC-verified), DTB/FIT, Android boot,
+  TRX, UEFI firmware volume (Partial).
+- **Forensics**: SQLite (b-tree walk, records, overflow chains), PCAP
+  (all endianness variants), PCAPNG, Windows Minidump, Registry hive
+  (hbin/cell walk, Partial), string/URL/flag hints (heuristic).
+- **Recovery**: truncated-ZIP local-entry salvage — partial data beats
+  none, and recovery never masks honest validation of intact archives.
+
+Handler children are either **owned bytes** (decompression output) or
+**source-backed regions** (zero-copy views into the parent input) — the
+latter is what makes firmware images, disk images, and packet captures
+cheap to analyze.
+See [docs/capabilities.md](docs/capabilities.md) for the full matrix,
+[docs/architecture.md](docs/architecture.md) for the engine design, and
+[docs/security.md](docs/security.md) for the extraction safety model.
 
 Handler children are either **owned bytes** (decompression output) or
 **source-backed regions** (zero-copy views into the parent input) — the
@@ -79,6 +94,17 @@ latter is what makes firmware/initramfs containers cheap to analyze.
 See [docs/capabilities.md](docs/capabilities.md) for the full matrix,
 [docs/architecture.md](docs/architecture.md) for the engine design, and
 [docs/security.md](docs/security.md) for the extraction safety model.
+
+## Development
+
+```bash
+cargo test --workspace          # unit + integration scenarios
+cargo bench                     # criterion scan benchmarks
+cargo install cargo-fuzz && cargo fuzz run engine_scan_memory   # fuzzing (nightly)
+```
+
+`fuzz/` targets the whole engine, per-handler validation, and the
+carving-rule parser; `benches/` tracks scan throughput regressions.
 
 ## Resource limits
 
