@@ -249,6 +249,9 @@ pub fn builtin_handlers() -> Vec<Box<dyn Handler>> {
         Box::new(handlers::cpio::CpioHandler),
         Box::new(handlers::tar::TarHandler),
         Box::new(handlers::pdf::PdfHandler),
+        // Recovery handlers run last: they stand down whenever a primary
+        // handler validated the region and only fire on damaged input.
+        Box::new(handlers::recovery::ZipSalvageHandler),
     ]
 }
 

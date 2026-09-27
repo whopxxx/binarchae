@@ -15,6 +15,7 @@ pub mod jpeg;
 pub mod media;
 pub mod pdf;
 pub mod png;
+pub mod recovery;
 pub mod sqlite;
 pub mod tar;
 pub mod uimage;
