@@ -57,11 +57,10 @@ impl Handler for ElfHandler {
         }
         let is64 = class == 2;
         let le = data == 1;
-        let (u16_at, u32_at, u64_at): (
-            fn(&ByteSource, u64) -> Option<u16>,
-            fn(&ByteSource, u64) -> Option<u32>,
-            fn(&ByteSource, u64) -> Option<u64>,
-        ) = if le {
+        type U16Fn = fn(&ByteSource, u64) -> Option<u16>;
+        type U32Fn = fn(&ByteSource, u64) -> Option<u32>;
+        type U64Fn = fn(&ByteSource, u64) -> Option<u64>;
+        let (u16_at, u32_at, u64_at): (U16Fn, U32Fn, U64Fn) = if le {
             (Self::le16, Self::le32, Self::le64)
         } else {
             (Self::be16, Self::be32, Self::be64)
@@ -571,7 +570,7 @@ impl Handler for OleHandler {
         let major = crate::handlers::media_read_u16_le(src, base + 26).unwrap_or(0);
         let sector_shift = crate::handlers::media_read_u16_le(src, base + 30).unwrap_or(9);
         let sector_size = 1u64 << sector_shift;
-        if sector_shift < 6 || sector_shift > 9 {
+        if !(6..=9).contains(&sector_shift) {
             return Err(Error::Validation {
                 format: "ole",
                 reason: format!("invalid sector shift {sector_shift}"),
@@ -815,7 +814,7 @@ mod exec_tests {
         let out = validate_at(&WasmHandler, &src, 0).expect("wasm validates");
         let art = &out.artifacts[0];
         assert_eq!(art.confidence, Confidence::Validated);
-        assert_eq!(art.size, src.len() as u64);
+        assert_eq!(art.size, src.len());
         assert_eq!(
             art.metadata.get("section_list").map(String::as_str),
             Some("type,function")
@@ -838,6 +837,6 @@ mod exec_tests {
         let out = validate_at(&RtfHandler, &src, 0).expect("rtf validates");
         let art = &out.artifacts[0];
         assert_eq!(art.size, 29, "boundary = balanced close brace");
-        assert!(art.size < src.len() as u64, "trailing text stays outside");
+        assert!(art.size < src.len(), "trailing text stays outside");
     }
 }

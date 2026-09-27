@@ -408,7 +408,7 @@ impl Handler for TiffHandler {
                 });
             }
         }
-        if ifd_count > limits.max_records as usize {
+        if ifd_count > limits.max_records {
             return Err(Error::Validation {
                 format: "tiff",
                 reason: "IFD limit exceeded".into(),
@@ -624,7 +624,7 @@ impl Handler for RiffHandler {
         Ok(HandlerOutput {
             artifacts: vec![ArtifactDraft {
                 format: "riff".to_string(),
-                label: format!("{kind}"),
+                label: kind.to_string(),
                 offset: base,
                 size,
                 confidence: Confidence::Validated,
@@ -889,7 +889,7 @@ impl Handler for FlacHandler {
         let mut saw_streaminfo = false;
         let mut last = false;
         let mut blocks = 0usize;
-        while !last && blocks < limits.max_records.min(4096) as usize {
+        while !last && blocks < limits.max_records.min(4096) {
             if off + 4 > src.len() {
                 return Err(Error::Validation {
                     format: "flac",
@@ -982,7 +982,7 @@ mod tests {
         let out = validate_at(&GifHandler, &src, 0).expect("gif validates");
         let art = &out.artifacts[0];
         assert_eq!(art.confidence, Confidence::Validated);
-        assert_eq!(art.size, src.len() as u64, "trailer ends the archive");
+        assert_eq!(art.size, src.len(), "trailer ends the archive");
         assert_eq!(art.metadata.get("width").map(String::as_str), Some("3"));
         assert_eq!(
             art.metadata.get("graphic_control").map(String::as_str),
