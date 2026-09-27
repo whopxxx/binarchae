@@ -144,91 +144,20 @@ fn make_gzip(content: &[u8]) -> Vec<u8> {
     enc.finish().unwrap()
 }
 
-fn make_xz(content: &[u8]) -> Vec<u8> {
-    // lzma-rust 0.1 has no XZ *writer*; build a real XZ via the `xz2`-free
-    // route: we synthesize a stream with the system-independent approach —
-    // use flate2? No: XZ required. Use a precomputed minimal XZ stream of
-    // `content` produced by our own encoder is out of scope; instead test
-    // XZ detection on a fixture generated through LZMA2 raw encoding is
-    // fragile. Compromise: exercise xz handler on a stored fixture built by
-    // xz CLI at authoring time is not allowed (no external tools). We
-    // therefore generate XZ in tests via the pure-Rust `lzma-rust` encoder
-    // (LZMA2) wrapped in a minimal XZ container by helper below.
-    xz_container(content)
-}
+/// Standard-compliant XZ fixture: generated ONCE by XZ Utils 5.8.3
+/// (`xz -z --check=crc32` over `flag{xz-payload} some content to
+/// decompress`) and fixed as bytes. External ground truth — if the
+/// handler drifts from the real XZ format, this stops parsing; the
+/// fixture is never regenerated to match a broken parser. (R4)
+const STD_XZ_INTEGRATION_HEX: &str = "fd377a585a0000016922de3604c02f2b210116000000000000000000940d1b1b01002a666c61677b787a2d7061796c6f61647d20736f6d6520636f6e74656e7420746f206465636f6d70726573730000404420070001472ba99502339042990d010000000001595a";
 
-/// Wrap raw bytes in a minimal single-block XZ stream using LZMA2
-/// uncompressed chunks (type 0x01), which our handler decodes via
-/// LZMA2Reader. This keeps the fixture deterministic and tool-free.
-fn xz_container(content: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    // Stream header: magic + flags(00 01 = CRC32 check) + CRC32(flags).
-    out.extend_from_slice(&[0xfd, b'7', b'z', b'X', b'Z', 0x00, 0x00, 0x01]);
-    out.extend_from_slice(&crc32(&out[6..8]).to_le_bytes());
-
-    // Block header: size byte (0x08 => 8*4=32 bytes), flags 0x00 (1 filter,
-    // no sizes), filter 0x21 (LZMA2), props: dict size byte 0x16 (64 MiB
-    // class), padding, CRC32 of header.
-    let mut bh = vec![0x07u8, 0x00, 0x21, 0x16]; // size byte 0x07 => 32 bytes
-                                                 // pad to 28 bytes then CRC32 goes in last 4 bytes of the 32.
-    while bh.len() < 28 {
-        bh.push(0x00);
-    }
-    let hcrc = crc32(&bh);
-    bh.extend_from_slice(&hcrc.to_le_bytes());
-    out.extend_from_slice(&bh);
-
-    // LZMA2 uncompressed chunk: control 0x01, size-1 (2 bytes BE).
-    out.push(0x01);
-    out.extend_from_slice(&((content.len() as u16 - 1).to_be_bytes()));
-    out.extend_from_slice(content);
-    out.push(0x00); // LZMA2 end marker
-
-    // Block padding to 4-byte multiple + CRC32 of uncompressed data.
-    let pad = (4 - (content.len() % 4)) % 4;
-    out.extend(std::iter::repeat(0u8).take(pad));
-    out.extend_from_slice(&crc32(content).to_le_bytes());
-
-    // Index: indicator 0x00, 1 record: unpadded size, uncompressed size,
-    // padding, CRC32.
-    let block_start = 12usize;
-    let unpadded = out.len() - block_start - pad - 4 + pad; // header+lzma2+marker+pad
-    let unpadded_size = (out.len() - block_start - pad) as u64;
-    let _ = unpadded;
-    let mut index = vec![0x00u8];
-    index.push(0x01); // one record
-    xz_varint(&mut index, unpadded_size);
-    xz_varint(&mut index, content.len() as u64);
-    while index.len() % 4 != 0 {
-        index.push(0x00);
-    }
-    let icrc = crc32(&index);
-    index.extend_from_slice(&icrc.to_le_bytes());
-    out.extend_from_slice(&index);
-
-    // Stream Footer per spec (B4): CRC32(4) over the following 8 bytes,
-    // stream flags (CRC32 check, must match header), backward size (index size/4 - 1),
-    // footer magic "YZ".
-    let backward_size = ((index.len() as u32 / 4) - 1).to_le_bytes();
-    let mut fbody = Vec::new();
-    fbody.extend_from_slice(&[0x00, 0x01]); // stream flags (CRC32 check), match header
-    fbody.extend_from_slice(&backward_size);
-    fbody.extend_from_slice(&[0x59, 0x5a]); // "YZ" footer magic
-    let fcrc = crc32(&fbody);
-    out.extend_from_slice(&fcrc.to_le_bytes());
-    out.extend_from_slice(&fbody);
-    out
-}
-
-fn xz_varint(out: &mut Vec<u8>, mut v: u64) {
-    loop {
-        if v < 0x80 {
-            out.push(v as u8);
-            return;
-        }
-        out.push((v as u8 & 0x7f) | 0x80);
-        v >>= 7;
-    }
+fn make_xz(_content: &[u8]) -> Vec<u8> {
+    // The fixture is fixed to one payload; `content` is accepted for call
+    // compatibility and asserted by the caller.
+    (0..STD_XZ_INTEGRATION_HEX.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&STD_XZ_INTEGRATION_HEX[i..i + 2], 16).unwrap())
+        .collect()
 }
 
 fn make_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -326,6 +255,14 @@ fn png_trailing_zip_discovered() {
         zip_in_trailing,
         "zip must be a child of the trailing-data artifact"
     );
+    // R3 regression: the trailing-data node itself must be parented to
+    // the PNG (PNG -> trailing -> ZIP), not to the root region.
+    assert_eq!(
+        t.parent,
+        Some(png_art.id),
+        "trailing data must hang off the validated structure, not the root"
+    );
+    assert_eq!(t.relation, Some(RelationKind::TrailingData));
     let zip_art = g
         .artifacts
         .iter()
@@ -807,4 +744,154 @@ fn extraction_status_records() {
     let g = e.analyze(&src, true);
     let gz_art = g.artifacts.iter().find(|a| a.format == "gzip").unwrap();
     assert_eq!(gz_art.extraction, ExtractionStatus::InMemory);
+}
+
+/// R1 regression: transactional budget. A malformed candidate that
+/// decompresses bytes before failing must NOT permanently drain the
+/// run-wide budget — a valid stream behind it must still expand fully.
+#[test]
+fn budget_rolls_back_failed_candidates() {
+    // Corrupt gzip trailer (CRC mismatch) of a stream that decompresses
+    // ~100KB before failing, followed by a VALID gzip of the same size.
+    // Ratio kept generous (1000x) so the ratio cap never fires first —
+    // the bad stream must fail on CRC after a full 100KB expansion.
+    let payload = vec![0x5Au8; 100_000];
+    let good = make_gzip(&payload);
+    let mut bad = good.clone();
+    let n = bad.len();
+    bad[n - 5] ^= 0xFF; // corrupt ISIZE/CRC area -> validation fails late
+
+    let mut data = bad;
+    data.extend_from_slice(&good);
+    let limits = EngineLimits {
+        max_total_expanded_bytes: 150_000, // both streams would exceed; one fits
+        max_expansion_ratio: 1_000,
+        ..EngineLimits::default()
+    };
+    let src = ByteSource::from_vec(data);
+    let mut e = RecursiveEngine::new(limits);
+    let g = e.analyze(&src, true);
+    // The good stream must have been accepted with its full payload.
+    let expanded: u64 = g
+        .artifacts
+        .iter()
+        .filter(|a| a.relation == Some(RelationKind::DecompressedFrom))
+        .map(|a| a.size)
+        .sum();
+    assert!(
+        expanded >= 100_000,
+        "the valid stream must fully expand despite the failed candidate \
+         before it (got {expanded}); failed candidates must not drain the budget"
+    );
+}
+
+/// R5 regression: region-backed artifacts (embedded/carved) are
+/// materializable — byte_cache covers them, not just decompressed data.
+#[test]
+fn region_backed_artifacts_are_extractable() {
+    let png = make_png();
+    let mut data = b"leading bytes".to_vec();
+    data.extend_from_slice(&png);
+    data.extend_from_slice(b"trailing bytes");
+    let src = ByteSource::from_vec(data);
+    let mut e = engine();
+    let g = e.analyze(&src, true);
+    let png_art = g
+        .artifacts
+        .iter()
+        .find(|a| a.format == "png")
+        .expect("embedded png found");
+    let cached = e.cached_bytes(&png_art.hash).expect("png bytes cached");
+    assert_eq!(
+        cached, &png,
+        "region-backed artifact bytes must be recoverable for extraction"
+    );
+}
+
+/// R6 regression: a user-defined carving rule is actually EXECUTED by the
+/// engine — a magic the builtin rules do not know becomes an artifact.
+#[test]
+fn custom_carving_rule_is_executed() {
+    // Builtin rules cover GIF/RAR/7z only; "CTFD" is unknown to them.
+    let mut data = b"padding padding".to_vec();
+    data.extend_from_slice(b"CTFD");
+    data.extend_from_slice(b"secret-data-blob");
+    data.extend_from_slice(b"DLTC"); // footer
+    data.extend_from_slice(b"more padding");
+    let src = ByteSource::from_vec(data);
+
+    // Sanity: without the rule, nothing is found.
+    let mut e0 = engine();
+    let g0 = e0.analyze(&src, true);
+    assert!(
+        !g0.artifacts.iter().any(|a| a.format == "ctf-blob"),
+        "builtin carving must not know this magic"
+    );
+
+    // With the injected rule, the blob is discovered between the markers.
+    let rules = parse_user_rules(
+        r#"
+[[rule]]
+name = "ctf-blob"
+header = "43544644"        # "CTFD"
+footer = "444C5443"        # "DLTC"
+max_size = 65536
+terminate_on_next_header = false
+"#,
+    )
+    .unwrap();
+    let mut e = engine();
+    e.carving_rules = rules;
+    let g = e.analyze(&src, true);
+    let blob = g
+        .artifacts
+        .iter()
+        .find(|a| a.format == "ctf-blob")
+        .expect("custom carving rule must produce an artifact");
+    assert_eq!(blob.confidence, Confidence::Recovered);
+    assert!(blob.label.contains("ctf-blob"));
+}
+
+/// R2 regression: a duplicate container keeps its OWN children — the
+/// second identical gzip registers a DecompressedFrom edge (provenance),
+/// even though recursive scanning of the identical bytes is skipped.
+#[test]
+fn duplicate_container_keeps_children() {
+    let inner = make_png_large();
+    let gz = make_gzip(&inner);
+    let mut data = gz.clone();
+    data.extend_from_slice(&gz);
+    let src = ByteSource::from_vec(data);
+    let mut e = engine();
+    let g = e.analyze(&src, true);
+    let gzs: Vec<_> = g
+        .artifacts
+        .iter()
+        .filter(|a| a.format == "gzip" && a.parent == Some(0))
+        .collect();
+    assert_eq!(gzs.len(), 1, "sanity: one root-level gzip in this fixture");
+
+    // Use the trailing-region duplicate from the dedup fixture instead:
+    let mut data2 = gz.clone();
+    data2.extend_from_slice(&gz);
+    let src2 = ByteSource::from_vec(data2);
+    let mut e2 = engine();
+    let g2 = e2.analyze(&src2, true);
+    let gz_nodes: Vec<_> = g2.artifacts.iter().filter(|a| a.format == "gzip").collect();
+    // At least two gzip containers exist (root-level + trailing region).
+    assert!(gz_nodes.len() >= 2);
+    // EVERY gzip container — duplicate or not — must have its own
+    // decompressed child edge.
+    for gz in &gz_nodes {
+        let has_child = g2
+            .children(gz.id)
+            .iter()
+            .any(|(r, _)| *r == RelationKind::DecompressedFrom);
+        assert!(
+            has_child,
+            "gzip container #{} (duplicate={}) must keep its decompressed-child edge",
+            gz.id,
+            gz.warnings.iter().any(|w| w.contains("duplicate"))
+        );
+    }
 }

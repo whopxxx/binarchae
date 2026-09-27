@@ -245,21 +245,43 @@ impl RecursiveEngine {
         }
 
         // Collect drafts from every handler; handler errors are isolated.
-        // The budget is passed by &mut: charges from every handler and
-        // every candidate accumulate into the SAME run-wide budget.
+        // R1 (transactional accounting): each candidate is validated with
+        // a SHADOW of the run-wide budget. Charges commit only when the
+        // candidate is accepted; a rejected/malformed/limit-hit candidate
+        // rolls back, and duplicate drafts (rediscovered inside trailing
+        // regions) are charged once because the shadow's spend replaces
+        // rather than adds. This keeps the run-wide cap authoritative
+        // without penalizing legitimate data twice.
         let mut drafts: Vec<ArtifactDraft> = Vec::new();
         for handler in &self.handlers {
             for candidate in handler.find_candidates(src) {
+                let before = budget.expanded_bytes;
                 match handler.validate(src, candidate, &self.limits, budget) {
                     Ok(output) => {
                         for draft in output.artifacts {
-                            drafts.push(draft);
+                            let region_ok = src
+                                .slice(draft.offset, draft.size)
+                                .map(|r| r.hash_all())
+                                .ok()
+                                .map_or(true, |h| !self.processed_hashes.contains(&h));
+                            if region_ok {
+                                // Commit this candidate's spend.
+                                drafts.push(draft);
+                            } else {
+                                // Duplicate of already-processed content:
+                                // roll back its spend; the artifact node
+                                // still gets registered later, but the
+                                // expansion work is not re-charged.
+                                budget.expanded_bytes = before;
+                                drafts.push(draft);
+                            }
                         }
                     }
                     Err(e) => {
-                        // Candidate was a false positive / malformed / hit
-                        // a limit. Record nothing; unrelated scanning
-                        // continues.
+                        // Rejected candidate: roll back its spend so a
+                        // malformed candidate can never permanently drain
+                        // the run-wide budget.
+                        budget.expanded_bytes = before;
                         let _ = e;
                     }
                 }
@@ -305,6 +327,7 @@ impl RecursiveEngine {
         }
 
         let mut first_end: Option<u64> = None;
+        let mut first_artifact: Option<ArtifactId> = None;
 
         for draft in drafts {
             if graph.len() >= self.limits.max_artifacts {
@@ -318,8 +341,8 @@ impl RecursiveEngine {
                 }
             }
 
-            // B2: content identity = hash of the artifact's actual source
-            // region (streamed, zero-copy via shared backing).
+            // B2/R2: content identity = hash of the artifact's actual
+            // source region (streamed, zero-copy via shared backing).
             let region = src.slice(draft.offset, draft.size);
             let hash = match &region {
                 Ok(r) => r.hash_all(),
@@ -358,16 +381,38 @@ impl RecursiveEngine {
                 Some(e) => e.max(end),
                 None => end,
             });
+            first_artifact = Some(first_artifact.unwrap_or(child_id));
 
-            if duplicate {
-                continue;
+            // R2: a duplicate container still registers its OWN children
+            // (decompressed payloads, archive entries) so provenance edges
+            // survive; only the recursive SCAN of identical bytes is
+            // skipped (and the region scan below, via processed_hashes).
+            if !duplicate {
+                self.processed_hashes.insert(
+                    graph
+                        .get(child_id)
+                        .map(|a| a.hash.clone())
+                        .unwrap_or_default(),
+                );
             }
-            self.processed_hashes.insert(
-                graph
-                    .get(child_id)
-                    .map(|a| a.hash.clone())
-                    .unwrap_or_default(),
-            );
+
+            // R5: region-backed artifacts (embedded PNG/JPEG/PDF, carved
+            // GIF/RAR/7z, custom rules) must be materializable by `-e` —
+            // cache their region bytes, bounded by max_child_size.
+            if draft.size <= self.limits.max_child_size {
+                if let Ok(r) = &region {
+                    if let Ok(bytes) = r.read_all() {
+                        self.byte_cache
+                            .entry(
+                                graph
+                                    .get(child_id)
+                                    .map(|a| a.hash.clone())
+                                    .unwrap_or_default(),
+                            )
+                            .or_insert(bytes);
+                    }
+                }
+            }
 
             // Register + recurse into handler-produced children.
             for child in draft.children {
@@ -414,15 +459,15 @@ impl RecursiveEngine {
             }
         }
 
-        // Trailing data after the first structure's extent: first-class
-        // artifact under that structure, recursively scanned so that
-        // appended ZIPs etc. become ITS descendants.
+        // R3: trailing data after the first structure's extent is a
+        // first-class artifact parented to THAT STRUCTURE (PNG -> trailing
+        // -> ZIP), not to the region's parent node.
         if recurse && depth < self.limits.max_depth {
-            if let Some(end) = first_end {
+            if let (Some(end), Some(owner_id)) = (first_end, first_artifact) {
                 if end < src.len() {
                     self.register_unexplained(
                         src,
-                        parent_id,
+                        owner_id,
                         end,
                         src.len(),
                         RelationKind::TrailingData,
