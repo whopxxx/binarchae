@@ -1,6 +1,7 @@
 //! Format handlers. Each owns its candidate discovery, structural
 //! validation, boundary determination, and child production.
 
+pub mod compression;
 pub mod cpio;
 pub mod gzip;
 pub mod jpeg;
