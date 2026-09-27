@@ -2,16 +2,16 @@
 //! boot image, TRX (Broadcom), and UEFI firmware volume (FFS).
 //!
 //! - DTB: FDT header validation (magic 0xD00DFEED, header fields),
-//!  device-tree structure block walk (FDT_BEGIN_NODE / FDT_END_NODE /
-//!  FDT_PROP / FDT_NOP / FDT_END), memory-reservation block awareness,
-//!  strings block metadata. Node names surface in evidence.
+//!   device-tree structure block walk (FDT_BEGIN_NODE / FDT_END_NODE /
+//!   FDT_PROP / FDT_NOP / FDT_END), memory-reservation block awareness,
+//!   strings block metadata. Node names surface in evidence.
 //! - Android boot: magic "ANDROID!", kernel/ramdisk/second sizes +
-//!  offsets with checked bounds; kernel/ramdisk payloads become
-//!  source-backed children.
+//!   offsets with checked bounds; kernel/ramdisk payloads become
+//!   source-backed children.
 //! - TRX: magic "HDR0", version, length field as exact boundary;
-//!  payload partitioning into source-backed children.
+//!   payload partitioning into source-backed children.
 //! - UEFI FV: zero vector + "_FVH" signature at 0x28, GUID/length
-//!  metadata; FFS file walking deferred (honest Partial).
+//!   metadata; FFS file walking deferred (honest Partial).
 
 use crate::artifact::{Confidence, Evidence, RelationKind};
 use crate::bytesource::ByteSource;
