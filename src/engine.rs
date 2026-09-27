@@ -231,6 +231,7 @@ pub fn builtin_handlers() -> Vec<Box<dyn Handler>> {
         Box::new(handlers::exec::RtfHandler),
         Box::new(handlers::disk::GptHandler),
         Box::new(handlers::disk::MbrHandler),
+        Box::new(handlers::fat::FatHandler),
         Box::new(handlers::cpio::CpioHandler),
         Box::new(handlers::tar::TarHandler),
         Box::new(handlers::pdf::PdfHandler),
