@@ -1,0 +1,120 @@
+# Architecture
+
+## Overview
+
+ctf-tools is built around one invariant: **every useful thing discovered from
+input data is an Artifact, and every parser/extractor exists to discover
+additional artifacts.**
+
+```text
+input ──> Engine ──> Handler[format] ──> Artifact(s) ──> children ──> recursion
+                 └─> carving fallback (when no handler claims the region)
+```
+
+## ByteSource design
+
+`ByteSource` is the single abstraction for readable bytes:
+
+- **Memory** — in-memory buffers (fixtures, decompressed payloads).
+- **File** — opened lazily per read; reads are positioned, never slurped.
+- **Child** — a *cheap* bounded view of a parent source (no copying, no
+  temp files).
+
+All reads go through `read_at(offset, buf)` which is bounds-checked against
+the view's own length; nested views translate offsets through the chain of
+`parent_offset`s. `root_offset()` reports where a view starts relative to
+the ultimate root, which the artifact model uses for provenance.
+
+Integer arithmetic on offsets is overflow-checked (`checked_add`); a bogus
+offset is a typed `Error::OutOfBounds`, never a panic.
+
+## Artifact / graph model
+
+- `Artifact` — id, parent, relation, format, label, offset/size, BLAKE3
+  content hash, confidence, evidence, extraction status, metadata,
+  warnings, errors.
+- `ArtifactGraph` — append-only vector of artifacts plus provenance edges.
+  **Overlapping artifacts coexist**: the graph never discards one
+  structurally valid artifact merely because another overlaps it.
+- `RelationKind` — contains, embedded-in, carved-from, decompressed-from,
+  trailing-data, leading-data, overlap.
+- `Confidence` — validated / recovered / partial / damaged / heuristic.
+  There are deliberately **no floating-point confidence scores**: a claim
+  is an explainable state backed by `Evidence::Facts` (human-readable
+  structural facts), not a magic number.
+
+## Handler lifecycle
+
+Each format handler implements the staged model:
+
+```text
+find_candidates()          fast signature scan (candidates, NOT proof)
+  -> validate(candidate)   structural validation + boundary determination
+     -> ArtifactDraft(s)   (with inline bytes and/or child drafts)
+        -> engine registers artifacts
+           -> recursion into artifact bytes and children
+```
+
+- Magic bytes are only *candidates*. A candidate that fails structural
+  validation is dropped; its failure never aborts unrelated scanning
+  (handler errors are isolated per candidate).
+- Handlers own their format's boundary logic (PNG via IEND walk, JPEG via
+  marker walk, PDF via %%EOF, ZIP via central directory, gzip via trailer,
+  XZ via footer, TAR via 512-byte header chain).
+- Third-party crates (`zip`, `tar`, `flate2`, `lzma-rust`) sit behind the
+  project-owned `Handler` trait; only `handlers::*` may touch them.
+
+## Recursion model
+
+The same `RecursiveEngine` analyzes root and child regions. After
+registering an artifact the engine scans:
+
+1. the artifact's inline bytes (structurally-claimed regions), and
+2. handler-produced children (decompressed streams, archive members),
+
+with the identical candidate→validate→register pipeline. Regions claimed
+by no handler fall through to the generic carving layer, which keeps
+structural parsing authoritative.
+
+## Dedup model
+
+Content identity is BLAKE3. When an artifact's hash was already processed:
+
+- the artifact is **still registered** (provenance preserved), and
+- recursive work is skipped once per unique hash.
+
+This means N logical artifacts pointing at identical bytes cost one
+recursion pass, while the graph faithfully records every occurrence.
+
+## Limits
+
+`EngineLimits` (all enforced from the first release):
+
+| Limit | Default |
+|---|---|
+| max_depth | 8 |
+| max_artifacts | 512 |
+| max_total_expanded_bytes | 512 MiB |
+| max_child_size | 64 MiB |
+| max_archive_entries | 4096 |
+| max_expansion_ratio | 200× |
+
+A shared `Budget` charges decompressed/carved bytes across the whole run;
+handlers check it before accepting expansion.
+
+## Extraction layout
+
+`ctf-tools -e input` writes deterministically:
+
+```text
+<input>.extracted/
+  report.json          full artifact graph (same schema as --json)
+  tree.txt             compact artifact tree
+  artifacts/
+    000001_png/        per-artifact directory, index = discovery order
+    000002_zip/
+      flag.txt         archive entries restored under safe paths
+```
+
+Entry names pass the safe-path layer (see docs/security.md) before
+anything touches disk; duplicates get deterministic `__N` suffixes.
