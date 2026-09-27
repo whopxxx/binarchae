@@ -1,0 +1,42 @@
+[package]
+name = "ctf-tools-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ctf-tools]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "engine_scan_memory"
+path = "fuzz_targets/engine_scan_memory.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handler_roundtrip"
+path = "fuzz_targets/handler_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "carving_rules"
+path = "fuzz_targets/carving_rules.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
