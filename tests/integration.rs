@@ -586,29 +586,59 @@ fn expansion_limit_enforced() {
 
 /// (10b) Run-wide budget: charges accumulate ACROSS handlers/artifacts.
 /// Two large gzip streams must jointly exceed a budget that either alone
-/// would fit (B1 regression).
+/// would fit. G1: payloads are incompressible (xorshift) so each stream's
+/// expansion ratio is ~1x — the per-stream ratio cap can never fire, and
+/// the run-wide total-expanded budget is provably the final rejection
+/// reason. The second stream's decompressed child must be REFUSED, not
+/// merely truncated.
 #[test]
 fn budget_is_run_wide() {
-    let big1 = vec![0xAAu8; 60_000];
-    let big2 = vec![0xBBu8; 60_000];
-    let mut data = make_gzip(&big1);
-    data.extend_from_slice(&make_gzip(&big2));
+    fn incompressible(seed: u32, n: usize) -> Vec<u8> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+    let big1 = incompressible(0xAAAA_0001, 60_000);
+    let big2 = incompressible(0xBBBB_0002, 60_000);
+    let gz1 = make_gzip(&big1);
+    let gz2 = make_gzip(&big2);
+    // Sanity: each compressed stream is large enough that even a very
+    // generous ratio cap would allow the first expansion — the ratio cap
+    // is NOT what rejects the second one.
+    assert!(gz1.len() > 50_000 && gz2.len() > 50_000);
+    let mut data = gz1;
+    data.extend_from_slice(&gz2);
     let limits = EngineLimits {
         max_total_expanded_bytes: 100_000, // each stream fits; both don't
+        max_expansion_ratio: 100_000,      // effectively disabled
+        max_child_size: 1_000_000,         // child cap out of the way
         ..EngineLimits::default()
     };
     let src = ByteSource::from_vec(data);
     let mut e = RecursiveEngine::new(limits);
     let g = e.analyze(&src, true);
-    let total_children: u64 = g
+    let expanded: Vec<u64> = g
         .artifacts
         .iter()
         .filter(|a| a.relation == Some(RelationKind::DecompressedFrom))
         .map(|a| a.size)
-        .sum();
+        .collect();
+    // Exactly ONE full expansion got through; the second was refused.
+    assert_eq!(
+        expanded,
+        vec![60_000],
+        "run-wide budget must refuse the second expansion entirely \
+         (got {expanded:?})"
+    );
     assert!(
-        total_children < 120_000,
-        "run-wide budget must cap combined expansion (got {total_children})"
+        expanded.iter().sum::<u64>() < 120_000,
+        "combined expansion must stay under both streams' total"
     );
 }
 

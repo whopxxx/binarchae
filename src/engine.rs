@@ -283,26 +283,37 @@ impl RecursiveEngine {
                         for draft in output.artifacts {
                             // Commit against the run-wide budget under the
                             // real limits; regions already billed commit 0.
+                            // G1: when the run-wide commit FAILS, the draft
+                            // is refused outright — expanded children must
+                            // never enter the graph on an unbilled charge.
                             let region_hash = src
                                 .slice(draft.offset, draft.size)
                                 .map(|r| r.hash_all())
                                 .ok();
                             let already_billed = region_hash
                                 .as_ref()
-                                .map_or(true, |h| spends_by_region.contains_key(h));
-                            if !already_billed {
+                                .is_some_and(|h| spends_by_region.contains_key(h));
+                            if already_billed {
+                                // One logical expansion per region: no new
+                                // charge. The draft's children still get
+                                // registered downstream, but the child loop
+                                // deduplicates byte-identical nodes via the
+                                // content hash (edge reuse), so no unbilled
+                                // bytes can enter the graph twice.
+                                drafts.push(draft);
+                            } else {
                                 let spend = shadow.expanded_bytes;
                                 if budget.charge(&self.limits, spend) {
                                     if let Some(h) = region_hash {
                                         spends_by_region.insert(h, spend);
                                     }
+                                    drafts.push(draft);
                                 }
-                                // If the run-wide commit fails, the draft
-                                // is still registered but its children
-                                // were bounded by the shadow caps; the
-                                // budget simply stays where it is.
+                                // else: run-wide budget exhausted — this
+                                // candidate's expansion is refused. The
+                                // shadow's partial bytes are discarded;
+                                // unrelated scanning continues.
                             }
-                            drafts.push(draft);
                         }
                     }
                     Err(_e) => {
@@ -449,7 +460,29 @@ impl RecursiveEngine {
                 let chash = content_hash(&child.bytes);
                 self.byte_cache.insert(chash.clone(), child.bytes.clone());
                 let cdup = graph.has_hash(&chash) || self.processed_hashes.contains(&chash);
-                let mut ca = Artifact {
+                if cdup {
+                    // R2 + G1: a byte-identical child node already exists
+                    // in the graph (same content hash). Re-registering it
+                    // would duplicate decompressed bytes that were billed
+                    // under the first occurrence. Instead, add a
+                    // provenance EDGE from this container to the EXISTING
+                    // node, so every logical occurrence keeps its
+                    // relationship while the bytes exist exactly once.
+                    if let Some(existing) = graph
+                        .artifacts
+                        .iter()
+                        .find(|a| a.hash == chash)
+                        .map(|a| a.id)
+                    {
+                        graph.edges.push(crate::artifact::GraphEdge {
+                            parent: child_id,
+                            child: existing,
+                            relation: child.relation,
+                        });
+                    }
+                    continue;
+                }
+                let ca = Artifact {
                     id: 0,
                     parent: Some(child_id),
                     relation: Some(child.relation),
@@ -465,12 +498,8 @@ impl RecursiveEngine {
                     warnings: child.warnings,
                     errors: Vec::new(),
                 };
-                if cdup {
-                    ca.warnings
-                        .push("duplicate content; recursion skipped".to_string());
-                }
                 let cid = graph.push_child(child_id, child.relation, ca);
-                if recurse && !cdup && depth < self.limits.max_depth {
+                if recurse && depth < self.limits.max_depth {
                     let region = ByteSource::from_vec(child.bytes);
                     self.scan_region(&region, cid, depth + 1, recurse, graph, budget);
                 }
