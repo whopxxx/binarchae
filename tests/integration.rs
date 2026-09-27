@@ -623,22 +623,30 @@ fn budget_is_run_wide() {
     let src = ByteSource::from_vec(data);
     let mut e = RecursiveEngine::new(limits);
     let g = e.analyze(&src, true);
-    let expanded: Vec<u64> = g
+    // Count DISTINCT decompressed payloads by content hash: R2/H1 let a
+    // duplicate container register its own occurrence node (same bytes,
+    // same hash), so raw node counts overstate real expansion. Exactly
+    // ONE distinct payload (the first stream) must exist; the second
+    // stream's expansion was refused outright by the run-wide budget.
+    let mut distinct: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    for a in g
         .artifacts
         .iter()
         .filter(|a| a.relation == Some(RelationKind::DecompressedFrom))
-        .map(|a| a.size)
-        .collect();
-    // Exactly ONE full expansion got through; the second was refused.
+    {
+        distinct.insert(a.hash.as_str(), a.size);
+    }
+    let sizes: Vec<u64> = {
+        let mut v: Vec<u64> = distinct.values().copied().collect();
+        v.sort_unstable();
+        v
+    };
     assert_eq!(
-        expanded,
+        sizes,
         vec![60_000],
-        "run-wide budget must refuse the second expansion entirely \
-         (got {expanded:?})"
-    );
-    assert!(
-        expanded.iter().sum::<u64>() < 120_000,
-        "combined expansion must stay under both streams' total"
+        "run-wide budget must refuse the second DISTINCT expansion entirely \
+         (got {sizes:?}); duplicate-occurrence nodes share one hash and must \
+         not count as new expansion"
     );
 }
 
@@ -911,18 +919,34 @@ fn duplicate_container_keeps_children() {
     // At least two gzip containers exist (root-level + trailing region).
     assert!(gz_nodes.len() >= 2);
     // EVERY gzip container — duplicate or not — must have its own
-    // decompressed child edge.
+    // decompressed child edge, and (H1) each child node's own
+    // parent/relation fields must agree with that edge: provenance is
+    // consistent between edges and artifacts.
     for gz in &gz_nodes {
-        let has_child = g2
-            .children(gz.id)
+        let children = g2.children(gz.id);
+        let dec: Vec<_> = children
             .iter()
-            .any(|(r, _)| *r == RelationKind::DecompressedFrom);
+            .filter(|(r, _)| *r == RelationKind::DecompressedFrom)
+            .collect();
         assert!(
-            has_child,
+            !dec.is_empty(),
             "gzip container #{} (duplicate={}) must keep its decompressed-child edge",
             gz.id,
             gz.warnings.iter().any(|w| w.contains("duplicate"))
         );
+        for (_, child) in &dec {
+            assert_eq!(
+                child.parent,
+                Some(gz.id),
+                "child.parent must match the edge source (container #{})",
+                gz.id
+            );
+            assert_eq!(
+                child.relation,
+                Some(RelationKind::DecompressedFrom),
+                "child.relation must match the edge kind"
+            );
+        }
     }
 }
 

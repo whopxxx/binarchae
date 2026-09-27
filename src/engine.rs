@@ -458,31 +458,12 @@ impl RecursiveEngine {
                     break;
                 }
                 let chash = content_hash(&child.bytes);
+                // H1: the byte_cache stays keyed by content hash, so the
+                // real payload exists exactly once in memory regardless of
+                // how many logical occurrences reference it.
                 self.byte_cache.insert(chash.clone(), child.bytes.clone());
                 let cdup = graph.has_hash(&chash) || self.processed_hashes.contains(&chash);
-                if cdup {
-                    // R2 + G1: a byte-identical child node already exists
-                    // in the graph (same content hash). Re-registering it
-                    // would duplicate decompressed bytes that were billed
-                    // under the first occurrence. Instead, add a
-                    // provenance EDGE from this container to the EXISTING
-                    // node, so every logical occurrence keeps its
-                    // relationship while the bytes exist exactly once.
-                    if let Some(existing) = graph
-                        .artifacts
-                        .iter()
-                        .find(|a| a.hash == chash)
-                        .map(|a| a.id)
-                    {
-                        graph.edges.push(crate::artifact::GraphEdge {
-                            parent: child_id,
-                            child: existing,
-                            relation: child.relation,
-                        });
-                    }
-                    continue;
-                }
-                let ca = Artifact {
+                let mut ca = Artifact {
                     id: 0,
                     parent: Some(child_id),
                     relation: Some(child.relation),
@@ -498,8 +479,18 @@ impl RecursiveEngine {
                     warnings: child.warnings,
                     errors: Vec::new(),
                 };
+                if cdup {
+                    // R2 + G1 + H1: a byte-identical child already exists.
+                    // This occurrence still gets its OWN artifact node (so
+                    // `parent`/`relation` always match the graph edge), but
+                    // its recursion is skipped — identical bytes were
+                    // already scanned under the first occurrence, and no
+                    // additional expansion is billed for them.
+                    ca.warnings
+                        .push("duplicate content; recursion skipped".to_string());
+                }
                 let cid = graph.push_child(child_id, child.relation, ca);
-                if recurse && depth < self.limits.max_depth {
+                if recurse && !cdup && depth < self.limits.max_depth {
                     let region = ByteSource::from_vec(child.bytes);
                     self.scan_region(&region, cid, depth + 1, recurse, graph, budget);
                 }
