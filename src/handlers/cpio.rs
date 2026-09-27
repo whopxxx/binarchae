@@ -133,6 +133,16 @@ impl Handler for CpioHandler {
                     reason: format!("entry {entries_scanned}: name is missing its NUL terminator"),
                 });
             };
+            // D1: `c_namesize` includes the final NUL and the format
+            // allows ADDITIONAL TRAILING NULs — so everything after the
+            // first NUL must be 0x00. Anything else (`a\0X`) is a
+            // malformed name field, not a name.
+            if name_buf[name_len..].iter().any(|&b| b != 0) {
+                return Err(Error::Validation {
+                    format: "cpio",
+                    reason: format!("entry {entries_scanned}: non-NUL byte after name terminator"),
+                });
+            }
             let name = String::from_utf8_lossy(&name_buf[..name_len]).into_owned();
 
             // B2: the name area is `110 + namesize` bytes of stream, then

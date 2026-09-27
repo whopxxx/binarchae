@@ -542,6 +542,87 @@ fn cpio_name_without_nul_rejected() {
     }
 }
 
+/// Build a raw single-entry archive with an explicit name FIELD (as
+/// stored, NUL(s) included) and explicit namesize, then validate the
+/// candidate at offset 0.
+fn validate_raw_name_field(
+    name_field: &[u8],
+    data: &[u8],
+) -> Result<ctf_tools::engine::HandlerOutput, ctf_tools::Error> {
+    let mut arch: Vec<u8> = Vec::new();
+    arch.extend_from_slice(b"070701");
+    for v in [
+        1u64,
+        0o100644,
+        0,
+        0,
+        1,
+        0,
+        data.len() as u64,
+        0,
+        0,
+        0,
+        0,
+        name_field.len() as u64,
+        0,
+    ] {
+        arch.extend_from_slice(hexf(v).as_bytes());
+    }
+    arch.extend_from_slice(name_field);
+    // Align stream position after 110 + name_field to 4.
+    let pad = (4 - (110 + name_field.len() as u64) % 4) % 4;
+    arch.resize(arch.len() + pad as usize, 0);
+    arch.extend_from_slice(data);
+    let dpad = (4 - data.len() as u64 % 4) % 4;
+    arch.resize(arch.len() + dpad as usize, 0);
+    arch.extend_from_slice(&trailer("070701"));
+    let src = ByteSource::from_vec(arch);
+    let h = ctf_tools::handlers::cpio::CpioHandler;
+    let cands = h.find_candidates(&src);
+    let first = cands
+        .iter()
+        .find(|c| c.offset == 0)
+        .expect("candidate at 0");
+    h.validate(
+        &src,
+        *first,
+        &EngineLimits::default(),
+        &mut Budget::default(),
+    )
+}
+
+/// D1 regression: bytes after the first NUL in the name field must be
+/// trailing NULs only — `a\0X` is malformed and rejects...
+#[test]
+fn cpio_name_garbage_after_nul_rejected() {
+    let res = validate_raw_name_field(b"a\0X", b"d");
+    let err = res.expect_err("a\\0X must reject");
+    match err {
+        ctf_tools::Error::Validation { reason, .. } => {
+            assert!(
+                reason.contains("non-NUL byte after name terminator"),
+                "rejection must cite the post-NUL check: {reason}"
+            );
+        }
+        other => panic!("expected Validation error, got: {other:?}"),
+    }
+}
+
+/// ...while `a\0\0` (extra trailing NULs, explicitly allowed by the
+/// Linux initramfs format) is accepted and parses as name "a".
+#[test]
+fn cpio_name_extra_trailing_nuls_accepted() {
+    let out = validate_raw_name_field(b"a\0\0", b"d").expect("a\\0\\0 must parse");
+    let art = &out.artifacts[0];
+    assert_eq!(art.confidence, Confidence::Validated);
+    let child = art
+        .children
+        .iter()
+        .find(|c| c.entry_name.as_deref() == Some("a"))
+        .expect("entry named 'a'");
+    assert_eq!(child.content.to_bytes().unwrap(), b"d".to_vec());
+}
+
 /// B1 regression: registering a source-backed child must NOT copy its
 /// bytes into memory — the engine stores a zero-copy handle, and bytes
 /// are only read at materialization.
