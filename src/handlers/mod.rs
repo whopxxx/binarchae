@@ -7,6 +7,7 @@ pub mod cpio;
 pub mod disk;
 pub mod exec;
 pub mod fat;
+pub mod filesystems;
 pub mod gzip;
 pub mod jpeg;
 pub mod media;
