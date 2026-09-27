@@ -1,11 +1,13 @@
 //! Format handlers. Each owns its candidate discovery, structural
 //! validation, boundary determination, and child production.
 
+pub mod cpio;
 pub mod gzip;
 pub mod jpeg;
 pub mod pdf;
 pub mod png;
 pub mod tar;
+pub mod uimage;
 pub mod xz;
 pub mod zip;
 

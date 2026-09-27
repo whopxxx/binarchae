@@ -3,7 +3,9 @@
 
 use crate::artifact::{Confidence, Evidence, RelationKind};
 use crate::bytesource::ByteSource;
-use crate::engine::{ArtifactDraft, Budget, Candidate, ChildDraft, Handler, HandlerOutput};
+use crate::engine::{
+    ArtifactDraft, Budget, Candidate, ChildContent, ChildDraft, Handler, HandlerOutput,
+};
 use crate::error::{Error, Result};
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -99,11 +101,13 @@ impl Handler for TarHandler {
                     detail: format!("tar entry {name:?} +{} bytes", buf.len()),
                 });
             }
+            let buf_size = buf.len() as u64;
             children.push(ChildDraft {
                 relation: RelationKind::Contains,
                 label: format!("tar entry {name}"),
                 format_hint: "raw",
-                bytes: buf,
+                content: ChildContent::Owned(buf),
+                size: buf_size,
                 metadata: BTreeMap::new(),
                 warnings: Vec::new(),
                 entry_name: Some(name),
