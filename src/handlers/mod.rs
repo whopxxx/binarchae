@@ -8,6 +8,7 @@ pub mod disk;
 pub mod exec;
 pub mod fat;
 pub mod filesystems;
+pub mod firmware;
 pub mod gzip;
 pub mod jpeg;
 pub mod media;
