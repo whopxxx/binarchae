@@ -76,5 +76,5 @@ All notable changes to ctf-tools. Format based on
 
 ## [0.1.x] — earlier
 
-See git history (M1/M2/M3 milestones: artifact graph, recursion +
+See git history (development milestones: artifact graph, recursion +
 dedup, extraction safety, first 20 handlers).

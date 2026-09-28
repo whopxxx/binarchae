@@ -2,8 +2,9 @@
 
 Why each dependency exists, its license, and its native/unsafe
 footprint. Kept current with `Cargo.toml`; the authoritative license
-inventory for a release is the SBOM (`cargo cyclonedx` output attached
-to release assets).
+inventory for a release is the SBOM (`cargo cyclonedx` JSON attached to
+release assets by the release workflow, alongside the resolved
+lockfile and a `cargo tree` dump).
 
 Policy: pure-Rust dependencies are strongly preferred. A C-backed
 dependency is accepted only when no maintained pure-Rust alternative
@@ -65,8 +66,9 @@ dependency for Windows/musl cross builds.
 
 ## Integrity
 
-- `Cargo.lock` is committed for the workspace and the fuzz harness;
-  `cargo install --path . --locked` is CI-gated.
-- SBOM (CycloneDX) + license inventory are attached to releases
-  (§16.3); regenerate with `cargo cyclonedx --format json` at release
-  time.
+- `Cargo.lock` is NOT committed (the crate is an end-user binary and
+  `.gitignore` excludes it); version pins come from the exact
+  dependency declarations and CI resolves them fresh on every build.
+- Releases attach `Cargo.lock` and a dependency inventory generated at
+  release time by the release workflow (`cargo generate-lockfile` +
+  `cargo tree`), not a pre-committed lockfile.

@@ -17,13 +17,13 @@ internal structure; the limits are stated explicitly.
 | BMP | yes | yes (header fields, data size) | yes | yes | yes | dimensions, depth |
 | TIFF | yes | yes (IFD walk, endian) | yes | yes | yes | dimensions, IFD entries |
 | WebP | yes | yes (RIFF/VP8 container walk) | yes | yes | yes | dimensions, chunk list |
-| PDF | yes | yes (object scan) | stream-bounded | raw streams | yes | object count; streams carved raw (filters not applied — honest warning) |
+| PDF | yes | yes (xref verified via startxref: keyword, entry count, canonical entries, trailer /Size) | stream-bounded | raw streams | yes | xref offset/entries + trailer size metadata; object scan; streams carved raw (filters not applied — honest warning); unverifiable startxref degrades to Partial |
 
 ### Compression / archives
 
 | Format | Detect | Validate | Size | Extract | Recurse | Notes |
 |---|---:|---:|---:|---:|---:|---|
-| ZIP | yes | yes (central directory) | yes | yes | yes | encrypted entries flagged |
+| ZIP | yes | yes (central directory, EOCD boundary) | yes | yes | yes | encrypted entries DECRYPTED via the shared password queue (ZipCrypto); working candidate + provenance surfaced |
 | gzip | yes | yes (CRC32/ISIZE) | yes | yes | yes | |
 | XZ | yes | yes (container + LZMA2) | yes | yes | yes | |
 | zlib/deflate | yes / no-sig | yes | yes | yes | yes | raw deflate is no-signature (discovered via nesting) |
@@ -37,8 +37,8 @@ internal structure; the limits are stated explicitly.
 | AR | yes | yes (member walk) | yes | yes | yes | source-backed members |
 | DEB | yes | yes (ar + control/data) | yes | member-level | yes | |
 | CAB | yes | yes (CFHEADER + entries) | yes | yes | yes | |
-| 7z | yes | yes (sevenz-rust2) | yes | yes | yes | password candidates via `--password` |
-| RAR (1.3–7) | yes | yes (rars decode) | yes | yes | yes | password candidates via `--password`; recovery-record parsing not included |
+| 7z | yes | yes (sevenz-rust2) | yes | yes | yes | password candidates via `--password` + auto-discovery (shared bounded queue) |
+| RAR (1.3–7) | yes | yes (rars decode) | yes | yes | yes | password candidates via `--password` + auto-discovery; recovery-record parsing not included |
 
 ### Media
 
@@ -47,7 +47,7 @@ internal structure; the limits are stated explicitly.
 | RIFF (WAV/AVI) | yes | yes (chunk walk) | yes | chunks | yes | |
 | MP3 | yes | yes (strict frame sync + chaining) | yes | yes | yes | |
 | FLAC | yes | yes (STREAMINFO + metadata) | yes | yes | yes | |
-| OLE (CFB) | yes | yes (header + FAT + dir tree) | partial | stream listing | yes | recursive stream walk; extraction of stream data is metadata-classified |
+| OLE (CFB) | yes | yes (header + FAT + dir tree) | yes | stream bytes via FAT and mini-FAT chains | yes | mini-stream resolved through the root entry; extraction budget-capped and size-truncated; storage provenance (fat/mini-fat) recorded |
 | RTF | yes | yes (brace balance) | partial | metadata | yes | |
 
 ### Executables / binaries
@@ -75,6 +75,7 @@ internal structure; the limits are stated explicitly.
 | UBI | yes | yes (EC/VID headers + volume table CRC) | yes | volume images | yes | volumes as ReconstructedFrom children |
 | UBIFS | yes | yes (superblock/master/index walk) | yes | files | yes | none/zlib/zstd decode; LEB layout |
 | JFFS2 | yes | yes (CRC-validated node scan + tree) | yes | files | yes | RTIME + zlib compression; deleted-node handling |
+| YAFFS2 | yes | yes (aligned chunk-stride candidate scan + packed tags2 validation, tree walk) | yes | files | yes | mkyaffs2image layout (2048+64); highest-seq wins per (obj, chunk); extra-header parents/types |
 | cramfs | yes | yes (superblock + dir walk) | yes | files | yes | |
 | ROMFS | yes | yes (superblock + entry chain) | yes | files | yes | |
 
@@ -167,7 +168,8 @@ Handler-produced children are one of:
 | Human compact tree output | yes |
 | Stable JSON output (serde round-trip) | yes |
 | JSONL output — one record/line, stable IDs (#7 §12.1) | yes (`--jsonl`) |
-| Password candidate provenance in metadata | yes |
+| Automatic password discovery (comments/strings/filenames) + provenance (`password_source`) | yes |
+| Dedicated `max_password_attempts` limit bounding trial decryption | yes |
 | Fuzzing harness (cargo-fuzz, 10 targets incl. per-format-family) | yes |
 | Fuzz-smoke CI job (bounded, per-PR) | yes |
 | Benchmarks (criterion: 4 scan + 7 expanded scenarios) | yes |
