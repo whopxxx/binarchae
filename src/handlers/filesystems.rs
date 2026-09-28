@@ -1852,6 +1852,686 @@ impl Handler for UbiHandler {
     }
 }
 
+// ---------------------------------------------------------------------------
+// JFFS2
+// ---------------------------------------------------------------------------
+
+pub struct Jffs2Handler;
+
+const JFFS2_MAGIC: u16 = 0x1985;
+const JFFS2_NODETYPE_DIRENT: u16 = 0xc001; // INCOMPAT|1 (ACCURATE masked off)
+const JFFS2_NODETYPE_INODE: u16 = 0xc002; // INCOMPAT|2 (ACCURATE masked off)
+const JFFS2_NODE_ACCURATE: u16 = 0x2000;
+const JFFS2_COMPAT_MASK: u16 = 0xc000;
+const JFFS2_DIRENT_SIZE: usize = 40;
+const JFFS2_INODE_SIZE: usize = 68;
+const JFFS2_COMPR_NONE: u8 = 0x00;
+const JFFS2_COMPR_ZERO: u8 = 0x01;
+const JFFS2_COMPR_RTIME: u8 = 0x02;
+const JFFS2_COMPR_ZLIB: u8 = 0x06;
+const JFFS2_COMPR_LZO: u8 = 0x07;
+/// DT_* dirent type values (fs/jffs2/dir.c writes these).
+const DT_FIFO: u8 = 1;
+const DT_CHR: u8 = 2;
+const DT_DIR: u8 = 4;
+const DT_BLK: u8 = 6;
+const DT_REG: u8 = 8;
+const DT_LNK: u8 = 10;
+const DT_SOCK: u8 = 12;
+/// Root directory inode number (convention: jffs2_mkdir uses ino 1 for
+/// the root because it is the first allocated inode).
+const JFFS2_ROOT_INO: u32 = 1;
+/// Skip runs of erased flash rather than probing every 4 bytes.
+const MAX_FF_RUN_SKIP: usize = 64 * 1024;
+
+/// Layout verified against Linux fs/jffs2 (jffs2.h, scan.c, read.c,
+/// compr.c, compr_rtime.c, compr_zlib.c):
+/// - Every node starts with `struct jffs2_unknown_node`:
+///   magic@0 (0x1985 big-endian), nodetype@2 (big-endian; INCOMPAT
+///   0xc000 | ACCURATE 0x2000 | id), totlen@4 (be32), hdr_crc@8 (be32).
+/// - hdr_crc = crc32 over the first 8 bytes with the ACCURATE bit
+///   forced into nodetype (scan.c crcnode logic).
+/// - `struct jffs2_raw_dirent` (40 bytes header): pino@12, version@16,
+///   ino@20 (0 = unlink), mctime@24, nsize@28, type@29 (DT_*),
+///   unused[2], node_crc@32 (crc32 over sizeof-8 = 32 header bytes),
+///   name_crc@36 (crc32 over name bytes), name[]@40. Names may be
+///   NUL-terminated; kernel truncates at the first NUL.
+/// - `struct jffs2_raw_inode` (68 bytes header): ino@12, version@16,
+///   mode@20, uid@24, gid@26, isize@28, atime@32, mtime@36, ctime@40,
+///   offset@44, csize@48 (compressed bytes stored), dsize@52
+///   (decompressed size), compr@56, usercompr@57, flags@58, data_crc@60
+///   (crc32 over the csize compressed bytes), node_crc@64 (crc32 over
+///   68-8 = 60 header bytes), data[]@68.
+/// - Node data is at arbitrary 4-byte-aligned positions across erase
+///   blocks; scan order + per-ino highest version wins. Unlinked names
+///   (ino == 0) remove the previous dirent.
+/// - Compression: NONE copies csize bytes (dsize == csize), ZERO is
+///   dsize zero bytes, RTIME is the byte+run-of-backrefs scheme in
+///   compr_rtime.c, ZLIB is deflate (kernel skips a standard 2-byte
+///   zlib header and inflates raw when possible). LZO/RUBIN/COPY are
+///   not supported here and produce honest metadata-only entries.
+///
+/// Parent inode -> children (ino, name, DT_* type).
+type Jffs2Tree = BTreeMap<u32, Vec<(u32, Vec<u8>, u8)>>;
+
+/// Name -> (version, target ino, DT_* type) per parent during resolve.
+type Jffs2NameMap = BTreeMap<u32, BTreeMap<Vec<u8>, (u32, u32, u8)>>;
+
+/// A scanned dirent node.
+struct Jffs2Dirent {
+    version: u32,
+    pino: u32,
+    ino: u32,
+    dtype: u8,
+    name: Vec<u8>,
+    valid_crc: bool,
+}
+
+/// A scanned inode node holding one data fragment.
+struct Jffs2Frag {
+    ino: u32,
+    version: u32,
+    offset: u32,
+    isize: u32,
+    csize: u32,
+    dsize: u32,
+    compr: u8,
+    data_abs: u64,
+    data_crc: u32,
+    valid: bool,
+}
+
+/// Compute the hdr_crc the way scan.c does: ACCURATE forced on.
+fn jffs2_hdr_crc(bytes: &[u8]) -> u32 {
+    let mut node = [
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ];
+    let nt = u16::from_be_bytes([bytes[2], bytes[3]]) | JFFS2_NODE_ACCURATE;
+    node[2..4].copy_from_slice(&nt.to_be_bytes());
+    crc32fast::hash(&node)
+}
+
+impl Jffs2Handler {
+    /// RTIME decompression (compr_rtime.c jffs2_rtime_decompress).
+    fn rtime_decompress(input: &[u8], destlen: usize) -> Option<Vec<u8>> {
+        let mut out = vec![0u8; destlen];
+        let mut positions = [0u16; 256];
+        let (mut outpos, mut pos) = (0usize, 0usize);
+        while outpos < destlen {
+            if pos + 2 > input.len() {
+                return None;
+            }
+            let value = input[pos];
+            pos += 1;
+            let repeat = usize::from(input[pos]);
+            pos += 1;
+            let mut backoffs = positions[value as usize] as usize;
+            positions[value as usize] = (outpos + 1) as u16;
+            out[outpos] = value;
+            outpos += 1;
+            if repeat > 0 {
+                if outpos + repeat > destlen {
+                    return None;
+                }
+                if backoffs + repeat >= outpos {
+                    for _ in 0..repeat {
+                        if backoffs >= outpos {
+                            return None;
+                        }
+                        out[outpos] = out[backoffs];
+                        outpos += 1;
+                        backoffs += 1;
+                    }
+                } else {
+                    out.copy_within(backoffs..backoffs + repeat, outpos);
+                    outpos += repeat;
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// JFFS2 zlib: standard zlib stream, or raw deflate after skipping
+    /// the 2-byte header when there is no preset dict (compr_zlib.c).
+    fn zlib_decompress(input: &[u8], destlen: usize) -> Result<Vec<u8>> {
+        let skip_header = input.len() > 2
+            && input[1] & 0x20 == 0
+            && (input[0] & 0x0f) == 8
+            && (u16::from(input[0]) << 8 | u16::from(input[1])) % 31 == 0;
+        let out = if skip_header {
+            let mut dec = flate2::read::DeflateDecoder::new(&input[2..]);
+            let mut out = Vec::with_capacity(destlen);
+            std::io::Read::read_to_end(&mut dec, &mut out).map_err(|_| Error::Validation {
+                format: "jffs2",
+                reason: "zlib raw inflate failed".into(),
+            })?;
+            out
+        } else {
+            let mut dec = flate2::read::ZlibDecoder::new(input);
+            let mut out = Vec::with_capacity(destlen);
+            std::io::Read::read_to_end(&mut dec, &mut out).map_err(|_| Error::Validation {
+                format: "jffs2",
+                reason: "zlib inflate failed".into(),
+            })?;
+            out
+        };
+        Ok(out)
+    }
+
+    /// Decompress one inode fragment by compr code. Unsupported codes
+    /// return Ok(None) so callers emit metadata-only entries.
+    fn decompress_fragment(compr: u8, data: &[u8], dsize: usize) -> Result<Option<Vec<u8>>> {
+        match compr {
+            JFFS2_COMPR_NONE => Ok(Some(data.to_vec())),
+            JFFS2_COMPR_ZERO => Ok(Some(vec![0u8; dsize])),
+            JFFS2_COMPR_RTIME => Ok(Self::rtime_decompress(data, dsize)),
+            JFFS2_COMPR_ZLIB => Ok(Some(Self::zlib_decompress(data, dsize)?)),
+            JFFS2_COMPR_LZO => Ok(None), // lzo crate not bundled
+            other => Err(Error::Validation {
+                format: "jffs2",
+                reason: format!("unsupported compression code {other}"),
+            }),
+        }
+    }
+
+    /// Scan all nodes in the source: dirents and inode fragments with
+    /// CRC validity. Bounded scan; skip 0xFF runs like the kernel's
+    /// empty-region fast path.
+    fn scan_nodes(
+        src: &ByteSource,
+        base: u64,
+        limits: &crate::engine::EngineLimits,
+        warnings: &mut Vec<String>,
+    ) -> Result<(Vec<Jffs2Dirent>, Vec<Jffs2Frag>, u64)> {
+        let mut dirents = Vec::new();
+        let mut frags = Vec::new();
+        let mut hdr = [0u8; 8];
+        let mut ff_run = 0usize;
+        let mut pos = base;
+        let mut nodes = 0usize;
+        let end = src.len();
+        let mut last_node_end = base;
+        while pos + 8 <= end {
+            src.read_at(pos, &mut hdr)?;
+            if hdr[0] == 0xFF && hdr[1] == 0xFF {
+                // Erased region: run ahead.
+                ff_run += 1;
+                pos += 1;
+                if ff_run > MAX_FF_RUN_SKIP {
+                    pos = end;
+                }
+                continue;
+            }
+            ff_run = 0;
+            let magic = u16::from_be_bytes([hdr[0], hdr[1]]);
+            if magic != JFFS2_MAGIC {
+                pos += 1;
+                continue;
+            }
+            let nodetype_raw = u16::from_be_bytes([hdr[2], hdr[3]]);
+            let totlen = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+            if totlen < 8 || pos + totlen as u64 > end {
+                pos += 1;
+                continue;
+            }
+            if nodetype_raw & JFFS2_COMPAT_MASK != 0xc000 {
+                // ROCOMPAT/RWCOMPAT: skip, do not claim.
+                pos += totlen as u64;
+                continue;
+            }
+            let hdr_crc = jffs2_hdr_crc(&hdr);
+            let stored_crc = {
+                let mut b = [0u8; 4];
+                src.read_at(pos + 8, &mut b)?;
+                u32::from_be_bytes(b)
+            };
+            let hdr_ok = hdr_crc == stored_crc;
+            nodes += 1;
+            if nodes > limits.max_records {
+                warnings.push("jffs2 node count exceeded max_records; scan truncated".to_string());
+                break;
+            }
+            match nodetype_raw & !JFFS2_NODE_ACCURATE {
+                JFFS2_NODETYPE_DIRENT if hdr_ok && totlen > JFFS2_DIRENT_SIZE => {
+                    let mut h = [0u8; JFFS2_DIRENT_SIZE];
+                    src.read_at(pos, &mut h)?;
+                    let be32 = |o: usize| u32::from_be_bytes([h[o], h[o + 1], h[o + 2], h[o + 3]]);
+                    let nsize = h[28] as usize;
+                    let name_abs = pos + JFFS2_DIRENT_SIZE as u64;
+                    let mut name = vec![0u8; nsize.min(totlen - JFFS2_DIRENT_SIZE)];
+                    src.read_at(name_abs, &mut name)?;
+                    // Kernel truncates names at the first NUL.
+                    let name_len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+                    name.truncate(name_len);
+                    let node_crc = be32(32);
+                    let name_crc = be32(36);
+                    let calc_node = crc32fast::hash(&h[..32]);
+                    let calc_name = crc32fast::hash(&name);
+                    dirents.push(Jffs2Dirent {
+                        version: be32(16),
+                        pino: be32(12),
+                        ino: be32(20),
+                        dtype: h[29],
+                        name,
+                        valid_crc: calc_node == node_crc && calc_name == name_crc,
+                    });
+                }
+                JFFS2_NODETYPE_INODE if hdr_ok && totlen > JFFS2_INODE_SIZE => {
+                    let mut h = [0u8; JFFS2_INODE_SIZE];
+                    src.read_at(pos, &mut h)?;
+                    let be32 = |o: usize| u32::from_be_bytes([h[o], h[o + 1], h[o + 2], h[o + 3]]);
+                    let csize = be32(48);
+                    if csize as u64 + JFFS2_INODE_SIZE as u64 <= totlen as u64 {
+                        frags.push(Jffs2Frag {
+                            ino: be32(12),
+                            version: be32(16),
+                            offset: be32(44),
+                            isize: be32(28),
+                            csize,
+                            dsize: be32(52),
+                            compr: h[56],
+                            data_abs: pos + JFFS2_INODE_SIZE as u64,
+                            data_crc: be32(60),
+                            valid: crc32fast::hash(&h[..60]) == be32(64),
+                        });
+                    }
+                }
+                _ => {}
+            }
+            pos += totlen as u64;
+            last_node_end = pos;
+        }
+        Ok((dirents, frags, last_node_end - base))
+    }
+}
+
+impl Jffs2Handler {
+    /// Resolve directory contents: per parent inode, the dirent with
+    /// the highest version per name wins; ino == 0 removes the name
+    /// (unlink).
+    fn resolve_tree(dirents: &[Jffs2Dirent]) -> BTreeMap<u32, Vec<(u32, Vec<u8>, u8)>> {
+        let mut by_parent: Jffs2NameMap = BTreeMap::new();
+        for d in dirents {
+            if !d.valid_crc {
+                continue;
+            }
+            let entry = by_parent.entry(d.pino).or_default().entry(d.name.clone());
+            match entry {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert((d.version, d.ino, d.dtype));
+                }
+                std::collections::btree_map::Entry::Occupied(mut o) => {
+                    if d.version > o.get().0 {
+                        o.insert((d.version, d.ino, d.dtype));
+                    }
+                }
+            }
+        }
+        by_parent
+            .into_iter()
+            .map(|(pino, names)| {
+                (
+                    pino,
+                    names
+                        .into_iter()
+                        .filter_map(|(name, (ver, ino, dtype))| {
+                            if ino == 0 {
+                                None // unlink
+                            } else {
+                                let _ = ver;
+                                Some((ino, name, dtype))
+                            }
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Assemble one file's content from its fragments: highest version
+    /// per offset wins (log semantics), holes zero-fill up to isize.
+    fn assemble_file(
+        &self,
+        src: &ByteSource,
+        frags: &[Jffs2Frag],
+        ino: u32,
+        limits: &crate::engine::EngineLimits,
+        budget: &mut Budget,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<Vec<u8>>> {
+        let mine: Vec<&Jffs2Frag> = frags.iter().filter(|f| f.ino == ino && f.valid).collect();
+        let isize = match mine.iter().map(|f| f.isize).max() {
+            Some(s) => s as u64,
+            None => return Ok(None),
+        };
+        let isize = isize.min(limits.max_child_size);
+        let mut out = vec![0u8; isize as usize];
+        // Highest version per offset.
+        let mut best: BTreeMap<u32, &Jffs2Frag> = BTreeMap::new();
+        for f in mine {
+            match best.get(&f.offset) {
+                Some(cur) if cur.version >= f.version => {}
+                _ => {
+                    best.insert(f.offset, f);
+                }
+            }
+        }
+        for f in best.values() {
+            let start = f.offset as u64;
+            if start >= isize {
+                continue;
+            }
+            let take = (f.dsize as u64).min(isize - start) as usize;
+            let mut raw = vec![0u8; f.csize as usize];
+            if f.data_abs + f.csize as u64 > src.len() {
+                warnings.push(format!(
+                    "inode {ino}: fragment data at {} out of bounds; skipped",
+                    f.data_abs
+                ));
+                continue;
+            }
+            src.read_at(f.data_abs, &mut raw)?;
+            if crc32fast::hash(&raw) != f.data_crc {
+                warnings.push(format!("inode {ino}: fragment data CRC mismatch; skipped"));
+                continue;
+            }
+            let decoded = match Self::decompress_fragment(f.compr, &raw, f.dsize as usize)? {
+                Some(d) => d,
+                None => {
+                    warnings.push(format!(
+                        "inode {ino}: unsupported compression {}; fragment kept as metadata",
+                        f.compr
+                    ));
+                    continue;
+                }
+            };
+            if !budget.charge(limits, decoded.len() as u64) {
+                return Err(Error::LimitExceeded {
+                    limit: "max-total-expanded-bytes",
+                    detail: "jffs2 fragment".into(),
+                });
+            }
+            let n = decoded.len().min(take);
+            out[start as usize..start as usize + n].copy_from_slice(&decoded[..n]);
+        }
+        Ok(Some(out))
+    }
+}
+
+impl Handler for Jffs2Handler {
+    fn format(&self) -> &'static str {
+        "jffs2"
+    }
+
+    fn find_candidates(&self, src: &ByteSource) -> Vec<Candidate> {
+        // Magic 0x1985 stored big-endian.
+        find_all(src, &[0x19, 0x85])
+            .into_iter()
+            .map(|offset| Candidate { offset })
+            .collect()
+    }
+
+    fn validate(
+        &self,
+        src: &ByteSource,
+        candidate: Candidate,
+        limits: &crate::engine::EngineLimits,
+        budget: &mut Budget,
+    ) -> Result<HandlerOutput> {
+        let base = candidate.offset;
+        let mut warnings = Vec::new();
+        let (dirents, frags, used) = Self::scan_nodes(src, base, limits, &mut warnings)?;
+        if dirents.is_empty() && frags.is_empty() {
+            return Err(Error::Validation {
+                format: "jffs2",
+                reason: "no valid JFFS2 nodes".into(),
+            });
+        }
+
+        let tree = Self::resolve_tree(&dirents);
+        let mut children = Vec::new();
+        // Find the root: the inode never referenced as a child, or the
+        // conventional ino 1. Depth-first from there.
+        let mut referenced: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for d in dirents.iter().filter(|d| d.valid_crc && d.ino != 0) {
+            referenced.insert(d.ino);
+        }
+        let roots: Vec<u32> =
+            if referenced.contains(&JFFS2_ROOT_INO) || tree.contains_key(&JFFS2_ROOT_INO) {
+                vec![JFFS2_ROOT_INO]
+            } else {
+                tree.keys()
+                    .filter(|p| !referenced.contains(p))
+                    .copied()
+                    .collect()
+            };
+        if roots.len() > 1 {
+            warnings.push(format!(
+                "multiple unreferenced parent inodes ({roots:?}); walking the first"
+            ));
+        }
+        let mut visited_dirs = std::collections::HashSet::new();
+        for root in roots.iter().take(1) {
+            self.emit_dir(
+                src,
+                *root,
+                "",
+                &tree,
+                &frags,
+                0,
+                limits,
+                budget,
+                &mut visited_dirs,
+                &mut warnings,
+                &mut children,
+            )?;
+        }
+
+        let files = children
+            .iter()
+            .filter(|c| c.metadata.get("type").map(String::as_str) == Some("file"))
+            .count();
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "nodes".to_string(),
+            (dirents.len() + frags.len()).to_string(),
+        );
+        metadata.insert("dirents".to_string(), dirents.len().to_string());
+        metadata.insert("inode_fragments".to_string(), frags.len().to_string());
+        metadata.insert("inodes".to_string(), tree.len().to_string());
+        metadata.insert("entries".to_string(), children.len().to_string());
+
+        Ok(HandlerOutput {
+            artifacts: vec![ArtifactDraft {
+                format: "jffs2".to_string(),
+                label: format!(
+                    "JFFS2 filesystem ({} nodes, {} entries)",
+                    dirents.len() + frags.len(),
+                    children.len()
+                ),
+                offset: base,
+                size: used.max(8),
+                confidence: if children.is_empty() {
+                    Confidence::Partial
+                } else {
+                    Confidence::Validated
+                },
+                evidence: Evidence::facts([
+                    "JFFS2 node chain validated (magic 0x1985, header CRCs)".to_string(),
+                    format!(
+                        "{} dirent nodes, {} inode fragments (CRC-checked)",
+                        dirents.len(),
+                        frags.len()
+                    ),
+                    format!("directory tree resolved: {} entries", children.len()),
+                    format!("{} files reconstructed from fragments", files),
+                ]),
+                metadata,
+                warnings,
+                errors: Vec::new(),
+                children,
+            }],
+        })
+    }
+}
+
+impl Jffs2Handler {
+    /// Depth-first emission of one directory's children.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_dir(
+        &self,
+        src: &ByteSource,
+        pino: u32,
+        path: &str,
+        tree: &Jffs2Tree,
+        frags: &[Jffs2Frag],
+        depth: u32,
+        limits: &crate::engine::EngineLimits,
+        budget: &mut Budget,
+        visited: &mut std::collections::HashSet<u32>,
+        warnings: &mut Vec<String>,
+        out: &mut Vec<ChildDraft>,
+    ) -> Result<()> {
+        if depth > 16 {
+            warnings.push("jffs2 directory nesting deeper than 16 not walked".to_string());
+            return Ok(());
+        }
+        if !visited.insert(pino) {
+            warnings.push("jffs2 directory cycle detected; subtree skipped".to_string());
+            return Ok(());
+        }
+        let Some(entries) = tree.get(&pino) else {
+            return Ok(());
+        };
+        for (ino, name, dtype) in entries {
+            if out.len() >= limits.max_fs_entries {
+                warnings.push("max_fs_entries reached; walk truncated".to_string());
+                return Ok(());
+            }
+            let name = String::from_utf8_lossy(name).into_owned();
+            let child_path = if path.is_empty() {
+                name.clone()
+            } else {
+                format!("{path}/{name}")
+            };
+            let mut meta = BTreeMap::new();
+            meta.insert("path".to_string(), child_path.clone());
+            meta.insert("inode".to_string(), ino.to_string());
+            let entry_name = Some(name);
+            let _is_dir = *dtype == DT_DIR;
+            match *dtype {
+                DT_DIR => {
+                    meta.insert("type".to_string(), "directory".to_string());
+                    out.push(ChildDraft {
+                        relation: RelationKind::FilesystemEntry,
+                        label: format!("jffs2 directory {child_path}"),
+                        format_hint: "metadata",
+                        content: ChildContent::Owned(Vec::new()),
+                        size: 0,
+                        metadata: meta,
+                        warnings: Vec::new(),
+                        entry_name,
+                    });
+                    self.emit_dir(
+                        src,
+                        *ino,
+                        &child_path,
+                        tree,
+                        frags,
+                        depth + 1,
+                        limits,
+                        budget,
+                        visited,
+                        warnings,
+                        out,
+                    )?;
+                }
+                DT_REG | 0 => {
+                    meta.insert("type".to_string(), "file".to_string());
+                    match self.assemble_file(src, frags, *ino, limits, budget, warnings)? {
+                        Some(data) => {
+                            let size = data.len() as u64;
+                            meta.insert(
+                                "declared_size".to_string(),
+                                frags
+                                    .iter()
+                                    .filter(|f| f.ino == *ino)
+                                    .map(|f| f.isize)
+                                    .max()
+                                    .unwrap_or(0)
+                                    .to_string(),
+                            );
+                            out.push(ChildDraft {
+                                relation: RelationKind::ReconstructedFrom,
+                                label: format!("jffs2 file {child_path} ({size} bytes)"),
+                                format_hint: "raw",
+                                content: ChildContent::Owned(data),
+                                size,
+                                metadata: meta,
+                                warnings: vec![
+                                    "content reconstructed from JFFS2 log fragments".to_string()
+                                ],
+                                entry_name,
+                            });
+                        }
+                        None => {
+                            out.push(ChildDraft {
+                                relation: RelationKind::FilesystemEntry,
+                                label: format!("jffs2 file {child_path} (no valid data)"),
+                                format_hint: "metadata",
+                                content: ChildContent::Owned(Vec::new()),
+                                size: 0,
+                                metadata: meta,
+                                warnings: Vec::new(),
+                                entry_name,
+                            });
+                        }
+                    }
+                }
+                DT_LNK => {
+                    meta.insert("type".to_string(), "symlink".to_string());
+                    let target = self.assemble_file(src, frags, *ino, limits, budget, warnings)?;
+                    let target_str = target
+                        .as_ref()
+                        .map(|t| String::from_utf8_lossy(t).into_owned())
+                        .unwrap_or_default();
+                    out.push(ChildDraft {
+                        relation: RelationKind::FilesystemEntry,
+                        label: format!("jffs2 symlink {child_path} -> {target_str}"),
+                        format_hint: "metadata",
+                        content: ChildContent::Owned(target.unwrap_or_default()),
+                        size: 0,
+                        metadata: meta,
+                        warnings: vec![
+                            "symlink target kept as metadata; never materialized".to_string()
+                        ],
+                        entry_name,
+                    });
+                }
+                DT_FIFO | DT_CHR | DT_BLK | DT_SOCK => {
+                    meta.insert("type".to_string(), "special".to_string());
+                    out.push(ChildDraft {
+                        relation: RelationKind::FilesystemEntry,
+                        label: format!("jffs2 special entry {child_path}"),
+                        format_hint: "metadata",
+                        content: ChildContent::Owned(Vec::new()),
+                        size: 0,
+                        metadata: meta,
+                        warnings: vec!["special entries are never materialized".to_string()],
+                        entry_name,
+                    });
+                }
+                other => {
+                    warnings.push(format!(
+                        "unknown dirent type {other} for {child_path}; metadata only"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2170,6 +2850,181 @@ mod tests {
             dir.metadata.get("type").map(String::as_str),
             Some("directory")
         );
+    }
+
+    /// Build a JFFS2 image. Nodes are written little-structured:
+    /// magic/nodetype/totlen/hdr_crc big-endian, everything else
+    /// big-endian too (jint* are big-endian on-disk).
+    fn jffs2_image() -> Vec<u8> {
+        fn crc32(b: &[u8]) -> u32 {
+            let mut h = crc32fast::Hasher::new();
+            h.update(b);
+            h.finalize()
+        }
+        // Write one node. `kind`: b"d" dirent, b"i" inode.
+        // hdr_crc is computed with ACCURATE forced (like scan.c).
+        fn dirent(img: &mut Vec<u8>, pino: u32, ino: u32, version: u32, dtype: u8, name: &[u8]) {
+            let totlen = 40 + name.len();
+            let mut h = [0u8; 40];
+            h[0..2].copy_from_slice(&0x1985u16.to_be_bytes());
+            h[2..4].copy_from_slice(&0xe001u16.to_be_bytes());
+            h[4..8].copy_from_slice(&(totlen as u32).to_be_bytes());
+            // hdr_crc over first 8 bytes with ACCURATE forced (already set).
+            let hdr_crc = crc32(&h[..8]);
+            h[8..12].copy_from_slice(&hdr_crc.to_be_bytes());
+            h[12..16].copy_from_slice(&pino.to_be_bytes());
+            h[16..20].copy_from_slice(&version.to_be_bytes());
+            h[20..24].copy_from_slice(&ino.to_be_bytes());
+            h[24..28].copy_from_slice(&0u32.to_be_bytes()); // mctime
+            h[28] = name.len() as u8;
+            h[29] = dtype;
+            let node_crc = crc32(&h[..32]);
+            let name_crc = crc32(name);
+            h[32..36].copy_from_slice(&node_crc.to_be_bytes());
+            h[36..40].copy_from_slice(&name_crc.to_be_bytes());
+            let start = img.len();
+            img.extend_from_slice(&h);
+            img.extend_from_slice(name);
+            // Pad nodes to 4 bytes.
+            while (img.len() - start) % 4 != 0 {
+                img.push(0);
+            }
+        }
+        fn inode(
+            img: &mut Vec<u8>,
+            ino: u32,
+            version: u32,
+            offset: u32,
+            dsize: u32,
+            compr: u8,
+            payload: &[u8],
+        ) {
+            let isize = offset + dsize;
+            let totlen = 68 + payload.len();
+            let mut h = [0u8; 68];
+            h[0..2].copy_from_slice(&0x1985u16.to_be_bytes());
+            h[2..4].copy_from_slice(&0xe002u16.to_be_bytes());
+            h[4..8].copy_from_slice(&(totlen as u32).to_be_bytes());
+            let hdr_crc = crc32(&h[..8]);
+            h[8..12].copy_from_slice(&hdr_crc.to_be_bytes());
+            h[12..16].copy_from_slice(&ino.to_be_bytes());
+            h[16..20].copy_from_slice(&version.to_be_bytes());
+            h[20..24].copy_from_slice(&0o100644u32.to_be_bytes()); // mode
+            h[28..32].copy_from_slice(&isize.to_be_bytes()); // isize
+            h[44..48].copy_from_slice(&offset.to_be_bytes());
+            h[48..52].copy_from_slice(&(payload.len() as u32).to_be_bytes()); // csize
+            h[52..56].copy_from_slice(&dsize.to_be_bytes()); // dsize
+            h[56] = compr;
+            let data_crc = crc32(payload);
+            h[60..64].copy_from_slice(&data_crc.to_be_bytes()); // data_crc
+            let node_crc = crc32(&h[..60]);
+            h[64..68].copy_from_slice(&node_crc.to_be_bytes()); // node_crc
+            let start = img.len();
+            img.extend_from_slice(&h);
+            img.extend_from_slice(payload);
+            while (img.len() - start) % 4 != 0 {
+                img.push(0);
+            }
+        }
+
+        let mut img = Vec::new();
+        // Root dir ino 1, children: FLAG.TXT (ino 2, plain), RTIME.BIN
+        // (ino 3, rtime-compressed), SUB (dir ino 4), ZLIB.BIN (ino 5,
+        // zlib). DIR/NESTED.TXT (ino 6). One stale dirent for ino 2
+        // with lower version, then a final dirent rename is covered by
+        // version ordering; plus an unlink node for a temp name.
+        dirent(&mut img, 1, 2, 1, 8, b"FLAG.TXT");
+        inode(&mut img, 2, 1, 0, 11, 0, b"JFFS2_FLAG!");
+        dirent(&mut img, 1, 4, 2, 4, b"SUB");
+        dirent(&mut img, 4, 6, 1, 8, b"NESTED.TXT");
+        inode(&mut img, 6, 1, 0, 13, 0, b"JFFS2_NESTED!");
+
+        // RTIME-compressed "AAAAABBBBB" (10 bytes). Encoder: value,
+        // run pairs with backrefs via positions table.
+        let raw = b"AAAAABBBBB";
+        let mut comp: Vec<u8> = Vec::new();
+        let mut positions = [0u16; 256];
+        let mut pos = 0usize;
+        let data = raw.to_vec();
+        while pos < data.len() {
+            let value = data[pos];
+            comp.push(value);
+            pos += 1;
+            let backpos = positions[value as usize] as usize;
+            positions[value as usize] = pos as u16;
+            let mut runlen = 0u8;
+            while pos < data.len() && runlen < 255 && data[pos] == data[backpos + runlen as usize] {
+                pos += 1;
+                runlen += 1;
+            }
+            comp.push(runlen);
+        }
+        dirent(&mut img, 1, 3, 1, 8, b"RTIME.BIN");
+        inode(&mut img, 3, 1, 0, 10, 2, &comp);
+
+        // ZLIB-compressed payload.
+        use std::io::Write as _;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(b"JFFS2_ZLIB_CONTENT").unwrap();
+        let z = enc.finish().unwrap();
+        dirent(&mut img, 1, 5, 1, 8, b"ZLIB.BIN");
+        inode(&mut img, 5, 1, 0, 18, 6, &z);
+
+        // Unlink: dirent with ino 0 removes "GONE.TXT".
+        dirent(&mut img, 1, 7, 1, 8, b"GONE.TXT");
+        inode(&mut img, 7, 1, 0, 4, 0, b"BYE!");
+        dirent(&mut img, 1, 0, 2, 8, b"GONE.TXT");
+
+        img
+    }
+
+    #[test]
+    fn jffs2_full_traversal() {
+        let src = ByteSource::from_vec(jffs2_image());
+        let out = validate_at(&Jffs2Handler, &src, 0).expect("jffs2 validates");
+        let art = &out.artifacts[0];
+        assert_eq!(art.confidence, Confidence::Validated);
+        let flag = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("path").map(String::as_str) == Some("FLAG.TXT"))
+            .expect("FLAG.TXT child");
+        match &flag.content {
+            ChildContent::Owned(d) => assert_eq!(d, b"JFFS2_FLAG!"),
+            _ => panic!("file content must reconstruct"),
+        }
+        let nested = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("path").map(String::as_str) == Some("SUB/NESTED.TXT"))
+            .expect("nested child");
+        match &nested.content {
+            ChildContent::Owned(d) => assert_eq!(d, b"JFFS2_NESTED!"),
+            _ => panic!("nested content must reconstruct"),
+        }
+        let rtime = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("path").map(String::as_str) == Some("RTIME.BIN"))
+            .expect("RTIME.BIN child");
+        match &rtime.content {
+            ChildContent::Owned(d) => assert_eq!(d, b"AAAAABBBBB"),
+            _ => panic!("rtime content must reconstruct"),
+        }
+        let zlib = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("path").map(String::as_str) == Some("ZLIB.BIN"))
+            .expect("ZLIB.BIN child");
+        match &zlib.content {
+            ChildContent::Owned(d) => assert_eq!(d, b"JFFS2_ZLIB_CONTENT"),
+            _ => panic!("zlib content must reconstruct"),
+        }
+        // The unlinked name must not appear.
+        assert!(art
+            .children
+            .iter()
+            .all(|c| c.metadata.get("path").map(String::as_str) != Some("GONE.TXT")));
     }
 
     #[test]
