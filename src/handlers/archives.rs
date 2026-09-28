@@ -174,6 +174,8 @@ fn walk_ar_children(
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name: Some(name.to_string()),
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
         }
 
@@ -449,6 +451,8 @@ fn read_cab_entries(
                 Vec::new()
             },
             entry_name: Some(name),
+            confidence: Confidence::Validated,
+            evidence: vec!["structurally decoded by parent handler".to_string()],
         });
     }
     Ok(children)
@@ -613,15 +617,23 @@ impl Handler for SevenZHandler {
                                 ));
                             }
                             children.push(ChildDraft {
-                                relation: RelationKind::Contains,
-                                label: format!("7z file {} ({} bytes)", entry.name(), entry.size()),
-                                format_hint: "raw",
-                                content: ChildContent::Owned(out),
-                                size: entry.size(),
-                                metadata: BTreeMap::new(),
-                                warnings: Vec::new(),
-                                entry_name: Some(entry.name().to_string()),
-                            });
+                                    relation: RelationKind::Contains,
+                                    label: format!(
+                                        "7z file {} ({} bytes)",
+                                        entry.name(),
+                                        entry.size()
+                                    ),
+                                    format_hint: "raw",
+                                    content: ChildContent::Owned(out),
+                                    size: entry.size(),
+                                    metadata: BTreeMap::new(),
+                                    warnings: Vec::new(),
+                                    entry_name: Some(entry.name().to_string()),
+                                    confidence: Confidence::Validated,
+                                    evidence: vec![
+                                        "structurally decoded by parent handler".to_string()
+                                    ],
+                                });
                         }
                         Ok(true)
                     }) {
@@ -825,7 +837,9 @@ impl Handler for RarHandler {
                                 metadata: BTreeMap::new(),
                                 warnings: Vec::new(),
                                 entry_name: Some(name),
-                            });
+                            confidence: Confidence::Validated,
+                                evidence: vec!["structurally decoded by parent handler".to_string()],
+                                });
                         }
                         None => {
                             if declared > 0 {

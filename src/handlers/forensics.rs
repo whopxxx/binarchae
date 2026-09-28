@@ -451,6 +451,8 @@ impl Handler for RegistryHandler {
                             metadata: meta,
                             warnings: Vec::new(),
                             entry_name: None,
+                            confidence: Confidence::Validated,
+                            evidence: vec!["structurally decoded by parent handler".to_string()],
                         });
                     }
                 }
@@ -748,6 +750,8 @@ impl Handler for PcapHandler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name: None,
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
             off += 16 + incl_len;
         }
@@ -1203,6 +1207,8 @@ impl Handler for PcapngHandler {
                         metadata: meta,
                         warnings: Vec::new(),
                         entry_name: None,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                     frame_list.push(crate::handlers::net::FrameRef {
                         start: data_off,
@@ -1369,7 +1375,9 @@ impl Handler for MinidumpHandler {
                                 metadata: meta,
                                 warnings: Vec::new(),
                                 entry_name: None,
-                            });
+                            confidence: Confidence::Validated,
+                                evidence: vec!["structurally decoded by parent handler".to_string()],
+                                });
                         }
                     }
                 }
@@ -1417,7 +1425,9 @@ impl Handler for MinidumpHandler {
                                 metadata: m,
                                 warnings: Vec::new(),
                                 entry_name: None,
-                            });
+                            confidence: Confidence::Validated,
+                                evidence: vec!["structurally decoded by parent handler".to_string()],
+                                });
                         }
                     }
                 }
@@ -1470,6 +1480,10 @@ impl Handler for MinidumpHandler {
                                     metadata: mm,
                                     warnings: Vec::new(),
                                     entry_name: None,
+                                    confidence: Confidence::Validated,
+                                    evidence: vec![
+                                        "structurally decoded by parent handler".to_string()
+                                    ],
                                 });
                             }
                         }
@@ -1505,6 +1519,8 @@ impl Handler for MinidumpHandler {
                             metadata: m,
                             warnings: Vec::new(),
                             entry_name: None,
+                            confidence: Confidence::Validated,
+                            evidence: vec!["structurally decoded by parent handler".to_string()],
                         });
                     }
                 }
@@ -1554,7 +1570,9 @@ impl Handler for MinidumpHandler {
                                 metadata: meta,
                                 warnings: Vec::new(),
                                 entry_name: None,
-                            });
+                            confidence: Confidence::Validated,
+                                evidence: vec!["structurally decoded by parent handler".to_string()],
+                                });
                             data_off += data_size;
                         }
                     }
@@ -1775,6 +1793,8 @@ impl Handler for Pagedu64Handler {
                     metadata: meta,
                     warnings: Vec::new(),
                     entry_name: Some(format!("phys_run_{idx}.bin")),
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
                 total_pages += take / PAGE_SIZE;
                 break;
@@ -1796,6 +1816,8 @@ impl Handler for Pagedu64Handler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name: Some(format!("phys_run_{idx}.bin")),
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
             total_pages += run.page_count;
             file_off += run_bytes;
@@ -1966,6 +1988,8 @@ impl Handler for StringsHandler {
                         metadata: BTreeMap::new(),
                         warnings: Vec::new(),
                         entry_name: None,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     })
                     .collect(),
             }],

@@ -744,6 +744,8 @@ impl ExtHandler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name,
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
             if !deleted {
                 Self::walk_dir(
@@ -779,6 +781,8 @@ impl ExtHandler {
                     metadata: meta,
                     warnings: Vec::new(),
                     entry_name,
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
                 return Ok(());
             }
@@ -792,6 +796,8 @@ impl ExtHandler {
                     metadata: meta,
                     warnings: Vec::new(),
                     entry_name,
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
                 return Ok(());
             }
@@ -819,6 +825,8 @@ impl ExtHandler {
                         "deleted inode (dtime set): recovered from block pointers".to_string()
                     ],
                     entry_name,
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
                 return Ok(());
             }
@@ -834,6 +842,8 @@ impl ExtHandler {
                 metadata: meta,
                 warnings: vec!["content reconstructed from block pointers".to_string()],
                 entry_name,
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
             return Ok(());
         }
@@ -848,6 +858,8 @@ impl ExtHandler {
                 metadata: meta,
                 warnings: vec!["symlink target kept as metadata; never materialized".to_string()],
                 entry_name,
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
             return Ok(());
         }
@@ -862,6 +874,8 @@ impl ExtHandler {
             metadata: meta,
             warnings: vec!["special entries are never materialized".to_string()],
             entry_name,
+            confidence: Confidence::Validated,
+            evidence: vec!["structurally decoded by parent handler".to_string()],
         });
         Ok(())
     }

@@ -326,6 +326,8 @@ impl Handler for AndroidBootHandler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name: None,
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
         }
 
@@ -445,6 +447,8 @@ impl Handler for TrxHandler {
                 metadata: BTreeMap::new(),
                 warnings: Vec::new(),
                 entry_name: None,
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
         }
 
@@ -806,6 +810,8 @@ impl UefiFvHandler {
                 metadata: meta,
                 warnings: child_warnings,
                 entry_name: Some(guid_str),
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
             pos = (pos + file_size + 7) & !7u64;
         }
@@ -1187,6 +1193,8 @@ impl Handler for AndroidSparseHandler {
                     metadata: BTreeMap::new(),
                     warnings: Vec::new(),
                     entry_name: Some("expanded.img".to_string()),
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 }],
             }],
         })
@@ -1315,6 +1323,8 @@ impl Handler for Bcm63xxTagHandler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name: Some(name.to_string()),
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
             region_off += len;
         }

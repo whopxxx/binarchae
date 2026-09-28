@@ -427,6 +427,8 @@ impl ExfatHandler {
                         metadata: meta,
                         warnings: Vec::new(),
                         entry_name: Some(entry.name.clone()),
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                     // Recurse: directory content = its cluster chain.
                     let dir_data = Self::dir_bytes(
@@ -518,6 +520,8 @@ impl ExfatHandler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name: Some(name),
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
             return Ok(());
         }
@@ -535,6 +539,8 @@ impl ExfatHandler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name: Some(name),
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
             return Ok(());
         }
@@ -558,6 +564,8 @@ impl ExfatHandler {
                     metadata: meta,
                     warnings: Vec::new(),
                     entry_name: Some(name),
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
                 return Ok(());
             }
@@ -611,6 +619,8 @@ impl ExfatHandler {
                 "cluster chain non-contiguous: content reconstructed from the FAT".to_string(),
             ],
             entry_name: Some(name),
+            confidence: Confidence::Validated,
+            evidence: vec!["structurally decoded by parent handler".to_string()],
         });
         Ok(())
     }

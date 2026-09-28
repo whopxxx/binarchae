@@ -147,6 +147,8 @@ impl Handler for TarHandler {
                         have, size
                     )],
                     entry_name: Some(name),
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
                 complete_entries += 1;
                 corrupt = true;
@@ -176,6 +178,8 @@ impl Handler for TarHandler {
                         metadata: BTreeMap::new(),
                         warnings: Vec::new(),
                         entry_name: Some(name),
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
             } else if !is_file {
@@ -191,6 +195,8 @@ impl Handler for TarHandler {
                     metadata: BTreeMap::new(),
                     warnings: Vec::new(),
                     entry_name: None,
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
             } else {
                 names.push(name.clone());

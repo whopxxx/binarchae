@@ -315,6 +315,8 @@ impl CramfsHandler {
                         metadata: meta,
                         warnings: Vec::new(),
                         entry_name: Some(ino.name.clone()),
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                     if ino.offset != 0 && ino.size != 0 {
                         Self::walk_dir(
@@ -346,6 +348,8 @@ impl CramfsHandler {
                             metadata: meta,
                             warnings: Vec::new(),
                             entry_name: Some(ino.name.clone()),
+                            confidence: Confidence::Validated,
+                            evidence: vec!["structurally decoded by parent handler".to_string()],
                         });
                     } else if u64::from(ino.size) > limits.max_child_size {
                         warnings.push(format!(
@@ -361,6 +365,8 @@ impl CramfsHandler {
                             metadata: meta,
                             warnings: Vec::new(),
                             entry_name: Some(ino.name.clone()),
+                            confidence: Confidence::Validated,
+                            evidence: vec!["structurally decoded by parent handler".to_string()],
                         });
                     } else {
                         let data =
@@ -378,6 +384,8 @@ impl CramfsHandler {
                                     .to_string(),
                             ],
                             entry_name: Some(ino.name.clone()),
+                            confidence: Confidence::Validated,
+                            evidence: vec!["structurally decoded by parent handler".to_string()],
                         });
                     }
                 }
@@ -397,6 +405,8 @@ impl CramfsHandler {
                             "symlink target kept as metadata; never materialized".to_string()
                         ],
                         entry_name: Some(ino.name.clone()),
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
                 0x2000 | 0x6000 | 0x1000 | 0xC000 => {
@@ -412,6 +422,8 @@ impl CramfsHandler {
                         metadata: meta,
                         warnings: vec!["special entries are never materialized".to_string()],
                         entry_name: Some(ino.name.clone()),
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
                 _ => {

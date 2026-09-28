@@ -237,6 +237,8 @@ impl Handler for ZipHandler {
                 metadata: child_meta,
                 warnings: Vec::new(),
                 entry_name: Some(raw_name),
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
         }
 

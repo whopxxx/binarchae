@@ -215,6 +215,8 @@ impl RomfsHandler {
                         metadata: meta,
                         warnings: Vec::new(),
                         entry_name: Some(raw.name.clone()),
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                     if node.spec_raw != 0 {
                         Self::walk_dir(
@@ -268,6 +270,8 @@ impl RomfsHandler {
                         metadata: meta,
                         warnings: vec!["special entries are never materialized".to_string()],
                         entry_name: Some(raw.name.clone()),
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
             }
@@ -312,6 +316,8 @@ impl RomfsHandler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name: Some(name.to_string()),
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
             return;
         }
@@ -332,6 +338,8 @@ impl RomfsHandler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name: Some(name.to_string()),
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
         } else {
             if over_child_cap {
@@ -351,6 +359,8 @@ impl RomfsHandler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name: Some(name.to_string()),
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
         }
     }

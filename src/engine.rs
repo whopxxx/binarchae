@@ -157,6 +157,72 @@ pub struct ChildDraft {
     pub warnings: Vec<String>,
     /// Name if extracted from an archive (used by the extraction layer).
     pub entry_name: Option<String>,
+    /// FINAL-B7: the handler's honest claim about these bytes. A
+    /// handler that RECOVERED (rather than structurally decoded) the
+    /// content must say so — the engine no longer stamps every child
+    /// as Validated on the handler's behalf.
+    pub confidence: Confidence,
+    /// Structural facts backing the confidence claim.
+    pub evidence: Vec<String>,
+}
+
+impl ChildDraft {
+    /// Convenience constructor: structurally decoded child. Handlers
+    /// that recovered damaged content should override `confidence`
+    /// afterwards (or build the struct directly).
+    #[allow(clippy::too_many_arguments)]
+    pub fn decoded(
+        relation: RelationKind,
+        label: String,
+        format_hint: &'static str,
+        content: ChildContent,
+        size: u64,
+        metadata: BTreeMap<String, String>,
+        warnings: Vec<String>,
+        entry_name: Option<String>,
+    ) -> Self {
+        ChildDraft {
+            relation,
+            label,
+            format_hint,
+            content,
+            size,
+            metadata,
+            warnings,
+            entry_name,
+            confidence: Confidence::Validated,
+            evidence: vec!["structurally decoded by parent handler".to_string()],
+        }
+    }
+
+    /// Convenience constructor: RECOVERED bytes (salvaged from damaged
+    /// input — deleted records, heuristic carving). Honest by default.
+    #[allow(clippy::too_many_arguments)]
+    pub fn recovered(
+        relation: RelationKind,
+        label: String,
+        format_hint: &'static str,
+        content: ChildContent,
+        size: u64,
+        metadata: BTreeMap<String, String>,
+        warnings: Vec<String>,
+        entry_name: Option<String>,
+    ) -> Self {
+        ChildDraft {
+            confidence: Confidence::Recovered,
+            evidence: vec!["bytes recovered from damaged/erased source".to_string()],
+            ..ChildDraft::decoded(
+                relation,
+                label,
+                format_hint,
+                content,
+                size,
+                metadata,
+                warnings,
+                entry_name,
+            )
+        }
+    }
 }
 
 impl ChildContent {
@@ -737,8 +803,9 @@ impl RecursiveEngine {
                     offset: 0,
                     size: child.size,
                     hash: chash,
-                    confidence: Confidence::Validated,
-                    evidence: Evidence::facts(["produced by parent handler"]),
+                    // FINAL-B7: honor the handler's confidence claim.
+                    confidence: child.confidence,
+                    evidence: Evidence::facts(child.evidence.clone()),
                     extraction: ExtractionStatus::InMemory,
                     metadata: child.metadata,
                     warnings: child.warnings,

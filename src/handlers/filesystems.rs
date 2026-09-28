@@ -659,6 +659,8 @@ impl SquashfsHandler {
                         metadata: meta,
                         warnings: vec!["special entries are never materialized".to_string()],
                         entry_name: Some(name),
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                     continue;
                 }
@@ -734,6 +736,8 @@ impl SquashfsHandler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name,
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
             if ino.file_size > 0 {
                 self.walk_dir(
@@ -770,6 +774,8 @@ impl SquashfsHandler {
                     metadata: meta,
                     warnings: Vec::new(),
                     entry_name,
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
                 return Ok(());
             }
@@ -787,6 +793,8 @@ impl SquashfsHandler {
                     metadata: meta,
                     warnings: Vec::new(),
                     entry_name,
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
                 return Ok(());
             }
@@ -800,6 +808,8 @@ impl SquashfsHandler {
                 metadata: meta,
                 warnings: vec!["content reconstructed from compressed squashfs blocks".to_string()],
                 entry_name,
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
             return Ok(());
         }
@@ -817,6 +827,8 @@ impl SquashfsHandler {
                 metadata: meta,
                 warnings: vec!["symlink target kept as metadata; never materialized".to_string()],
                 entry_name,
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
         }
         Ok(())
@@ -1327,6 +1339,8 @@ impl Iso9660Handler {
                     metadata: meta,
                     warnings: Vec::new(),
                     entry_name,
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
                 self.walk_dir(
                     src,
@@ -1401,6 +1415,8 @@ impl Iso9660Handler {
                     Vec::new()
                 },
                 entry_name,
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
         }
         Ok(())
@@ -2389,6 +2405,8 @@ impl Jffs2Handler {
                         metadata: meta,
                         warnings: Vec::new(),
                         entry_name,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                     self.emit_dir(
                         src,
@@ -2430,7 +2448,9 @@ impl Jffs2Handler {
                                     "content reconstructed from JFFS2 log fragments".to_string()
                                 ],
                                 entry_name,
-                            });
+                            confidence: Confidence::Validated,
+                                evidence: vec!["structurally decoded by parent handler".to_string()],
+                                });
                         }
                         None => {
                             out.push(ChildDraft {
@@ -2442,7 +2462,9 @@ impl Jffs2Handler {
                                 metadata: meta,
                                 warnings: Vec::new(),
                                 entry_name,
-                            });
+                            confidence: Confidence::Validated,
+                                evidence: vec!["structurally decoded by parent handler".to_string()],
+                                });
                         }
                     }
                 }
@@ -2464,6 +2486,8 @@ impl Jffs2Handler {
                             "symlink target kept as metadata; never materialized".to_string()
                         ],
                         entry_name,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
                 DT_FIFO | DT_CHR | DT_BLK | DT_SOCK => {
@@ -2477,6 +2501,8 @@ impl Jffs2Handler {
                         metadata: meta,
                         warnings: vec!["special entries are never materialized".to_string()],
                         entry_name,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
                 other => {
@@ -2817,6 +2843,8 @@ impl Handler for UbiVolumeHandler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name: Some(vol.name.clone()),
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
         }
 
@@ -3541,6 +3569,8 @@ impl UbifsHandler {
                         metadata: meta,
                         warnings: Vec::new(),
                         entry_name,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                     self.emit_dir(
                         src,
@@ -3583,6 +3613,8 @@ impl UbifsHandler {
                         metadata: meta,
                         warnings: vec!["content reconstructed from UBIFS B-tree nodes".to_string()],
                         entry_name,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
                 2 => {
@@ -3604,6 +3636,8 @@ impl UbifsHandler {
                             "symlink target kept as metadata; never materialized".to_string()
                         ],
                         entry_name,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
                 3..=6 => {
@@ -3618,6 +3652,8 @@ impl UbifsHandler {
                         metadata: meta,
                         warnings: vec!["special entries are never materialized".to_string()],
                         entry_name,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
                 other => {
@@ -4055,6 +4091,8 @@ impl Yaffs2Handler {
                         metadata: meta,
                         warnings: Vec::new(),
                         entry_name,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                     self.emit_dir(
                         src,
@@ -4120,6 +4158,8 @@ impl Yaffs2Handler {
                         metadata: meta,
                         warnings: vec!["content reconstructed from YAFFS2 data chunks".to_string()],
                         entry_name,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
                 YAFFS_TYPE_SYMLINK => {
@@ -4135,6 +4175,8 @@ impl Yaffs2Handler {
                             "symlink target kept as metadata; never materialized".to_string()
                         ],
                         entry_name,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
                 YAFFS_TYPE_HARDLINK => {
@@ -4149,6 +4191,8 @@ impl Yaffs2Handler {
                         metadata: meta,
                         warnings: Vec::new(),
                         entry_name,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
                 YAFFS_TYPE_SPECIAL => {
@@ -4162,6 +4206,8 @@ impl Yaffs2Handler {
                         metadata: meta,
                         warnings: vec!["special entries are never materialized".to_string()],
                         entry_name,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
                 _ => {}

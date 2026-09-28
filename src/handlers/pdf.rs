@@ -385,6 +385,8 @@ impl Handler for PdfHandler {
                         .to_string(),
                 ],
                 entry_name: Some(format!("object_{obj_num}.stream")),
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
         }
         if !objects.is_empty() && children.is_empty() {

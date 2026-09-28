@@ -74,6 +74,8 @@ fn decompressed_output(
                 metadata: BTreeMap::new(),
                 warnings: Vec::new(),
                 entry_name: None,
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             }],
         }],
     }
@@ -1043,6 +1045,8 @@ impl Handler for LzmaAloneHandler {
                     metadata: BTreeMap::new(),
                     warnings: Vec::new(),
                     entry_name: Some("payload.bin".to_string()),
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 }],
             }],
         })

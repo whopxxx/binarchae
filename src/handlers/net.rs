@@ -28,7 +28,7 @@
 //! reporting; stream count and byte limits come from EngineLimits
 //! (max_streams, max_reconstructed_bytes).
 
-use crate::artifact::RelationKind;
+use crate::artifact::{Confidence, RelationKind};
 use crate::bytesource::ByteSource;
 use crate::engine::{ChildContent, ChildDraft};
 use std::collections::BTreeMap;
@@ -801,6 +801,8 @@ pub fn owned_child(
         metadata: meta,
         warnings: Vec::new(),
         entry_name: None,
+        confidence: Confidence::Validated,
+        evidence: vec!["structurally decoded by parent handler".to_string()],
     }
 }
 

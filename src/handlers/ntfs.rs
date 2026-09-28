@@ -476,6 +476,8 @@ impl NtfsHandler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name: Some(label_full),
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
             return Ok(());
         }
@@ -490,6 +492,8 @@ impl NtfsHandler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name: Some(label_full),
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
             return Ok(());
         }
@@ -507,6 +511,8 @@ impl NtfsHandler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name: Some(label_full),
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
             return Ok(());
         }
@@ -520,6 +526,8 @@ impl NtfsHandler {
             metadata: meta,
             warnings: vec!["content reconstructed from non-resident runs".to_string()],
             entry_name: Some(label_full),
+            confidence: Confidence::Validated,
+            evidence: vec!["structurally decoded by parent handler".to_string()],
         });
         Ok(())
     }
@@ -626,11 +634,18 @@ impl NtfsHandler {
                 )?;
             }
             if deleted {
-                // §8: mark everything the deleted record produced.
+                // §8: mark everything the deleted record produced. FINAL-B7:
+                // the confidence claim must match — deleted records are
+                // RECOVERED bytes (clusters may be reused), not Validated.
                 for c in &mut out[before..] {
                     c.metadata.insert("deleted".to_string(), "true".to_string());
                     c.warnings
                         .push("deleted MFT record: clusters may be reused; content is best-effort recovery".to_string());
+                    c.confidence = Confidence::Recovered;
+                    c.evidence = vec![
+                        "bytes recovered from a deleted MFT record".to_string(),
+                        "clusters may have been reused since deletion".to_string(),
+                    ];
                 }
             }
         } else {
@@ -711,6 +726,8 @@ impl NtfsHandler {
                 metadata: dmeta,
                 warnings: dwarn,
                 entry_name: fname,
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
         }
         Ok(())
@@ -1081,6 +1098,24 @@ mod tests {
             .find(|c| c.metadata.get("mft_record").map(String::as_str) == Some("16"))
             .map(|c| !c.metadata.contains_key("deleted"))
             .unwrap_or(true));
+        // FINAL-B7: deleted-record children must claim Recovered, and
+        // the evidence must say so — never Validated.
+        assert_eq!(
+            del.confidence,
+            Confidence::Recovered,
+            "deleted-record content is recovered bytes, not validated"
+        );
+        assert!(del
+            .evidence
+            .iter()
+            .any(|e| e.contains("recovered from a deleted MFT record")));
+        // The live record keeps Validated.
+        assert!(art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("mft_record").map(String::as_str) == Some("16"))
+            .map(|c| c.confidence == Confidence::Validated)
+            .unwrap_or(false));
     }
 
     #[test]

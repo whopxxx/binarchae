@@ -207,6 +207,8 @@ impl Handler for UImageHandler {
                     metadata: BTreeMap::new(),
                     warnings: Vec::new(),
                     entry_name: None,
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
             }
         }
@@ -299,6 +301,8 @@ fn parse_multi_components(payload: &ByteSource, total: u64) -> Result<Vec<ChildD
             metadata: meta,
             warnings: Vec::new(),
             entry_name: None,
+            confidence: Confidence::Validated,
+            evidence: vec!["structurally decoded by parent handler".to_string()],
         });
         // 4-byte alignment between components.
         data_off = end + (4 - (end % 4)) % 4;

@@ -426,6 +426,8 @@ impl Handler for PeHandler {
                     metadata: meta,
                     warnings: Vec::new(),
                     entry_name: Some(format!("section_{sec_name}")),
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
             }
         }
@@ -1240,6 +1242,8 @@ impl Handler for OleHandler {
                             metadata: meta,
                             warnings: Vec::new(),
                             entry_name: Some(child_path.replace('/', "_")),
+                            confidence: Confidence::Validated,
+                            evidence: vec!["structurally decoded by parent handler".to_string()],
                         });
                     }
                 }

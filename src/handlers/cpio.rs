@@ -267,6 +267,8 @@ impl Handler for CpioHandler {
                             metadata: meta,
                             warnings: Vec::new(),
                             entry_name: Some(name),
+                            confidence: Confidence::Validated,
+                            evidence: vec!["structurally decoded by parent handler".to_string()],
                         });
                     }
                 }
@@ -292,6 +294,8 @@ impl Handler for CpioHandler {
                             "symlink entry: never materialized as a host symlink".to_string()
                         ],
                         entry_name: None,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
                 0o040000 => {
@@ -309,6 +313,8 @@ impl Handler for CpioHandler {
                         metadata: meta,
                         warnings: Vec::new(),
                         entry_name: None,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
                 0o020000 | 0o060000 | 0o010000 | 0o140000 => {
@@ -325,6 +331,8 @@ impl Handler for CpioHandler {
                             "{type_name} entry: host special file creation forbidden"
                         )],
                         entry_name: None,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
                 _ => {
@@ -341,6 +349,8 @@ impl Handler for CpioHandler {
                         metadata: meta,
                         warnings: vec!["unknown entry type".to_string()],
                         entry_name: None,
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                 }
             }
