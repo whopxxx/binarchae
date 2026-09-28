@@ -311,6 +311,238 @@ fn s6_uimage_gzip_kernel_provenance() {
     );
 }
 
+// ---------- B7 required chains ----------
+
+// PCAP -> TCP/HTTP reconstruction -> artifact
+#[test]
+fn b7_pcap_http_reconstruction() {
+    let http_req = b"GET /flag.txt HTTP/1.1\r\nHost: ctf.local\r\n\r\n";
+    let http_resp = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nCTF{pcap77}";
+    let mut p = Vec::new();
+    p.extend_from_slice(&[0xD4, 0xC3, 0xB2, 0xA1]);
+    p.extend(2u16.to_le_bytes());
+    p.extend(4u16.to_le_bytes());
+    p.extend(0u32.to_le_bytes());
+    p.extend(0u32.to_le_bytes());
+    p.extend(262144u32.to_le_bytes());
+    p.extend(1u32.to_le_bytes());
+    // Two packets: request and response.
+    for pkt in [http_req.as_slice(), http_resp.as_slice()] {
+        p.extend(1u32.to_le_bytes());
+        p.extend(0u32.to_le_bytes());
+        p.extend((pkt.len() as u32).to_le_bytes());
+        p.extend((pkt.len() as u32).to_le_bytes());
+        p.extend_from_slice(pkt);
+    }
+    let graph = engine().analyze(&ByteSource::from_vec(p), true);
+
+    let pcap_id = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "pcap")
+        .map(|a| a.id);
+    assert!(pcap_id.is_some(), "pcap validated");
+    let mut found = false;
+    for (r, c) in graph.children(pcap_id.unwrap()) {
+        if c.label.contains("HTTP object") && r == RelationKind::ReconstructedFrom {
+            found = true;
+        }
+    }
+    assert!(found, "HTTP object reconstructed under pcap");
+}
+
+// GPT -> partition -> FAT -> nested file
+#[test]
+fn b7_gpt_partition_fat_file_chain() {
+    let fat = make_fat12_with_file(b"FLAG{gpt}");
+    let sector = 512usize;
+    let fat_start_lba: u64 = 3;
+    let fat_sectors = (fat.len() as u64).div_ceil(512);
+    let total = ((fat_start_lba + fat_sectors) * 512) as usize;
+    let mut d = vec![0u8; total];
+    // Protective MBR (LBA 0).
+    let pe = 446;
+    d[pe + 4] = 0xEE;
+    d[pe + 8..pe + 12].copy_from_slice(&1u32.to_le_bytes());
+    d[510..512].copy_from_slice(&[0x55, 0xAA]);
+    // GPT header at LBA 1 (offset 512).
+    let hdr = sector;
+    d[hdr..hdr + 8].copy_from_slice(b"EFI PART");
+    d[hdr + 8..hdr + 12].copy_from_slice(&0x0001_0000u32.to_le_bytes()); // revision 1.0
+    d[hdr + 12..hdr + 16].copy_from_slice(&92u32.to_le_bytes()); // header size
+    d[hdr + 24..hdr + 32].copy_from_slice(&1u64.to_le_bytes()); // current lba
+    d[hdr + 32..hdr + 40].copy_from_slice(&1u64.to_le_bytes()); // backup lba
+    d[hdr + 40..hdr + 48].copy_from_slice(&2u64.to_le_bytes()); // first usable
+    d[hdr + 48..hdr + 56].copy_from_slice(&((total as u64 / 512) - 2).to_le_bytes());
+    d[hdr + 56..hdr + 64].copy_from_slice(&((total as u64 / 512) - 2).to_le_bytes());
+    // 0x48=72 entries lba; 0x50=80 num entries; 0x54=84 entry size;
+    // 0x58=88 entries crc.
+    d[hdr + 72..hdr + 80].copy_from_slice(&2u64.to_le_bytes());
+    d[hdr + 80..hdr + 84].copy_from_slice(&1u32.to_le_bytes());
+    d[hdr + 84..hdr + 88].copy_from_slice(&128u32.to_le_bytes());
+    // Entry array at LBA 2 (offset 1024). Entry 0 = FAT partition.
+    let ent = 2 * sector;
+    d[ent..ent + 16].copy_from_slice(&[
+        0x06, 0x57, 0x20, 0x9E, 0x36, 0x77, 0xA3, 0x4E, 0xA3, 0x1E, 0xB3, 0x13, 0x3E, 0xEE, 0x00,
+        0x02,
+    ]);
+    d[ent + 32..ent + 40].copy_from_slice(&fat_start_lba.to_le_bytes());
+    d[ent + 40..ent + 48].copy_from_slice(&(fat_start_lba + fat_sectors - 1).to_le_bytes());
+    // Entry-array CRC over num_entries * entry_size bytes.
+    let entries_crc = crc32(&d[ent..ent + 128]);
+    d[hdr + 88..hdr + 92].copy_from_slice(&entries_crc.to_le_bytes());
+    // Header CRC over the first 92 bytes with the CRC field zeroed.
+    d[hdr + 16..hdr + 20].copy_from_slice(&[0; 4]);
+    let hcrc = crc32(&d[hdr..hdr + 92]);
+    d[hdr + 16..hdr + 20].copy_from_slice(&hcrc.to_le_bytes());
+    // Partition data at LBA 3.
+    d[3 * sector..3 * sector + fat.len()].copy_from_slice(&fat);
+
+    let graph = engine().analyze(&ByteSource::from_vec(d), true);
+    // Chain: a fat artifact must descend from the gpt artifact.
+    let gpt_id = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "gpt")
+        .map(|a| a.id);
+    assert!(gpt_id.is_some(), "GPT header validated");
+    let mut chain_ok = false;
+    for j in 0..graph.len() as u64 {
+        if graph.get(j).unwrap().format == "fat" && has_ancestor(&graph, j, gpt_id.unwrap()) {
+            chain_ok = true;
+        }
+    }
+    assert!(chain_ok, "GPT -> partition -> FAT chain");
+}
+
+// SQLite -> BLOB -> nested artifact
+#[test]
+fn b7_sqlite_blob_nested_artifact() {
+    let png = make_png_valid();
+    // Record: header [len][blob serial], body = png bytes.
+    let mut hdr: Vec<u8> = vec![0u8];
+    hdr.extend(ctf_write_varint(12u64 + 2 * png.len() as u64));
+    hdr[0] = hdr.len() as u8;
+    let mut record = hdr;
+    record.extend_from_slice(&png);
+
+    let page_size = 8192usize;
+    let mut db = vec![0u8; page_size];
+    db[0..16].copy_from_slice(b"SQLite format 3\0");
+    db[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
+    db[56..60].copy_from_slice(&1u32.to_be_bytes());
+    db[100] = 0x0D;
+    db[103..105].copy_from_slice(&1u16.to_be_bytes());
+    let mut cell = ctf_write_varint(record.len() as u64);
+    cell.extend(ctf_write_varint(1));
+    cell.extend_from_slice(&record);
+    let cell_off = page_size - cell.len();
+    db[108..110].copy_from_slice(&(cell_off as u16).to_be_bytes());
+    db[cell_off..cell_off + cell.len()].copy_from_slice(&cell);
+
+    let gz = make_gzip(&db);
+    let graph = engine().analyze(&ByteSource::from_vec(gz), true);
+    let sqlite_id = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "sqlite")
+        .map(|a| a.id);
+    assert!(sqlite_id.is_some(), "sqlite validated");
+    let mut png_under_sqlite = false;
+    for j in 0..graph.len() as u64 {
+        if graph.get(j).unwrap().format == "png" && has_ancestor(&graph, j, sqlite_id.unwrap()) {
+            png_under_sqlite = true;
+        }
+    }
+    assert!(png_under_sqlite, "PNG BLOB recursed under sqlite");
+}
+
+// Registry -> REG_BINARY -> artifact
+#[test]
+fn b7_registry_regbinary_artifact() {
+    let mut v = vec![0u8; 8192];
+    v[0..4].copy_from_slice(b"regf");
+    v[4096..4100].copy_from_slice(b"hbin");
+    v[4104..4108].copy_from_slice(&4096u32.to_le_bytes());
+    let cell: u64 = 4128;
+    let cell_size: u64 = 4 + 2 + 2 + 4 + 4 + 4 + 4 + 12;
+    v[cell as usize..cell as usize + 4].copy_from_slice(&((-(cell_size as i32)).to_le_bytes()));
+    v[cell as usize + 4..cell as usize + 6].copy_from_slice(b"vk");
+    v[cell as usize + 6..cell as usize + 8].copy_from_slice(&0u16.to_le_bytes());
+    v[cell as usize + 8..cell as usize + 12].copy_from_slice(&16u32.to_le_bytes());
+    v[cell as usize + 12..cell as usize + 16].copy_from_slice(&4192u32.to_le_bytes());
+    v[cell as usize + 16..cell as usize + 20].copy_from_slice(&0u32.to_le_bytes());
+    v[cell as usize + 20..cell as usize + 24].copy_from_slice(&3u32.to_le_bytes()); // REG_BINARY
+    v[4192..4208].copy_from_slice(&[0xB7u8; 16]);
+    let graph = engine().analyze(&ByteSource::from_vec(v), true);
+    let reg = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "registry")
+        .map(|a| a.id)
+        .expect("registry validated");
+    let mut binary_child = false;
+    for (r, c) in graph.children(reg) {
+        if c.label.contains("REG_BINARY") && r == RelationKind::FilesystemEntry {
+            binary_child = true;
+        }
+    }
+    assert!(binary_child, "REG_BINARY must be a child artifact");
+}
+
+// Minidump -> MemoryRange -> artifact
+#[test]
+fn b7_minidump_memoryrange_artifact() {
+    let mut m = Vec::new();
+    m.extend(b"MDMP"); // 0..4
+    m.extend(42899u32.to_le_bytes()); // version
+    m.extend(1u32.to_le_bytes()); // 1 stream
+    m.extend(32u32.to_le_bytes()); // dir rva = 32
+    m.extend(0u32.to_le_bytes()); // checksum
+    m.extend(0u32.to_le_bytes()); // timestamp
+    m.extend(0u64.to_le_bytes()); // flags -> header ends at 32
+                                  // Directory entry at 32: type=9 (Memory64List), size=24, rva=48.
+    m.extend(9u32.to_le_bytes());
+    m.extend(24u32.to_le_bytes());
+    m.extend(48u32.to_le_bytes());
+    m.resize(48, 0); // pad to the stream rva
+                     // Memory64List at 48: count(8), base_rva(8) = 80 (data at 80).
+    m.extend(1u64.to_le_bytes());
+    m.extend(80u64.to_le_bytes());
+    // Descriptor at 64: start_addr, data_size=32.
+    m.extend(0x1000u64.to_le_bytes());
+    m.extend(32u64.to_le_bytes()); // ends at 80
+                                   // Raw memory at 80..112.
+    m.extend(b"FLAG{memdump}FFFFFFFFFFFFFFFFFFFF");
+    let graph = engine().analyze(&ByteSource::from_vec(m), true);
+    let md = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "minidump")
+        .map(|a| a.id)
+        .expect("minidump validated");
+    let mut range_child = false;
+    for (r, _) in graph.children(md) {
+        if r == RelationKind::MemoryRange {
+            range_child = true;
+        }
+    }
+    assert!(range_child, "MemoryRange child required");
+}
+
+fn ctf_write_varint(mut v: u64) -> Vec<u8> {
+    if v <= 0x7F {
+        return vec![v as u8];
+    }
+    let mut out = Vec::new();
+    while v > 0 {
+        out.insert(0, ((v & 0x7F) as u8) | 0x80);
+        v >>= 7;
+    }
+    *out.last_mut().unwrap() &= 0x7F;
+    out
+}
+
 // ---------- graph helpers ----------
 
 fn has_ancestor(graph: &ctf_tools::artifact::ArtifactGraph, id: u64, ancestor: u64) -> bool {

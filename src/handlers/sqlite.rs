@@ -142,6 +142,31 @@ impl Handler for SqliteHandler {
                 warnings: Vec::new(),
                 entry_name: None,
             });
+            // B7: BLOB values surface as children for recursive scanning.
+            for (vi, v) in row.values.iter().enumerate() {
+                if let Value::Blob(b) = v {
+                    if b.len() >= 16
+                        && b.len() as u64 <= limits.max_child_size
+                        && children.len() < limits.max_records
+                    {
+                        children.push(ChildDraft {
+                            relation: RelationKind::DatabaseRecord,
+                            label: format!(
+                                "row sqlite_schema[{}] col{} blob ({} bytes)",
+                                row.rowid,
+                                vi,
+                                b.len()
+                            ),
+                            format_hint: "raw",
+                            content: ChildContent::Owned(b.clone()),
+                            size: b.len() as u64,
+                            metadata: BTreeMap::new(),
+                            warnings: Vec::new(),
+                            entry_name: None,
+                        });
+                    }
+                }
+            }
         }
 
         // Extract table names + root pages from schema rows.
@@ -203,6 +228,33 @@ impl Handler for SqliteHandler {
                     warnings: Vec::new(),
                     entry_name: None,
                 });
+                // B7: BLOB values surface as children so the recursive
+                // engine can scan their bytes (a PNG in a BLOB becomes a
+                // real artifact under the SQLite node).
+                for (vi, v) in row.values.iter().enumerate() {
+                    if let Value::Blob(b) = v {
+                        if b.len() >= 16
+                            && b.len() as u64 <= limits.max_child_size
+                            && children.len() < limits.max_records
+                        {
+                            children.push(ChildDraft {
+                                relation: RelationKind::DatabaseRecord,
+                                label: format!(
+                                    "row {name}[{}] col{} blob ({} bytes)",
+                                    row.rowid,
+                                    vi,
+                                    b.len()
+                                ),
+                                format_hint: "raw",
+                                content: ChildContent::Owned(b.clone()),
+                                size: b.len() as u64,
+                                metadata: BTreeMap::new(),
+                                warnings: Vec::new(),
+                                entry_name: None,
+                            });
+                        }
+                    }
+                }
             }
         }
 

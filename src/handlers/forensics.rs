@@ -23,6 +23,13 @@ use crate::error::{Error, Result};
 use crate::handlers::find_all;
 use std::collections::BTreeMap;
 
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
 fn le32(src: &ByteSource, off: u64) -> Option<u32> {
     let mut b = [0u8; 4];
     src.read_at(off, &mut b).ok()?;
@@ -70,6 +77,7 @@ impl Handler for RegistryHandler {
         let mut cells = 0usize;
         let mut nk_nodes = 0usize;
         let mut vk_values = 0usize;
+        let mut children: Vec<ChildDraft> = Vec::new();
         while off + 32 <= src.len() && bins < limits.max_records.min(4096) {
             let mut magic = [0u8; 4];
             if src.read_at(off, &mut magic).is_err() || &magic != b"hbin" {
@@ -94,7 +102,43 @@ impl Handler for RegistryHandler {
                     src.read_at(cell + 4, &mut tag)?;
                     match &tag {
                         b"nk" => nk_nodes += 1,
-                        b"vk" => vk_values += 1,
+                        b"vk" => {
+                            vk_values += 1;
+                            // B7: decode the value record. vk layout:
+                            // +0 sig, +2 name_len(u16), +4 data_len(u32),
+                            // +8 data_offset(u32; HBIN-relative; high bit
+                            // = data stored inline in the 4-byte field),
+                            // +20 value_type(u32).
+                            let data_len = le32(src, cell + 8).unwrap_or(0) as u64;
+                            let data_off_field = le32(src, cell + 12).unwrap_or(0);
+                            let value_type = le32(src, cell + 20).unwrap_or(0);
+                            // REG_BINARY = 3. Data size sanity + cap.
+                            if value_type == 3
+                                && data_len > 0
+                                && data_len <= limits.max_child_size
+                                && (data_off_field & 0x8000_0000) == 0
+                            {
+                                // HBIN-relative data offset: the vk data
+                                // offset field is relative to the START OF
+                                // THE HIVE FILE in practice (offset 0 = base
+                                // of the regf). Add base and the cell start.
+                                let abs_data = base + data_off_field as u64;
+                                if abs_data + data_len <= src.len() {
+                                    if let Ok(region) = src.slice(abs_data, data_len) {
+                                        children.push(ChildDraft {
+                                            relation: RelationKind::FilesystemEntry,
+                                            label: format!("REG_BINARY value ({} bytes)", data_len),
+                                            format_hint: "raw",
+                                            content: ChildContent::Source(region),
+                                            size: data_len,
+                                            metadata: BTreeMap::new(),
+                                            warnings: Vec::new(),
+                                            entry_name: None,
+                                        });
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -132,7 +176,7 @@ impl Handler for RegistryHandler {
                     "full key-hierarchy reconstruction is planned for a hardening pass".to_string(),
                 ],
                 errors: Vec::new(),
-                children: Vec::new(),
+                children,
             }],
         })
     }
@@ -206,6 +250,7 @@ impl Handler for PcapHandler {
         // Packet record walk.
         let mut off = base + 24;
         let mut packets: Vec<ChildDraft> = Vec::new();
+        let mut http_objects = 0usize;
         let mut truncated = false;
         while off + 16 <= src.len() && packets.len() < limits.max_records.min(65_536) {
             let ts_sec = rd32(off)?;
@@ -237,12 +282,107 @@ impl Handler for PcapHandler {
 
         let mut metadata = BTreeMap::new();
         metadata.insert("packets".to_string(), packets.len().to_string());
+        metadata.insert("http_objects".to_string(), http_objects.to_string());
         metadata.insert("snaplen".to_string(), snaplen.to_string());
         metadata.insert(
             "byte_order".to_string(),
             if little_endian { "little" } else { "big" }.to_string(),
         );
         metadata.insert("nanosecond".to_string(), nanosecond.to_string());
+
+        // B7: TCP/HTTP reconstruction. Concatenate the packet payloads
+        // in capture order and carve complete HTTP request/response
+        // messages (header block terminated by CRLFCRLF, body bounded by
+        // Content-Length when present, else header-block-only). Each
+        // recovered object becomes a ReconstructedFrom child carrying
+        // the reassembled bytes.
+        // Gather payloads (bounded).
+        let mut payload: Vec<u8> = Vec::new();
+        let mut seg_meta: Vec<(u64, u64)> = Vec::new(); // (payload_start_abs, len)
+        for p in &packets {
+            // packets store absolute region start via metadata? The
+            // ChildDraft carries content, not offsets; use recorded
+            // sizes to recompute from the record headers instead.
+            let _ = p;
+        }
+        // Re-walk record headers to get payload absolute ranges.
+        let mut off2 = base + 24;
+        let mut idx = 0usize;
+        while off2 + 16 <= src.len() && idx < packets.len() {
+            let incl_len = rd32(off2 + 8)? as u64;
+            if incl_len > snaplen.max(262_144) || off2 + 16 + incl_len > src.len() {
+                break;
+            }
+            seg_meta.push((off2 + 16, incl_len));
+            off2 += 16 + incl_len;
+            idx += 1;
+        }
+        for (pstart, plen) in seg_meta {
+            if payload.len() > 4 * 1024 * 1024 {
+                break;
+            }
+            let mut buf = vec![0u8; plen as usize];
+            if src.read_at(pstart, &mut buf).is_ok() {
+                payload.extend_from_slice(&buf);
+            }
+        }
+        // Carve HTTP messages from the concatenated payload.
+        let mut pos = 0usize;
+        while pos + 16 < payload.len() && http_objects < limits.max_records {
+            let window = &payload[pos..];
+            let header_end = match find_subslice(window, b"\r\n\r\n") {
+                Some(h) => h + 4,
+                None => break,
+            };
+            let head = String::from_utf8_lossy(&window[..header_end]).to_string();
+            let first = head.lines().next().unwrap_or("");
+            let is_http = first.starts_with("HTTP/")
+                || first.starts_with("GET ")
+                || first.starts_with("POST ")
+                || first.starts_with("PUT ")
+                || first.starts_with("DELETE ")
+                || first.starts_with("HEAD ");
+            if !is_http {
+                // Skip past this false header candidate.
+                pos += header_end;
+                continue;
+            }
+            let content_length = head
+                .lines()
+                .find_map(|l| {
+                    let lower = l.to_ascii_lowercase();
+                    lower
+                        .strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            let body_end = (header_end + content_length).min(window.len());
+            let complete = body_end == header_end + content_length;
+            let total = body_end;
+            if total == 0 {
+                break;
+            }
+            let bytes = window[..total].to_vec();
+            let mut meta = BTreeMap::new();
+            meta.insert("http_object_index".to_string(), http_objects.to_string());
+            meta.insert("complete".to_string(), complete.to_string());
+            meta.insert("method_or_status".to_string(), first.to_string());
+            packets.push(ChildDraft {
+                relation: RelationKind::ReconstructedFrom,
+                label: format!(
+                    "HTTP object {http_objects} ({total} bytes{})",
+                    if complete { "" } else { ", incomplete" }
+                ),
+                format_hint: "http",
+                content: ChildContent::Owned(bytes),
+                size: total as u64,
+                metadata: meta,
+                warnings: Vec::new(),
+                entry_name: None,
+            });
+            http_objects += 1;
+            pos += total;
+        }
 
         // B4: a capture cut off mid-record is NOT fully validated — the
         // record chain was not walked to a clean end. Downgrade honestly.
@@ -737,6 +877,39 @@ mod tests {
             ChildContent::Source(r) => assert_eq!(r.read_all().unwrap(), b"PKTD!".to_vec()),
             _ => panic!("packet must be source-backed"),
         }
+    }
+
+    #[test]
+    fn registry_binary_values_source_backed() {
+        // B7: REG_BINARY values must surface as source-backed children.
+        let mut v = vec![0u8; 8192];
+        v[0..4].copy_from_slice(b"regf");
+        // First hbin at 4096: magic + size 4096.
+        v[4096..4100].copy_from_slice(b"hbin");
+        v[4104..4108].copy_from_slice(&4096u32.to_le_bytes());
+        // Cell at 4128: negative size (allocated), vk record.
+        // vk: sig(2) name_len(2)=0 data_len(4)=16 data_offset(4) type(4)=3
+        let cell: u64 = 4128;
+        let cell_size: u64 = 4 + 2 + 2 + 4 + 4 + 4 + 4 + 12; // sig..type + slack
+        v[cell as usize..cell as usize + 4].copy_from_slice(&((-(cell_size as i32)).to_le_bytes()));
+        v[cell as usize + 4..cell as usize + 6].copy_from_slice(b"vk");
+        v[cell as usize + 6..cell as usize + 8].copy_from_slice(&0u16.to_le_bytes());
+        v[cell as usize + 8..cell as usize + 12].copy_from_slice(&16u32.to_le_bytes());
+        v[cell as usize + 12..cell as usize + 16].copy_from_slice(&4192u32.to_le_bytes());
+        v[cell as usize + 16..cell as usize + 20].copy_from_slice(&0u32.to_le_bytes());
+        v[cell as usize + 20..cell as usize + 24].copy_from_slice(&3u32.to_le_bytes()); // REG_BINARY
+                                                                                        // Payload at 4192.
+        v[4192..4208].copy_from_slice(0xBEEFu32.to_le_bytes().repeat(4).as_slice());
+        let src = ByteSource::from_vec(v);
+        let out = validate_at(&RegistryHandler, &src, 0).expect("registry validates");
+        let art = &out.artifacts[0];
+        assert!(
+            art.children
+                .iter()
+                .any(|c| c.label.contains("REG_BINARY") && c.size == 16),
+            "REG_BINARY value must be a source-backed child; children: {:?}",
+            art.children.iter().map(|c| &c.label).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -135,6 +135,24 @@ The forensics and recovery additions follow the same contract:
   bounded by `max_string_candidates`; string hints are metadata, never
   validated artifacts, and never materialized as files.
 
+## M3 hardening (round 2)
+
+- **FAT**: BPB layout arithmetic is fully checked — reserved + FAT
+  sectors + root-directory sectors must fit `total_sectors`; a hostile
+  BPB is rejected instead of wrapping into a huge cluster count.
+- **Compression**: zlib/bzip2/Zstd/LZ4 stream chunk-by-chunk through the
+  source (no candidate-to-EOF `read_all()` before limits apply); frame
+  ends are exact (zlib ADLER, zstd `findFrameCompressedSize`, LZ4
+  EndMark), so trailing data after a frame stays discoverable.
+- **SQLite**: overflow pages use full `page_size` stride; the per-spec
+  X/M/K local-payload rule is implemented; `max_sqlite_pages` bounds the
+  b-tree walk and overflow chains.
+- **Minidump**: RVAs resolve relative to the dump start; Memory64List
+  uses its real layout (u64 count, u64 BaseRva, contiguous memory).
+- **ELF/PE/Mach-O**: artifact size is the provable structural end
+  (section table / section raw data / load commands + segment files),
+  never "rest of input" — trailing-data provenance stays correct.
+
 ## Fuzzing
 
 `fuzz/` contains three cargo-fuzz targets exercising the engine, every

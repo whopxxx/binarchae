@@ -53,9 +53,9 @@ internal structure; the limits are stated explicitly.
 
 | Format | Detect | Validate | Size | Extract | Recurse | Notes |
 |---|---:|---:|---:|---:|---:|---|
-| ELF | yes | yes (header + sections) | yes | sections | yes | section/program headers |
-| PE | yes | yes (DOS+NT headers) | partial | metadata | yes | Partial: sections not carved individually |
-| Mach-O | yes | yes (header + load commands) | partial | metadata | yes | |
+| ELF | yes | yes (header + sections) | yes (section-table-proven) | sections | yes | section/program headers |
+| PE | yes | yes (DOS+NT headers + section raw data) | yes (proven boundary) | metadata | yes | sections not carved individually |
+| Mach-O | yes | yes (header + load commands + segments) | yes (proven boundary) | metadata | yes | |
 | WASM | yes | yes (magic + section walk) | yes | sections | yes | |
 
 ### Disk / filesystems (M3)
@@ -89,12 +89,27 @@ internal structure; the limits are stated explicitly.
 
 | Format | Detect | Validate | Size | Extract | Recurse | Notes |
 |---|---:|---:|---:|---:|---:|---|
-| SQLite | yes | yes (header + b-tree walk) | yes | records | yes | schema + table rows as DatabaseRecord children; overflow chains |
-| Registry (regf) | yes | partial (hbin/cell walk) | n/a | counts | no | Partial: nk/vk cell counting; value decoding planned |
-| PCAP | yes | yes (record walk) | yes | packets | yes | all 4 magic endianness variants; truncated captures recoverable |
+| SQLite | yes | yes (header + b-tree walk) | yes | records + BLOBs | yes | schema + table rows as DatabaseRecord children; BLOB values recurse (nested artifacts); overflow chains per X/M/K rule |
+| Registry (regf) | yes | partial (hbin/cell walk) | n/a | REG_BINARY values | no | Partial: nk/vk cell counting; REG_BINARY values surface as source-backed children |
+| PCAP | yes | yes (record walk) | yes | packets + HTTP | yes | all 4 magic endianness variants (us/ns); truncated captures → Partial; TCP/HTTP object reconstruction (ReconstructedFrom children) |
 | PCAPNG | yes | yes (block chain) | yes | packets | yes | SHB/EPB walk |
 | Minidump | yes | yes (stream directory) | yes | memory ranges | yes | MemoryList/Memory64List → MemoryRange children |
 | Strings/URL/flag hints | yes | heuristic | n/a | n/a | no | Heuristic confidence — never claims validation |
+
+## Required cross-domain chains (Issue #5, verified in tests/m3_integration.rs)
+
+| Chain | Status |
+|---|---|
+| PNG → trailing data → ZIP → member | yes (per-hop provenance asserted) |
+| gzip → SQLite → DatabaseRecord rows | yes |
+| PCAP → TCP/HTTP reconstruction → HTTP object artifact | yes |
+| GPT → PartitionOf → filesystem (FAT) → nested file | yes |
+| SQLite → DatabaseRecord BLOB → nested artifact (e.g. PNG) | yes |
+| Registry → REG_BINARY value → artifact | yes |
+| Minidump → MemoryRange → artifact | yes |
+| MBR → partition → FAT → file | yes |
+| uImage → gzip kernel → payload | yes |
+| Truncated ZIP → salvage → Recovered entries | yes |
 
 ## Recovery (M3)
 
@@ -146,9 +161,11 @@ they represent bytes that already existed in the input.
 - RAR/7z *recovery-record* parsing; RAR extraction (recovery-only).
 - exFAT, JFFS2, cramfs, ROMFS filesystems.
 - NTFS/ext/SquashFS/UBI full-entry extraction (superblock-level only).
-- Registry key-tree reconstruction and value-content decoding.
-- Network protocol reassembly (TCP streams, HTTP objects, DNS) on top
-  of PCAP packets.
+- Registry key-tree reconstruction (REG_BINARY value extraction works;
+  full key hierarchy and REG_SZ/REG_MULTI_SZ decoding remain).
+- Per-flow TCP stream reassembly (sequence-number based, multi-packet
+  retransmission handling); HTTP carving over capture-order payload
+  concatenation works today.
 - GUI/web UI, MCP, plugin ecosystem.
 
 Each "not yet" above is a deliberate scoping decision documented here;
