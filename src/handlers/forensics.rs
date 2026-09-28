@@ -51,6 +51,267 @@ fn le32(src: &ByteSource, off: u64) -> Option<u32> {
 
 pub struct RegistryHandler;
 
+/// Registry hive node types (nk record).
+const NK_TAG: &[u8] = b"nk";
+const VK_TAG: &[u8] = b"vk";
+const LH_TAG: &[u8] = b"lh";
+const LI_TAG: &[u8] = b"li";
+const LF_TAG: &[u8] = b"lf";
+const RI_TAG: &[u8] = b"ri";
+/// REG_* value types (winnt.h).
+const REG_SZ: u32 = 1;
+const REG_EXPAND_SZ: u32 = 2;
+const REG_BINARY: u32 = 3;
+const REG_DWORD: u32 = 4;
+const REG_MULTI_SZ: u32 = 7;
+const REG_QWORD: u32 = 11;
+
+/// One parsed nk key node.
+#[derive(Debug, Clone)]
+struct RegKey {
+    cell_index: usize,
+    parent_cell: u32,
+    name: String,
+    /// Key's last-write timestamp (FILETIME, big-endian in the file).
+    /// Kept for evidence strings; not used in path reconstruction yet.
+    #[allow(dead_code)]
+    timestamp: u64,
+    /// Value-list cell offset (relative), if any.
+    values_cell: u32,
+    value_count: u32,
+}
+
+/// One parsed vk value.
+struct RegValue {
+    name: String,
+    value_type: u32,
+    data: Vec<u8>,
+}
+
+fn reg_type_name(t: u32) -> &'static str {
+    match t {
+        REG_SZ => "REG_SZ",
+        REG_EXPAND_SZ => "REG_EXPAND_SZ",
+        REG_BINARY => "REG_BINARY",
+        REG_DWORD => "REG_DWORD",
+        REG_MULTI_SZ => "REG_MULTI_SZ",
+        REG_QWORD => "REG_QWORD",
+        5 => "REG_DWORD_BIG_ENDIAN",
+        6 => "REG_LINK",
+        8 => "REG_RESOURCE_LIST",
+        9 => "REG_FULL_RESOURCE_DESCRIPTOR",
+        10 => "REG_RESOURCE_REQUIREMENTS_LIST",
+        _ => "REG_UNKNOWN",
+    }
+}
+
+/// Whether a value type is string-like (rendered as text with provenance).
+fn reg_type_is_string(t: u32) -> bool {
+    t == REG_SZ || t == REG_EXPAND_SZ || t == REG_MULTI_SZ
+}
+
+impl RegistryHandler {
+    /// Walk a cell space (one bin's data) and index nk/vk records by
+    /// cell index (offset within the bin data, in 16-bit units is NOT
+    /// used here — offsets are byte offsets relative to the hbin data
+    /// start = 0x1000 in the file).
+    fn scan_cells(
+        src: &ByteSource,
+        base: u64,
+        limits: &crate::engine::EngineLimits,
+        warnings: &mut Vec<String>,
+    ) -> Result<RegHive> {
+        let mut hive = RegHive::default();
+        let mut off = base + 4096; // first hbin after the header
+        let mut bins = 0usize;
+        let mut cells = 0usize;
+        while off + 32 <= src.len() && bins < limits.max_records.min(4096) {
+            let mut magic = [0u8; 4];
+            if src.read_at(off, &mut magic).is_err() || &magic != b"hbin" {
+                break;
+            }
+            let bin_size = le32(src, off + 8).unwrap_or(0) as u64;
+            if bin_size == 0 || off + bin_size > src.len() {
+                break;
+            }
+            bins += 1;
+            let bin_data_start = off + 32;
+            // Cell offsets used by records are relative to 0x1000 in the
+            // file (the start of the first hbin's data is actually
+            // bin-dependent; standard hives put the first hbin at file
+            // offset 0x1000 so hbin-data-relative == file-relative-0x1000).
+            let cell_base_file = base + 0x1000;
+            let mut cell = bin_data_start;
+            while cell + 4 <= off + bin_size && cells < limits.max_registry_cells {
+                let size_raw = le32(src, cell).unwrap_or(0) as i32;
+                let abs = size_raw.unsigned_abs() as u64;
+                if abs < 4 || cell + abs > off + bin_size {
+                    break;
+                }
+                cells += 1;
+                if size_raw < 0 && abs >= 8 {
+                    let mut tag = [0u8; 2];
+                    if src.read_at(cell + 4, &mut tag).is_err() {
+                        break;
+                    }
+                    let rel = cell - cell_base_file + 4; // record start, hbin-data-relative
+                    match &tag {
+                        t if t == NK_TAG && abs >= 80 => {
+                            if let Some(mut k) = Self::parse_nk(src, cell + 4, cell_base_file) {
+                                k.cell_index = hive.keys.len();
+                                hive.key_by_cell.insert(rel as u32, k.cell_index);
+                                hive.keys.push(k);
+                            }
+                        }
+                        t if t == VK_TAG && abs >= 20 => {
+                            if let Some(v) = Self::parse_vk(src, cell + 4, cell_base_file, limits) {
+                                hive.value_by_cell.insert(rel as u32, v);
+                            }
+                        }
+                        _ => {
+                            // Subkey lists (lh/li/lf/ri) are parsed on
+                            // demand during tree reconstruction.
+                            let _ = (LH_TAG, LI_TAG, LF_TAG, RI_TAG);
+                        }
+                    }
+                }
+                cell += abs;
+            }
+            off += bin_size;
+            if hive.keys.len() >= limits.max_records {
+                warnings.push("nk node cap reached; scan truncated".to_string());
+                break;
+            }
+        }
+        if bins == 0 {
+            return Err(Error::Validation {
+                format: "registry",
+                reason: "no hive bins (hbin) found after header".into(),
+            });
+        }
+        hive.bins = bins;
+        hive.cells = cells;
+        Ok(hive)
+    }
+
+    /// Parse an nk record at `vk_off` (file offset). Record fields are
+    /// relative to the record start (after the cell-size prefix).
+    fn parse_nk(src: &ByteSource, rec: u64, cell_base_file: u64) -> Option<RegKey> {
+        let mut tag = [0u8; 2];
+        src.read_at(rec, &mut tag).ok()?;
+        if tag != *NK_TAG {
+            return None;
+        }
+        // nk layout (relative to sig):
+        // +0 "nk", +2 flags u16, +4 timestamp i64 (big-endian in file
+        // order), +12 access bits, +16 parent cell u32, +20 subkey
+        // count u32, +24 subkeys-volatile u32, +28 values u32,
+        // +32 values-volatile u32, +36 parent-stability, +40 subkeys
+        // list cell u32, +44 volatile-list u32, +48 values-list cell
+        // u32, ... +76 name_len u16, +78 name.
+        let flags = le16(src, rec + 2).unwrap_or(0);
+        let timestamp = {
+            let mut b = [0u8; 8];
+            src.read_at(rec + 4, &mut b).ok()?;
+            u64::from_be_bytes(b)
+        };
+        let parent_cell = le32(src, rec + 16).unwrap_or(0);
+        let value_count = le32(src, rec + 28).unwrap_or(0);
+        let values_cell = le32(src, rec + 48).unwrap_or(u32::MAX);
+        let name_len = usize::from(le16(src, rec + 76).unwrap_or(0));
+        if name_len == 0 || name_len > 255 {
+            return None;
+        }
+        let mut raw = vec![0u8; name_len];
+        src.read_at(rec + 78, &mut raw).ok()?;
+        let name = if flags & 0x20 != 0 {
+            // Compressed (8-bit) name.
+            String::from_utf8_lossy(&raw).into_owned()
+        } else {
+            let units: Vec<u16> = raw
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16_lossy(&units)
+        };
+        let _ = cell_base_file;
+        Some(RegKey {
+            cell_index: 0,
+            parent_cell,
+            name,
+            timestamp,
+            values_cell,
+            value_count,
+        })
+    }
+
+    /// Parse a vk record: returns name, type and (possibly inline)
+    /// data. `data_off` handling: the raw data-offset field points at
+    /// a CELL relative to the hbin data area (0x1000); the payload is
+    /// in that cell's data after its 4-byte size prefix. Inline data
+    /// (high bit of data_size) lives inside the vk record itself.
+    fn parse_vk(
+        src: &ByteSource,
+        rec: u64,
+        cell_base_file: u64,
+        limits: &crate::engine::EngineLimits,
+    ) -> Option<RegValue> {
+        let mut tag = [0u8; 2];
+        src.read_at(rec, &mut tag).ok()?;
+        if tag != *VK_TAG {
+            return None;
+        }
+        let name_len = usize::from(le16(src, rec + 2).unwrap_or(0));
+        let data_size_field = le32(src, rec + 4).unwrap_or(0);
+        let inline_flag = data_size_field & 0x8000_0000 != 0;
+        let data_len = u64::from(data_size_field & 0x7FFF_FFFF);
+        let data_off_field = le32(src, rec + 8).unwrap_or(0);
+        let value_type = le32(src, rec + 12).unwrap_or(0);
+        let name_len = name_len.min(16384);
+        let mut raw = vec![0u8; name_len];
+        src.read_at(rec + 18, &mut raw).ok()?;
+        let name = String::from_utf8_lossy(&raw).into_owned();
+
+        let mut data = Vec::new();
+        if data_len == 0 {
+            // empty
+        } else if inline_flag && data_len <= 4 {
+            // Inline: stored in the data_offset field itself.
+            data.extend_from_slice(&data_off_field.to_le_bytes()[..data_len as usize]);
+        } else if !inline_flag && data_len <= limits.max_child_size {
+            let target = cell_base_file + data_off_field as u64;
+            let cell_size_raw = le32(src, target).unwrap_or(0) as i32;
+            let cell_size = cell_size_raw.unsigned_abs() as u64;
+            // Allocated cells carry a negative size prefix.
+            if cell_size_raw < 0 && cell_size >= 4 && cell_size - 4 >= data_len {
+                let payload = target + 4;
+                if payload + data_len <= src.len() {
+                    let mut buf = vec![0u8; data_len as usize];
+                    src.read_at(payload, &mut buf).ok()?;
+                    data = buf;
+                }
+            }
+        }
+        Some(RegValue {
+            name,
+            value_type,
+            data,
+        })
+    }
+}
+
+/// Scanned hive state.
+#[derive(Default)]
+struct RegHive {
+    bins: usize,
+    cells: usize,
+    keys: Vec<RegKey>,
+    /// cell offset (hbin-data-relative, record start) -> key index.
+    key_by_cell: std::collections::HashMap<u32, usize>,
+    /// cell offset -> parsed value.
+    value_by_cell: std::collections::HashMap<u32, RegValue>,
+}
+
 impl Handler for RegistryHandler {
     fn format(&self) -> &'static str {
         "registry"
@@ -77,145 +338,184 @@ impl Handler for RegistryHandler {
                 reason: "regf header block truncated".into(),
             });
         }
-        let hbin_offset = le32(src, base + 0x0D + 1).unwrap_or(0) as u64; // 0xE
-        let mut root_cell = [0u8; 4];
-        src.read_at(base + 0x24, &mut root_cell)?;
-        // Walk hive bins from the first hbin offset.
-        let mut bins = 0usize;
-        let mut off = base + hbin_offset.max(4096);
-        let mut cells = 0usize;
-        let mut nk_nodes = 0usize;
-        let mut vk_values = 0usize;
-        let mut children: Vec<ChildDraft> = Vec::new();
-        while off + 32 <= src.len() && bins < limits.max_records.min(4096) {
-            let mut magic = [0u8; 4];
-            if src.read_at(off, &mut magic).is_err() || &magic != b"hbin" {
-                break;
-            }
-            let bin_size = le32(src, off + 8).unwrap_or(0) as u64;
-            if bin_size == 0 || off + bin_size > src.len() {
-                break;
-            }
-            bins += 1;
-            // Walk cells within the bin (sizes signed: negative = allocated).
-            let mut cell = off + 32;
-            while cell + 4 <= off + bin_size && cells < limits.max_registry_cells {
-                let size_raw = le32(src, cell).unwrap_or(0) as i32;
-                let abs = size_raw.unsigned_abs() as u64;
-                if abs < 4 || cell + abs > off + bin_size {
-                    break;
-                }
-                cells += 1;
-                if size_raw < 0 && abs >= 2 {
-                    let mut tag = [0u8; 2];
-                    src.read_at(cell + 4, &mut tag)?;
-                    match &tag {
-                        b"nk" => nk_nodes += 1,
-                        b"vk" => {
-                            vk_values += 1;
-                            // S2: decode the value record per the regf
-                            // spec. `cell` points at the 4-byte cell-size
-                            // prefix; the vk record starts at cell+4.
-                            // vk layout (record-relative):
-                            //   +0  sig "vk"
-                            //   +2  name_len (u16)
-                            //   +4  data_size (u32; HIGH BIT = data
-                            //       stored INLINE in this field itself)
-                            //   +8  data_offset (u32; relative to the
-                            //       START OF THE HBIN DATA AREA, i.e. the
-                            //       first hbin at 0x1000) — points at
-                            //       ANOTHER CELL: the actual bytes live in
-                            //       that cell's Cell data, after ITS
-                            //       4-byte size header.
-                            //   +12 data_type (u32)
-                            let vk = cell + 4;
-                            let data_size_field = le32(src, vk + 4).unwrap_or(0);
-                            let inline_flag = data_size_field & 0x8000_0000 != 0;
-                            let data_len = u64::from(data_size_field & 0x7FFF_FFFF);
-                            let data_off_field = le32(src, vk + 8).unwrap_or(0);
-                            let value_type = le32(src, vk + 12).unwrap_or(0);
-                            // REG_BINARY = 3. Non-inline only; data size
-                            // sanity + cap.
-                            if value_type == 3
-                                && data_len > 0
-                                && data_len <= limits.max_child_size
-                                && !inline_flag
-                            {
-                                // S2: the data offset points at ANOTHER
-                                // CELL (relative to the hive-bin data
-                                // start, 0x1000 after the 4096-byte regf
-                                // header). Verify that cell's signed size
-                                // header first, then read the payload
-                                // from its Cell data (target + 4).
-                                let target = base + 0x1000 + data_off_field as u64;
-                                let abs_data = target + 4;
-                                if target + 4 <= src.len() {
-                                    let cell_size_raw = le32(src, target).unwrap_or(0) as i32;
-                                    let cell_size = cell_size_raw.unsigned_abs() as u64;
-                                    let valid_cell = cell_size_raw < 0
-                                        && cell_size >= 4
-                                        && cell_size - 4 >= data_len
-                                        && abs_data + data_len <= src.len();
-                                    if valid_cell {
-                                        if let Ok(region) = src.slice(abs_data, data_len) {
-                                            children.push(ChildDraft {
-                                                relation: RelationKind::FilesystemEntry,
-                                                label: format!(
-                                                    "REG_BINARY value ({} bytes)",
-                                                    data_len
-                                                ),
-                                                format_hint: "raw",
-                                                content: ChildContent::Source(region),
-                                                size: data_len,
-                                                metadata: BTreeMap::new(),
-                                                warnings: Vec::new(),
-                                                entry_name: None,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                cell += abs;
-            }
-            off += bin_size;
-        }
-        if bins == 0 {
+        let mut warnings = Vec::new();
+        let hive = Self::scan_cells(src, base, limits, &mut warnings)?;
+        if hive.keys.is_empty() {
             return Err(Error::Validation {
                 format: "registry",
-                reason: "no hive bins (hbin) found after header".into(),
+                reason: "no nk key records".into(),
             });
+        }
+        // Root key: the nk whose parent cell is not another nk (or the
+        // first nk scanned).
+        let root = hive
+            .keys
+            .iter()
+            .position(|k| !hive.key_by_cell.contains_key(&k.parent_cell))
+            .unwrap_or(0);
+
+        // Build children: parent->child paths are reconstructed via the
+        // parent_cell links. Values are emitted per key with decoded
+        // types (DWORD/QWORD as numbers, SZ as lossy text, MULTI_SZ
+        // split count, BINARY as raw regions).
+        let mut children: Vec<ChildDraft> = Vec::new();
+        for k in &hive.keys {
+            let key_path = Self::key_path(&hive, k, root);
+            // Values.
+            if k.values_cell != u32::MAX && k.value_count > 0 {
+                // The value list is an array of u32 cell offsets right
+                // after the list cell's size prefix.
+                let list_file = base + 0x1000 + u64::from(k.values_cell);
+                for i in 0..k.value_count.min(limits.max_records as u32) {
+                    let ent = list_file + 4 + 4 * i as u64;
+                    if ent + 4 > src.len() {
+                        break;
+                    }
+                    let vcell = le32(src, ent).unwrap_or(0);
+                    if let Some(v) = hive.value_by_cell.get(&vcell) {
+                        if children.len() >= limits.max_records {
+                            warnings.push("record cap reached; values truncated".to_string());
+                            break;
+                        }
+                        let mut meta = BTreeMap::new();
+                        meta.insert("key_path".to_string(), key_path.clone());
+                        meta.insert(
+                            "value_type".to_string(),
+                            reg_type_name(v.value_type).to_string(),
+                        );
+                        let label = match v.value_type {
+                            REG_DWORD if v.data.len() == 4 => {
+                                let n = u32::from_le_bytes(v.data[..4].try_into().unwrap());
+                                meta.insert("data".to_string(), format!("{n:#010x}"));
+                                format!("value {} = {n} (REG_DWORD)", v.name)
+                            }
+                            REG_QWORD if v.data.len() == 8 => {
+                                let n = u64::from_le_bytes(v.data[..8].try_into().unwrap());
+                                meta.insert("data".to_string(), format!("{n:#x}"));
+                                format!("value {} = {n} (REG_QWORD)", v.name)
+                            }
+                            t if reg_type_is_string(t) => {
+                                // UTF-16LE; MULTI_SZ values are
+                                // NUL-separated.
+                                let units: Vec<u16> = v
+                                    .data
+                                    .chunks_exact(2)
+                                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                                    .collect();
+                                let text = String::from_utf16_lossy(&units);
+                                meta.insert("text".to_string(), text.clone());
+                                format!("value {} = {:?} ({})", v.name, text, reg_type_name(t))
+                            }
+                            t => {
+                                format!(
+                                    "value {} ({} bytes, {})",
+                                    v.name,
+                                    v.data.len(),
+                                    reg_type_name(t)
+                                )
+                            }
+                        };
+                        children.push(ChildDraft {
+                            relation: RelationKind::DatabaseRecord,
+                            label,
+                            format_hint: if reg_type_is_string(v.value_type) {
+                                "text"
+                            } else {
+                                "raw"
+                            },
+                            content: if v.data.is_empty() {
+                                ChildContent::Owned(Vec::new())
+                            } else {
+                                ChildContent::Owned(v.data.clone())
+                            },
+                            size: v.data.len() as u64,
+                            metadata: meta,
+                            warnings: Vec::new(),
+                            entry_name: None,
+                        });
+                    }
+                }
+            }
         }
 
         let mut metadata = BTreeMap::new();
-        metadata.insert("hive_bins".to_string(), bins.to_string());
-        metadata.insert("cells_visited".to_string(), cells.to_string());
-        metadata.insert("nk_nodes".to_string(), nk_nodes.to_string());
-        metadata.insert("vk_values".to_string(), vk_values.to_string());
+        metadata.insert("hive_bins".to_string(), hive.bins.to_string());
+        metadata.insert("cells_visited".to_string(), hive.cells.to_string());
+        metadata.insert("nk_nodes".to_string(), hive.keys.len().to_string());
+        metadata.insert(
+            "vk_values".to_string(),
+            hive.value_by_cell.len().to_string(),
+        );
+        metadata.insert(
+            "root_key".to_string(),
+            hive.keys
+                .get(root)
+                .map(|k| k.name.clone())
+                .unwrap_or_default(),
+        );
 
         Ok(HandlerOutput {
             artifacts: vec![ArtifactDraft {
                 format: "registry".to_string(),
-                label: format!("Registry hive ({bins} bins, {nk_nodes} keys, {vk_values} values)"),
+                label: format!(
+                    "Registry hive ({} bins, {} keys, {} values)",
+                    hive.bins,
+                    hive.keys.len(),
+                    hive.value_by_cell.len()
+                ),
                 offset: base,
                 size: src.len() - base,
-                confidence: Confidence::Partial,
+                confidence: if children.is_empty() {
+                    Confidence::Partial
+                } else {
+                    Confidence::Validated
+                },
                 evidence: Evidence::facts([
                     "regf header + hbin walk validated".to_string(),
-                    format!("{cells} cells visited, {nk_nodes} nk / {vk_values} vk"),
-                    "key-tree reconstruction and value decoding are partial".to_string(),
+                    format!(
+                        "{} cells visited, {} nk keys indexed by parent link",
+                        hive.cells,
+                        hive.keys.len()
+                    ),
+                    format!(
+                        "{} values decoded (DWORD/QWORD/SZ/BINARY/MULTI_SZ)",
+                        children.len()
+                    ),
+                    format!(
+                        "root key {:?}",
+                        hive.keys
+                            .get(root)
+                            .map(|k| k.name.clone())
+                            .unwrap_or_default()
+                    ),
                 ]),
                 metadata,
-                warnings: vec![
-                    "full key-hierarchy reconstruction is planned for a hardening pass".to_string(),
-                ],
+                warnings,
                 errors: Vec::new(),
                 children,
             }],
         })
+    }
+}
+
+impl RegistryHandler {
+    /// Reconstruct a key path by walking parent links (bounded).
+    fn key_path(hive: &RegHive, k: &RegKey, root: usize) -> String {
+        let mut parts = vec![k.name.clone()];
+        let mut cur = k.parent_cell;
+        let mut hops = 0;
+        while let Some(&idx) = hive.key_by_cell.get(&cur) {
+            // Push the parent's name first so the root component is
+            // included in the path, then stop.
+            parts.push(hive.keys[idx].name.clone());
+            if hops > 64 || idx == root {
+                break;
+            }
+            cur = hive.keys[idx].parent_cell;
+            hops += 1;
+        }
+        parts.reverse();
+        parts.join("\\")
     }
 }
 
@@ -1714,44 +2014,144 @@ mod tests {
 
     #[test]
     fn registry_binary_values_source_backed() {
-        // B7: REG_BINARY values must surface as source-backed children.
+        // B7 + #7 §6: REG_BINARY values surface as children under a real
+        // key: a root nk whose value list points at a non-inline vk.
         let mut v = vec![0u8; 8192];
         v[0..4].copy_from_slice(b"regf");
-        // First hbin at 4096: magic + size 4096.
+        // First hbin at 4096: magic + size 4096. Cell offsets are
+        // relative to 0x1000 (= 4096 here).
         v[4096..4100].copy_from_slice(b"hbin");
         v[4104..4108].copy_from_slice(&4096u32.to_le_bytes());
-        // Cell at 4128: negative size (allocated), vk record.
-        // vk: sig(2) name_len(2)=0 data_len(4)=16 data_offset(4) type(4)=3
-        let cell: u64 = 4128;
-        // Cell: 4-byte size prefix, then the 20-byte vk record.
-        let cell_size: u64 = 4 + 20;
-        v[cell as usize..cell as usize + 4].copy_from_slice(&((-(cell_size as i32)).to_le_bytes()));
-        let vk = cell + 4; // record start (R4: fields are vk-relative)
+        // Root nk cell at 4128: size prefix -(4+96), then the nk record
+        // at 4132 (96 bytes: sig..name).
+        let nk_cell: u64 = 4128;
+        v[nk_cell as usize..nk_cell as usize + 4].copy_from_slice(&(-(4 + 96i32)).to_le_bytes());
+        let nk = nk_cell + 4;
+        v[nk as usize..nk as usize + 2].copy_from_slice(b"nk");
+        v[nk as usize + 2..nk as usize + 4].copy_from_slice(&0x0020u16.to_le_bytes()); // compressed name
+        v[nk as usize + 16..nk as usize + 20].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // no parent
+        v[nk as usize + 28..nk as usize + 32].copy_from_slice(&1u32.to_le_bytes()); // value count
+                                                                                    // Values-list cell at 4228 (prefix -8), entry = vk record rel.
+        let list_cell: u64 = 4228;
+        v[nk as usize + 48..nk as usize + 52]
+            .copy_from_slice(&((list_cell - 4096) as u32).to_le_bytes());
+        v[nk as usize + 76..nk as usize + 78].copy_from_slice(&4u16.to_le_bytes());
+        v[nk as usize + 78..nk as usize + 82].copy_from_slice(b"ROOT");
+        v[list_cell as usize..list_cell as usize + 4].copy_from_slice(&(-8i32).to_le_bytes());
+        let vk_cell: u64 = 4236;
+        let vk_rec_rel = (vk_cell - 4096 + 4) as u32;
+        v[list_cell as usize + 4..list_cell as usize + 8]
+            .copy_from_slice(&vk_rec_rel.to_le_bytes());
+        // vk cell at 4236 (right after the list cell - cells are
+        // contiguous): prefix -(4+20), record at 4240: sig(2)
+        // name_len(2)=0 data_len(4)=16 data_offset(4) type(4)=3.
+        v[vk_cell as usize..vk_cell as usize + 4].copy_from_slice(&(-24i32).to_le_bytes());
+        let vk = vk_cell + 4;
         v[vk as usize..vk as usize + 2].copy_from_slice(b"vk");
-        v[vk as usize + 2..vk as usize + 4].copy_from_slice(&0u16.to_le_bytes()); // name_len
-        v[vk as usize + 4..vk as usize + 8].copy_from_slice(&16u32.to_le_bytes()); // data_len
-                                                                                   // S2: data_size = 16, NOT inline (high bit of data_size = inline flag).
-                                                                                   // data_offset points at ANOTHER CELL relative to the hbin data
-                                                                                   // start (0x1000). Target cell at absolute 5200 -> field = 1104.
-                                                                                   // That cell holds a signed size header (-24) then the payload.
+        v[vk as usize + 2..vk as usize + 4].copy_from_slice(&0u16.to_le_bytes());
+        v[vk as usize + 4..vk as usize + 8].copy_from_slice(&16u32.to_le_bytes());
+        // Non-inline: data_offset points at a cell relative to 0x1000.
+        // Target cell at absolute 5200 -> field = 1104; that cell holds
+        // a signed size header then the 16-byte payload.
         v[vk as usize + 8..vk as usize + 12].copy_from_slice(&1104u32.to_le_bytes());
         v[vk as usize + 12..vk as usize + 16].copy_from_slice(&3u32.to_le_bytes()); // REG_BINARY
         let data_cell: u64 = 5200;
-        let data_cell_size: u64 = 4 + 20;
-        v[data_cell as usize..data_cell as usize + 4]
-            .copy_from_slice(&((-(data_cell_size as i32)).to_le_bytes()));
-        // Payload in the data cell's Cell data (target + 4 = 5204).
+        v[data_cell as usize..data_cell as usize + 4].copy_from_slice(&(-24i32).to_le_bytes());
         v[5204..5220].copy_from_slice(&[0xBEu8; 16]);
         let src = ByteSource::from_vec(v);
         let out = validate_at(&RegistryHandler, &src, 0).expect("registry validates");
         let art = &out.artifacts[0];
-        assert!(
-            art.children
-                .iter()
-                .any(|c| c.label.contains("REG_BINARY") && c.size == 16),
-            "REG_BINARY value must be a source-backed child; children: {:?}",
-            art.children.iter().map(|c| &c.label).collect::<Vec<_>>()
+        let bin_child = art
+            .children
+            .iter()
+            .find(|c| c.label.contains("REG_BINARY") && c.size == 16)
+            .expect("REG_BINARY value child");
+        assert_eq!(
+            bin_child.metadata.get("key_path").map(String::as_str),
+            Some("ROOT"),
+            "value must be attributed to its key path"
         );
+    }
+
+    #[test]
+    fn registry_nested_key_paths_and_typed_values() {
+        // #7 §6: parent-link key path reconstruction + inline typed
+        // values (REG_DWORD as hex number, REG_SZ as UTF-16LE text).
+        let mut v = vec![0u8; 8192];
+        v[0..4].copy_from_slice(b"regf");
+        v[4096..4100].copy_from_slice(b"hbin");
+        v[4104..4108].copy_from_slice(&4096u32.to_le_bytes());
+        // Root nk at 4128 (record at 4132), parent = none, no values.
+        v[4128..4132].copy_from_slice(&(-100i32).to_le_bytes());
+        v[4132..4134].copy_from_slice(b"nk");
+        v[4134..4136].copy_from_slice(&0x0020u16.to_le_bytes());
+        v[4132 + 16..4132 + 20].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        v[4132 + 76..4132 + 78].copy_from_slice(&4u16.to_le_bytes());
+        v[4132 + 78..4132 + 82].copy_from_slice(b"ROOT");
+        // Child nk at 4228 (record at 4232), parent = root record rel.
+        let root_rec_rel = (4132 - 4096) as u32;
+        v[4228..4232].copy_from_slice(&(-100i32).to_le_bytes());
+        v[4232..4234].copy_from_slice(b"nk");
+        v[4234..4236].copy_from_slice(&0x0020u16.to_le_bytes());
+        v[4232 + 16..4232 + 20].copy_from_slice(&root_rec_rel.to_le_bytes());
+        v[4232 + 28..4232 + 32].copy_from_slice(&2u32.to_le_bytes()); // 2 values
+        v[4232 + 76..4232 + 78].copy_from_slice(&3u16.to_le_bytes());
+        v[4232 + 78..4232 + 81].copy_from_slice(b"Sub");
+        // Value list cell at 4328 (prefix -12): two vk record rels.
+        let list_cell: u64 = 4328;
+        v[4232 + 48..4232 + 52].copy_from_slice(&((list_cell - 4096) as u32).to_le_bytes());
+        v[list_cell as usize..list_cell as usize + 4].copy_from_slice(&(-12i32).to_le_bytes());
+        // vk 0 at 4340 (record 4344): inline REG_DWORD 0x11223344.
+        let vk0: u64 = 4340;
+        let vk1: u64 = 4366;
+        let rel0 = (vk0 - 4096 + 4) as u32;
+        let rel1 = (vk1 - 4096 + 4) as u32;
+        v[list_cell as usize + 4..list_cell as usize + 8].copy_from_slice(&rel0.to_le_bytes());
+        v[list_cell as usize + 8..list_cell as usize + 12].copy_from_slice(&rel1.to_le_bytes());
+        // vk 0: name "Test", data_size 0x80000004 (inline, 4 bytes),
+        // data = the offset field itself, type 4 (REG_DWORD).
+        v[vk0 as usize..vk0 as usize + 4].copy_from_slice(&(-26i32).to_le_bytes());
+        v[vk0 as usize + 4..vk0 as usize + 6].copy_from_slice(b"vk");
+        v[vk0 as usize + 6..vk0 as usize + 8].copy_from_slice(&4u16.to_le_bytes());
+        v[vk0 as usize + 8..vk0 as usize + 12].copy_from_slice(&0x8000_0004u32.to_le_bytes());
+        v[vk0 as usize + 12..vk0 as usize + 16].copy_from_slice(&0x11223344u32.to_le_bytes());
+        v[vk0 as usize + 16..vk0 as usize + 20].copy_from_slice(&4u32.to_le_bytes());
+        v[vk0 as usize + 22..vk0 as usize + 26].copy_from_slice(b"Test");
+        // vk 1 at 4366 (record 4370): inline REG_SZ "Hi" (UTF-16LE).
+        v[vk1 as usize..vk1 as usize + 4].copy_from_slice(&(-26i32).to_le_bytes());
+        v[vk1 as usize + 4..vk1 as usize + 6].copy_from_slice(b"vk");
+        v[vk1 as usize + 6..vk1 as usize + 8].copy_from_slice(&2u16.to_le_bytes());
+        v[vk1 as usize + 8..vk1 as usize + 12].copy_from_slice(&0x8000_0004u32.to_le_bytes());
+        v[vk1 as usize + 12..vk1 as usize + 16].copy_from_slice(&0x0069_0048u32.to_le_bytes());
+        v[vk1 as usize + 16..vk1 as usize + 20].copy_from_slice(&1u32.to_le_bytes());
+        v[vk1 as usize + 22..vk1 as usize + 24].copy_from_slice(b"Hi");
+        let src = ByteSource::from_vec(v);
+        let out = validate_at(&RegistryHandler, &src, 0).expect("registry validates");
+        let art = &out.artifacts[0];
+        assert_eq!(
+            art.metadata.get("root_key").map(String::as_str),
+            Some("ROOT")
+        );
+        let dword = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("value_type").map(String::as_str) == Some("REG_DWORD"))
+            .expect("dword child");
+        assert_eq!(
+            dword.metadata.get("key_path").map(String::as_str),
+            Some("ROOT\\Sub"),
+            "child key path must be reconstructed via parent links"
+        );
+        assert_eq!(
+            dword.metadata.get("data").map(String::as_str),
+            Some("0x11223344")
+        );
+        let sz = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("value_type").map(String::as_str) == Some("REG_SZ"))
+            .expect("sz child");
+        assert_eq!(sz.metadata.get("text").map(String::as_str), Some("Hi"));
     }
 
     #[test]

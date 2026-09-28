@@ -517,24 +517,37 @@ fn b7_registry_regbinary_artifact() {
     v[0..4].copy_from_slice(b"regf");
     v[4096..4100].copy_from_slice(b"hbin");
     v[4104..4108].copy_from_slice(&4096u32.to_le_bytes());
-    let cell: u64 = 4128;
-    let cell_size: u64 = 4 + 20;
-    v[cell as usize..cell as usize + 4].copy_from_slice(&((-(cell_size as i32)).to_le_bytes()));
-    let vk = cell + 4; // R4: vk record starts after the size prefix
+    // Root nk at 4128 (record at 4132) whose value list points at the
+    // vk record; values are emitted per key with their key path.
+    v[4128..4132].copy_from_slice(&(-100i32).to_le_bytes());
+    v[4132..4134].copy_from_slice(b"nk");
+    v[4134..4136].copy_from_slice(&0x0020u16.to_le_bytes()); // compressed name
+    v[4132 + 16..4132 + 20].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // no parent
+    v[4132 + 28..4132 + 32].copy_from_slice(&1u32.to_le_bytes()); // 1 value
+    v[4132 + 76..4132 + 78].copy_from_slice(&4u16.to_le_bytes());
+    v[4132 + 78..4132 + 82].copy_from_slice(b"ROOT");
+    // Values-list cell at 4228 (prefix -8) -> vk record rel offset.
+    let list_cell: u64 = 4228;
+    v[4132 + 48..4132 + 52].copy_from_slice(&((list_cell - 4096) as u32).to_le_bytes());
+    v[list_cell as usize..list_cell as usize + 4].copy_from_slice(&(-8i32).to_le_bytes());
+    let vk_cell: u64 = 4236;
+    let vk_rec_rel = (vk_cell - 4096 + 4) as u32;
+    v[list_cell as usize + 4..list_cell as usize + 8].copy_from_slice(&vk_rec_rel.to_le_bytes());
+    // vk record at 4240: sig(2) name_len(2)=0 data_len(4)=16
+    // data_offset(4) type(4)=3 (REG_BINARY).
+    v[vk_cell as usize..vk_cell as usize + 4].copy_from_slice(&(-24i32).to_le_bytes());
+    let vk = vk_cell + 4;
     v[vk as usize..vk as usize + 2].copy_from_slice(b"vk");
     v[vk as usize + 2..vk as usize + 4].copy_from_slice(&0u16.to_le_bytes());
     v[vk as usize + 4..vk as usize + 8].copy_from_slice(&16u32.to_le_bytes()); // data_len
-                                                                               // S2: data_size = 16, NOT inline (high bit of data_size = inline).
-                                                                               // data_offset points at ANOTHER CELL relative to the hbin data start
-                                                                               // (0x1000): target cell at absolute 5216 -> field = 5216 - 0x1000 =
-                                                                               // 1120. That cell holds a signed size header (-24) then the payload.
+                                                                               // Non-inline: data_offset points at a CELL relative to 0x1000.
+                                                                               // Target cell at absolute 5216 -> field = 1120. That cell holds a
+                                                                               // signed size header (-24) then the payload.
     v[vk as usize + 8..vk as usize + 12].copy_from_slice(&1120u32.to_le_bytes());
     v[vk as usize + 12..vk as usize + 16].copy_from_slice(&3u32.to_le_bytes()); // REG_BINARY
     let data_cell: u64 = 5216;
-    let data_cell_size: u64 = 4 + 20;
-    v[data_cell as usize..data_cell as usize + 4]
-        .copy_from_slice(&((-(data_cell_size as i32)).to_le_bytes()));
-    // Payload in the data cell's Cell data (target + 4 = 5220).
+    v[data_cell as usize..data_cell as usize + 4].copy_from_slice(&(-24i32).to_le_bytes());
+    // Payload in the data cell (target + 4 = 5220).
     v[5220..5236].copy_from_slice(&[0xB7u8; 16]);
     let graph = engine().analyze(&ByteSource::from_vec(v), true);
     let reg = graph
@@ -545,7 +558,7 @@ fn b7_registry_regbinary_artifact() {
         .expect("registry validated");
     let mut binary_child = false;
     for (r, c) in graph.children(reg) {
-        if c.label.contains("REG_BINARY") && r == RelationKind::FilesystemEntry {
+        if c.label.contains("REG_BINARY") && r == RelationKind::DatabaseRecord {
             binary_child = true;
         }
     }
