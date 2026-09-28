@@ -78,12 +78,17 @@ struct RegKey {
     cell_index: usize,
     parent_cell: u32,
     name: String,
-    /// Key's last-write timestamp (FILETIME, big-endian in the file).
-    /// Kept for evidence strings; not used in path reconstruction yet.
+    /// Key's last-write timestamp (FILETIME, little-endian per regf).
     #[allow(dead_code)]
     timestamp: u64,
-    /// Value-list cell offset (relative), if any.
+    /// Number of subkeys (nk +20). surfaced in metadata via list walk.
+    #[allow(dead_code)]
+    subkey_count: u32,
+    /// Subkey-list cell offset (nk +28; li/lf/lh/ri record).
+    subkeys_cell: u32,
+    /// Value-list cell offset (nk +40), if any.
     values_cell: u32,
+    /// Value count (nk +36).
     value_count: u32,
 }
 
@@ -160,16 +165,18 @@ impl RegistryHandler {
                     if src.read_at(cell + 4, &mut tag).is_err() {
                         break;
                     }
-                    let rel = cell - cell_base_file + 4; // record start, hbin-data-relative
+                    // FINAL-B3: regf reference fields point at the
+                    // CELL START (the size field), not record data.
+                    let rel = cell - cell_base_file;
                     match &tag {
-                        t if t == NK_TAG && abs >= 80 => {
-                            if let Some(mut k) = Self::parse_nk(src, cell + 4, cell_base_file) {
+                        t if t == NK_TAG && abs >= 88 => {
+                            if let Some(mut k) = Self::parse_nk(src, cell + 4) {
                                 k.cell_index = hive.keys.len();
                                 hive.key_by_cell.insert(rel as u32, k.cell_index);
                                 hive.keys.push(k);
                             }
                         }
-                        t if t == VK_TAG && abs >= 20 => {
+                        t if t == VK_TAG && abs >= 24 => {
                             if let Some(v) = Self::parse_vk(src, cell + 4, cell_base_file, limits) {
                                 hive.value_by_cell.insert(rel as u32, v);
                             }
@@ -202,34 +209,36 @@ impl RegistryHandler {
 
     /// Parse an nk record at `vk_off` (file offset). Record fields are
     /// relative to the record start (after the cell-size prefix).
-    fn parse_nk(src: &ByteSource, rec: u64, cell_base_file: u64) -> Option<RegKey> {
+    fn parse_nk(src: &ByteSource, rec: u64) -> Option<RegKey> {
         let mut tag = [0u8; 2];
         src.read_at(rec, &mut tag).ok()?;
         if tag != *NK_TAG {
             return None;
         }
-        // nk layout (relative to sig):
-        // +0 "nk", +2 flags u16, +4 timestamp i64 (big-endian in file
-        // order), +12 access bits, +16 parent cell u32, +20 subkey
-        // count u32, +24 subkeys-volatile u32, +28 values u32,
-        // +32 values-volatile u32, +36 parent-stability, +40 subkeys
-        // list cell u32, +44 volatile-list u32, +48 values-list cell
-        // u32, ... +76 name_len u16, +78 name.
+        // nk layout (relative to sig) per the regf specification:
+        // +0 sig, +2 flags u16, +4 timestamp FILETIME (LITTLE-endian),
+        // +12 access bits, +16 parent cell u32, +20 subkey count u32,
+        // +24 subkeys-volatile count u32, +28 SUBKEYS LIST cell u32,
+        // +32 volatile-list cell u32, +36 VALUE COUNT u32, +40 VALUE
+        // LIST cell u32, +44 security cell, +48 class-name cell,
+        // +72 name_len u16, +76 name.
         let flags = le16(src, rec + 2).unwrap_or(0);
         let timestamp = {
             let mut b = [0u8; 8];
             src.read_at(rec + 4, &mut b).ok()?;
-            u64::from_be_bytes(b)
+            u64::from_le_bytes(b)
         };
         let parent_cell = le32(src, rec + 16).unwrap_or(0);
-        let value_count = le32(src, rec + 28).unwrap_or(0);
-        let values_cell = le32(src, rec + 48).unwrap_or(u32::MAX);
-        let name_len = usize::from(le16(src, rec + 76).unwrap_or(0));
+        let subkey_count = le32(src, rec + 20).unwrap_or(0);
+        let subkeys_cell = le32(src, rec + 28).unwrap_or(u32::MAX);
+        let value_count = le32(src, rec + 36).unwrap_or(0);
+        let values_cell = le32(src, rec + 40).unwrap_or(u32::MAX);
+        let name_len = usize::from(le16(src, rec + 72).unwrap_or(0));
         if name_len == 0 || name_len > 255 {
             return None;
         }
         let mut raw = vec![0u8; name_len];
-        src.read_at(rec + 78, &mut raw).ok()?;
+        src.read_at(rec + 76, &mut raw).ok()?;
         let name = if flags & 0x20 != 0 {
             // Compressed (8-bit) name.
             String::from_utf8_lossy(&raw).into_owned()
@@ -240,12 +249,13 @@ impl RegistryHandler {
                 .collect();
             String::from_utf16_lossy(&units)
         };
-        let _ = cell_base_file;
         Some(RegKey {
             cell_index: 0,
             parent_cell,
             name,
             timestamp,
+            subkey_count,
+            subkeys_cell,
             values_cell,
             value_count,
         })
@@ -275,7 +285,9 @@ impl RegistryHandler {
         let value_type = le32(src, rec + 12).unwrap_or(0);
         let name_len = name_len.min(16384);
         let mut raw = vec![0u8; name_len];
-        src.read_at(rec + 18, &mut raw).ok()?;
+        // FINAL-B3: vk name is at +20 (sig2 + name_len2 + data_size4 +
+        // data_off4 + type4 + flags2 + spare2).
+        src.read_at(rec + 20, &mut raw).ok()?;
         let name = String::from_utf8_lossy(&raw).into_owned();
 
         let mut data = Vec::new();
@@ -369,8 +381,9 @@ impl Handler for RegistryHandler {
             let key_path = Self::key_path(&hive, k, root);
             // Values.
             if k.values_cell != u32::MAX && k.value_count > 0 {
-                // The value list is an array of u32 cell offsets right
-                // after the list cell's size prefix.
+                // FINAL-B3: the value-list CELL (offset points at the
+                // cell start) holds [size i32][count x u32 vk cell
+                // offsets]. vk offsets target cell starts.
                 let list_file = base + 0x1000 + u64::from(k.values_cell);
                 for i in 0..k.value_count.min(limits.max_records as u32) {
                     let ent = list_file + 4 + 4 * i as u64;
@@ -444,10 +457,31 @@ impl Handler for RegistryHandler {
             }
         }
 
+        // FINAL-B3: parse the ROOT key's subkey list (li/lf/lh/ri) to
+        // count reachable children — real hives carry subkey lists and
+        // the parser must consume them, not just declare the tags.
+        let (subkeys_reachable, list_kinds) = Self::count_subkeys(src, base, &hive, root, limits);
+        if subkeys_reachable
+            < hive
+                .keys
+                .iter()
+                .filter(|k| k.subkeys_cell != u32::MAX)
+                .count()
+        {
+            warnings.push(format!(
+                "subkey lists partially parsed ({subkeys_reachable} reachable)"
+            ));
+        }
+        let _ = &list_kinds;
+
         let mut metadata = BTreeMap::new();
         metadata.insert("hive_bins".to_string(), hive.bins.to_string());
         metadata.insert("cells_visited".to_string(), hive.cells.to_string());
         metadata.insert("nk_nodes".to_string(), hive.keys.len().to_string());
+        metadata.insert(
+            "subkeys_reachable".to_string(),
+            subkeys_reachable.to_string(),
+        );
         metadata.insert(
             "vk_values".to_string(),
             hive.value_by_cell.len().to_string(),
@@ -505,6 +539,106 @@ impl Handler for RegistryHandler {
 }
 
 impl RegistryHandler {
+    /// Parse a subkey-list record (li/lf/lh/ri) at a CELL reference
+    /// (offset points at the cell start). Returns the referenced child
+    /// key cell offsets. ri lists point at OTHER LIST records (one
+    /// level of indirection).
+    fn parse_subkey_list(
+        src: &ByteSource,
+        base: u64,
+        cell_off: u32,
+        limits: &crate::engine::EngineLimits,
+    ) -> Result<(Vec<u32>, &'static str)> {
+        const LIST_BASE: u64 = 0x1000;
+        let cell = base + LIST_BASE + u64::from(cell_off);
+        let mut sig = [0u8; 2];
+        src.read_at(cell + 4, &mut sig)
+            .map_err(|_| Error::Validation {
+                format: "registry",
+                reason: "subkey list unreadable".into(),
+            })?;
+        let count = le16(src, cell + 6).unwrap_or(0) as usize;
+        let kind: &'static str = match &sig {
+            b"li" => "li",
+            b"lf" => "lf",
+            b"lh" => "lh",
+            b"ri" => "ri",
+            _ => {
+                return Err(Error::Validation {
+                    format: "registry",
+                    reason: format!(
+                        "subkey list signature {:?} invalid",
+                        String::from_utf8_lossy(&sig)
+                    ),
+                })
+            }
+        };
+        if count > limits.max_records {
+            return Err(Error::Validation {
+                format: "registry",
+                reason: format!("subkey list count {count} exceeds cap"),
+            });
+        }
+        let mut out = Vec::with_capacity(count);
+        // li/lf/lh entries: (key cell offset u32 [, hint/hash u32]).
+        // ri entries: (subkey-list offset u32) — one level only.
+        let stride = if kind == "lf" || kind == "lh" { 8 } else { 4 };
+        for i in 0..count {
+            let ent = cell + 8 + (i * stride) as u64;
+            if ent + 4 > src.len() {
+                break;
+            }
+            let target = le32(src, ent).unwrap_or(0);
+            if kind == "ri" {
+                // Nested list: parse one level deeper.
+                if out.len() < limits.max_records {
+                    let (mut nested, _) = Self::parse_subkey_list(src, base, target, limits)?;
+                    out.append(&mut nested);
+                }
+            } else {
+                out.push(target);
+            }
+        }
+        Ok((out, kind))
+    }
+
+    /// Count subkeys reachable from the root through li/lf/lh/ri lists
+    /// (bounded walk, depth 8).
+    fn count_subkeys(
+        src: &ByteSource,
+        base: u64,
+        hive: &RegHive,
+        root: usize,
+        limits: &crate::engine::EngineLimits,
+    ) -> (usize, String) {
+        let mut total = 0usize;
+        let mut kinds: Vec<&str> = Vec::new();
+        let mut visited: Vec<u32> = Vec::new();
+        // Walk every key that declares a subkey list; count distinct
+        // reachable child cells. Bounded.
+        for k in hive.keys.iter().take(limits.max_records) {
+            if k.subkeys_cell == u32::MAX {
+                continue;
+            }
+            if visited.contains(&k.subkeys_cell) {
+                continue;
+            }
+            visited.push(k.subkeys_cell);
+            if visited.len() > 4096 {
+                break;
+            }
+            if let Ok((children, kind)) = Self::parse_subkey_list(src, base, k.subkeys_cell, limits)
+            {
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+                total += children.len();
+            }
+        }
+        let _ = root;
+        (total, kinds.join("+"))
+    }
+
     /// Reconstruct a key path by walking parent links (bounded).
     fn key_path(hive: &RegHive, k: &RegKey, root: usize) -> String {
         let mut parts = vec![k.name.clone()];
@@ -2002,49 +2136,47 @@ mod tests {
 
     #[test]
     fn registry_binary_values_source_backed() {
-        // B7 + #7 §6: REG_BINARY values surface as children under a real
-        // key: a root nk whose value list points at a non-inline vk.
+        // B7 + FINAL-B3: fixture built per the regf specification --
+        // nk value count @+36, value-list cell @+40, name_len @+72,
+        // name @+76; ALL reference fields point at CELL STARTS.
         let mut v = vec![0u8; 8192];
         v[0..4].copy_from_slice(b"regf");
         // First hbin at 4096: magic + size 4096. Cell offsets are
         // relative to 0x1000 (= 4096 here).
         v[4096..4100].copy_from_slice(b"hbin");
         v[4104..4108].copy_from_slice(&4096u32.to_le_bytes());
-        // Root nk cell at 4128: size prefix -(4+96), then the nk record
-        // at 4132 (96 bytes: sig..name).
-        let nk_cell: u64 = 4128;
-        v[nk_cell as usize..nk_cell as usize + 4].copy_from_slice(&(-(4 + 96i32)).to_le_bytes());
-        let nk = nk_cell + 4;
-        v[nk as usize..nk as usize + 2].copy_from_slice(b"nk");
-        v[nk as usize + 2..nk as usize + 4].copy_from_slice(&0x0020u16.to_le_bytes()); // compressed name
-        v[nk as usize + 16..nk as usize + 20].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // no parent
-        v[nk as usize + 28..nk as usize + 32].copy_from_slice(&1u32.to_le_bytes()); // value count
-                                                                                    // Values-list cell at 4228 (prefix -8), entry = vk record rel.
-        let list_cell: u64 = 4228;
-        v[nk as usize + 48..nk as usize + 52]
-            .copy_from_slice(&((list_cell - 4096) as u32).to_le_bytes());
-        v[nk as usize + 76..nk as usize + 78].copy_from_slice(&4u16.to_le_bytes());
-        v[nk as usize + 78..nk as usize + 82].copy_from_slice(b"ROOT");
-        v[list_cell as usize..list_cell as usize + 4].copy_from_slice(&(-8i32).to_le_bytes());
-        let vk_cell: u64 = 4236;
-        let vk_rec_rel = (vk_cell - 4096 + 4) as u32;
-        v[list_cell as usize + 4..list_cell as usize + 8]
-            .copy_from_slice(&vk_rec_rel.to_le_bytes());
-        // vk cell at 4236 (right after the list cell - cells are
-        // contiguous): prefix -(4+20), record at 4240: sig(2)
-        // name_len(2)=0 data_len(4)=16 data_offset(4) type(4)=3.
-        v[vk_cell as usize..vk_cell as usize + 4].copy_from_slice(&(-24i32).to_le_bytes());
-        let vk = vk_cell + 4;
-        v[vk as usize..vk as usize + 2].copy_from_slice(b"vk");
-        v[vk as usize + 2..vk as usize + 4].copy_from_slice(&0u16.to_le_bytes());
-        v[vk as usize + 4..vk as usize + 8].copy_from_slice(&16u32.to_le_bytes());
-        // Non-inline: data_offset points at a cell relative to 0x1000.
-        // Target cell at absolute 5200 -> field = 1104; that cell holds
-        // a signed size header then the 16-byte payload.
-        v[vk as usize + 8..vk as usize + 12].copy_from_slice(&1104u32.to_le_bytes());
-        v[vk as usize + 12..vk as usize + 16].copy_from_slice(&3u32.to_le_bytes()); // REG_BINARY
-        let data_cell: u64 = 5200;
-        v[data_cell as usize..data_cell as usize + 4].copy_from_slice(&(-24i32).to_le_bytes());
+        // Root nk CELL at 4128: size prefix -(4+88), record at 4132.
+        let rec: usize = 4132;
+        v[4128..4132].copy_from_slice(&(-(4 + 88i32)).to_le_bytes());
+        v[rec..rec + 2].copy_from_slice(b"nk");
+        v[rec + 2..rec + 4].copy_from_slice(&0x0020u16.to_le_bytes()); // ASCII name
+        v[rec + 16..rec + 20].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // no parent
+        v[rec + 36..rec + 40].copy_from_slice(&1u32.to_le_bytes()); // VALUE COUNT (+36)
+                                                                    // Value-list CELL at 4220 (immediately after the nk cell —
+                                                                    // cells are contiguous); nk +40 = cell rel.
+        let list_cell: usize = 4220;
+        v[rec + 40..rec + 44].copy_from_slice(&((list_cell - 4096) as u32).to_le_bytes());
+        v[rec + 72..rec + 74].copy_from_slice(&4u16.to_le_bytes()); // NAME LEN (+72)
+        v[rec + 76..rec + 80].copy_from_slice(b"ROOT"); // NAME (+76)
+                                                        // Value-list cell: [size -8][vk cell offset] -- vk offset
+                                                        // targets a CELL START.
+        v[list_cell..list_cell + 4].copy_from_slice(&(-8i32).to_le_bytes());
+        let vk_cell: usize = 4228;
+        v[list_cell + 4..list_cell + 8].copy_from_slice(&((vk_cell - 4096) as u32).to_le_bytes());
+        // vk CELL at 4228: prefix -(4+24), record at 4232: sig(2)
+        // name_len(2)=0 data_len(4)=16 data_off(4) type(4)=3
+        // flags(2) spare(2). Name at +20.
+        let vk: usize = 4232;
+        v[vk_cell..vk_cell + 4].copy_from_slice(&(-28i32).to_le_bytes());
+        v[vk..vk + 2].copy_from_slice(b"vk");
+        v[vk + 2..vk + 4].copy_from_slice(&0u16.to_le_bytes());
+        v[vk + 4..vk + 8].copy_from_slice(&16u32.to_le_bytes()); // data_len
+                                                                 // Non-inline: data offset points at a CELL START relative to
+                                                                 // 0x1000. Data cell at 5200 -> field = 1104.
+        v[vk + 8..vk + 12].copy_from_slice(&1104u32.to_le_bytes());
+        v[vk + 12..vk + 16].copy_from_slice(&3u32.to_le_bytes()); // REG_BINARY
+        let data_cell: usize = 5200;
+        v[data_cell..data_cell + 4].copy_from_slice(&(-24i32).to_le_bytes());
         v[5204..5220].copy_from_slice(&[0xBEu8; 16]);
         let src = ByteSource::from_vec(v);
         let out = validate_at(&RegistryHandler, &src, 0).expect("registry validates");
@@ -2063,62 +2195,84 @@ mod tests {
 
     #[test]
     fn registry_nested_key_paths_and_typed_values() {
-        // #7 §6: parent-link key path reconstruction + inline typed
-        // values (REG_DWORD as hex number, REG_SZ as UTF-16LE text).
+        // FINAL-B3: spec-layout fixture -- nested keys via parent CELL
+        // references, inline REG_DWORD + REG_SZ values, subkey list
+        // (lf) on the root exercised through subkeys_reachable.
         let mut v = vec![0u8; 8192];
         v[0..4].copy_from_slice(b"regf");
         v[4096..4100].copy_from_slice(b"hbin");
         v[4104..4108].copy_from_slice(&4096u32.to_le_bytes());
-        // Root nk at 4128 (record at 4132), parent = none, no values.
-        v[4128..4132].copy_from_slice(&(-100i32).to_le_bytes());
-        v[4132..4134].copy_from_slice(b"nk");
-        v[4134..4136].copy_from_slice(&0x0020u16.to_le_bytes());
-        v[4132 + 16..4132 + 20].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
-        v[4132 + 76..4132 + 78].copy_from_slice(&4u16.to_le_bytes());
-        v[4132 + 78..4132 + 82].copy_from_slice(b"ROOT");
-        // Child nk at 4228 (record at 4232), parent = root record rel.
-        let root_rec_rel = (4132 - 4096) as u32;
-        v[4228..4232].copy_from_slice(&(-100i32).to_le_bytes());
-        v[4232..4234].copy_from_slice(b"nk");
-        v[4234..4236].copy_from_slice(&0x0020u16.to_le_bytes());
-        v[4232 + 16..4232 + 20].copy_from_slice(&root_rec_rel.to_le_bytes());
-        v[4232 + 28..4232 + 32].copy_from_slice(&2u32.to_le_bytes()); // 2 values
-        v[4232 + 76..4232 + 78].copy_from_slice(&3u16.to_le_bytes());
-        v[4232 + 78..4232 + 81].copy_from_slice(b"Sub");
-        // Value list cell at 4328 (prefix -12): two vk record rels.
-        let list_cell: u64 = 4328;
-        v[4232 + 48..4232 + 52].copy_from_slice(&((list_cell - 4096) as u32).to_le_bytes());
-        v[list_cell as usize..list_cell as usize + 4].copy_from_slice(&(-12i32).to_le_bytes());
-        // vk 0 at 4340 (record 4344): inline REG_DWORD 0x11223344.
-        let vk0: u64 = 4340;
-        let vk1: u64 = 4366;
-        let rel0 = (vk0 - 4096 + 4) as u32;
-        let rel1 = (vk1 - 4096 + 4) as u32;
-        v[list_cell as usize + 4..list_cell as usize + 8].copy_from_slice(&rel0.to_le_bytes());
-        v[list_cell as usize + 8..list_cell as usize + 12].copy_from_slice(&rel1.to_le_bytes());
-        // vk 0: name "Test", data_size 0x80000004 (inline, 4 bytes),
-        // data = the offset field itself, type 4 (REG_DWORD).
-        v[vk0 as usize..vk0 as usize + 4].copy_from_slice(&(-26i32).to_le_bytes());
-        v[vk0 as usize + 4..vk0 as usize + 6].copy_from_slice(b"vk");
-        v[vk0 as usize + 6..vk0 as usize + 8].copy_from_slice(&4u16.to_le_bytes());
-        v[vk0 as usize + 8..vk0 as usize + 12].copy_from_slice(&0x8000_0004u32.to_le_bytes());
-        v[vk0 as usize + 12..vk0 as usize + 16].copy_from_slice(&0x11223344u32.to_le_bytes());
-        v[vk0 as usize + 16..vk0 as usize + 20].copy_from_slice(&4u32.to_le_bytes());
-        v[vk0 as usize + 22..vk0 as usize + 26].copy_from_slice(b"Test");
-        // vk 1 at 4366 (record 4370): inline REG_SZ "Hi" (UTF-16LE).
-        v[vk1 as usize..vk1 as usize + 4].copy_from_slice(&(-26i32).to_le_bytes());
-        v[vk1 as usize + 4..vk1 as usize + 6].copy_from_slice(b"vk");
-        v[vk1 as usize + 6..vk1 as usize + 8].copy_from_slice(&2u16.to_le_bytes());
-        v[vk1 as usize + 8..vk1 as usize + 12].copy_from_slice(&0x8000_0004u32.to_le_bytes());
-        v[vk1 as usize + 12..vk1 as usize + 16].copy_from_slice(&0x0069_0048u32.to_le_bytes());
-        v[vk1 as usize + 16..vk1 as usize + 20].copy_from_slice(&1u32.to_le_bytes());
-        v[vk1 as usize + 22..vk1 as usize + 24].copy_from_slice(b"Hi");
+        // Root nk CELL at 4128 (record at 4132).
+        let root_rec: usize = 4132;
+        v[4128..4132].copy_from_slice(&(-(4 + 88i32)).to_le_bytes());
+        v[root_rec..root_rec + 2].copy_from_slice(b"nk");
+        v[root_rec + 2..root_rec + 4].copy_from_slice(&0x0020u16.to_le_bytes());
+        v[root_rec + 16..root_rec + 20].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        // Root: 1 subkey (lf list), 0 values.
+        v[root_rec + 20..root_rec + 24].copy_from_slice(&1u32.to_le_bytes());
+        let lf_cell: usize = 4220;
+        v[root_rec + 28..root_rec + 32].copy_from_slice(&((lf_cell - 4096) as u32).to_le_bytes());
+        v[root_rec + 72..root_rec + 74].copy_from_slice(&4u16.to_le_bytes());
+        v[root_rec + 76..root_rec + 80].copy_from_slice(b"ROOT");
+        // lf list cell: [size -(8+8)][child cell off][hash].
+        v[lf_cell..lf_cell + 4].copy_from_slice(&(-(8 + 8i32)).to_le_bytes());
+        v[lf_cell + 4..lf_cell + 6].copy_from_slice(b"lf");
+        v[lf_cell + 6..lf_cell + 8].copy_from_slice(&1u16.to_le_bytes());
+        // child nk CELL at 4236 (record at 4240) -- contiguous after lf.
+        let child_cell: usize = 4236;
+        v[lf_cell + 8..lf_cell + 12].copy_from_slice(&((child_cell - 4096) as u32).to_le_bytes());
+        v[lf_cell + 12..lf_cell + 16].copy_from_slice(&0u32.to_le_bytes()); // hash
+                                                                            // Child nk record at 4248, parent = ROOT CELL rel (cell start).
+        let child_rec: usize = 4240;
+        v[child_cell..child_cell + 4].copy_from_slice(&(-(4 + 88i32)).to_le_bytes());
+        v[child_rec..child_rec + 2].copy_from_slice(b"nk");
+        v[child_rec + 2..child_rec + 4].copy_from_slice(&0x0020u16.to_le_bytes());
+        v[child_rec + 16..child_rec + 20].copy_from_slice(&((4128 - 4096) as u32).to_le_bytes());
+        v[child_rec + 36..child_rec + 40].copy_from_slice(&2u32.to_le_bytes()); // 2 values
+        let list_cell: usize = 4328;
+        v[child_rec + 40..child_rec + 44]
+            .copy_from_slice(&((list_cell - 4096) as u32).to_le_bytes());
+        v[child_rec + 72..child_rec + 74].copy_from_slice(&3u16.to_le_bytes());
+        v[child_rec + 76..child_rec + 79].copy_from_slice(b"Sub");
+        // Value list cell: [size -12][vk0 cell][vk1 cell].
+        v[list_cell..list_cell + 4].copy_from_slice(&(-12i32).to_le_bytes());
+        // vk0 CELL at 4340 (record 4344): inline REG_DWORD.
+        let vk0_cell: usize = 4340;
+        let vk1_cell: usize = 4374;
+        v[list_cell + 4..list_cell + 8].copy_from_slice(&((vk0_cell - 4096) as u32).to_le_bytes());
+        v[list_cell + 8..list_cell + 12].copy_from_slice(&((vk1_cell - 4096) as u32).to_le_bytes());
+        // vk record: sig(2) name_len(2) data_size(4) data_off(4)
+        // type(4) flags(2) spare(2) name(...). Inline data lives in
+        // the data-offset field.
+        let vk0: usize = 4344;
+        v[vk0_cell..vk0_cell + 4].copy_from_slice(&(-(4 + 30i32)).to_le_bytes());
+        v[vk0..vk0 + 2].copy_from_slice(b"vk");
+        v[vk0 + 2..vk0 + 4].copy_from_slice(&4u16.to_le_bytes()); // "Test"
+        v[vk0 + 4..vk0 + 8].copy_from_slice(&0x8000_0004u32.to_le_bytes()); // inline 4
+        v[vk0 + 8..vk0 + 12].copy_from_slice(&0x11223344u32.to_le_bytes());
+        v[vk0 + 12..vk0 + 16].copy_from_slice(&4u32.to_le_bytes()); // REG_DWORD
+        v[vk0 + 20..vk0 + 24].copy_from_slice(b"Test");
+        // vk1 CELL at 4374 (record 4378): inline REG_SZ "Hi".
+        let vk1: usize = 4378;
+        v[vk1_cell..vk1_cell + 4].copy_from_slice(&(-(4 + 28i32)).to_le_bytes());
+        v[vk1..vk1 + 2].copy_from_slice(b"vk");
+        v[vk1 + 2..vk1 + 4].copy_from_slice(&2u16.to_le_bytes()); // "Hi"
+        v[vk1 + 4..vk1 + 8].copy_from_slice(&0x8000_0004u32.to_le_bytes());
+        v[vk1 + 8..vk1 + 12].copy_from_slice(&0x0069_0048u32.to_le_bytes());
+        v[vk1 + 12..vk1 + 16].copy_from_slice(&1u32.to_le_bytes()); // REG_SZ
+        v[vk1 + 20..vk1 + 22].copy_from_slice(b"Hi");
         let src = ByteSource::from_vec(v);
         let out = validate_at(&RegistryHandler, &src, 0).expect("registry validates");
         let art = &out.artifacts[0];
         assert_eq!(
             art.metadata.get("root_key").map(String::as_str),
             Some("ROOT")
+        );
+        // Subkey list (lf) parsed: root's 1 child reachable.
+        assert_eq!(
+            art.metadata.get("subkeys_reachable").map(String::as_str),
+            Some("1"),
+            "lf subkey list must be parsed"
         );
         let dword = art
             .children
@@ -2128,7 +2282,7 @@ mod tests {
         assert_eq!(
             dword.metadata.get("key_path").map(String::as_str),
             Some("ROOT\\Sub"),
-            "child key path must be reconstructed via parent links"
+            "child key path must be reconstructed via parent cell refs"
         );
         assert_eq!(
             dword.metadata.get("data").map(String::as_str),

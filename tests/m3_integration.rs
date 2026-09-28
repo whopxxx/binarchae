@@ -512,40 +512,40 @@ fn b7_sqlite_blob_nested_artifact() {
 // Registry -> REG_BINARY -> artifact
 #[test]
 fn b7_registry_regbinary_artifact() {
+    // FINAL-B3: spec-layout hive -- nk value count @+36, value-list
+    // cell @+40, name_len @+72, name @+76; references target CELL
+    // STARTS; contiguous cells.
     let mut v = vec![0u8; 8192];
     v[0..4].copy_from_slice(b"regf");
     v[4096..4100].copy_from_slice(b"hbin");
     v[4104..4108].copy_from_slice(&4096u32.to_le_bytes());
-    // Root nk at 4128 (record at 4132) whose value list points at the
-    // vk record; values are emitted per key with their key path.
-    v[4128..4132].copy_from_slice(&(-100i32).to_le_bytes());
-    v[4132..4134].copy_from_slice(b"nk");
-    v[4134..4136].copy_from_slice(&0x0020u16.to_le_bytes()); // compressed name
-    v[4132 + 16..4132 + 20].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // no parent
-    v[4132 + 28..4132 + 32].copy_from_slice(&1u32.to_le_bytes()); // 1 value
-    v[4132 + 76..4132 + 78].copy_from_slice(&4u16.to_le_bytes());
-    v[4132 + 78..4132 + 82].copy_from_slice(b"ROOT");
-    // Values-list cell at 4228 (prefix -8) -> vk record rel offset.
-    let list_cell: u64 = 4228;
-    v[4132 + 48..4132 + 52].copy_from_slice(&((list_cell - 4096) as u32).to_le_bytes());
-    v[list_cell as usize..list_cell as usize + 4].copy_from_slice(&(-8i32).to_le_bytes());
-    let vk_cell: u64 = 4236;
-    let vk_rec_rel = (vk_cell - 4096 + 4) as u32;
-    v[list_cell as usize + 4..list_cell as usize + 8].copy_from_slice(&vk_rec_rel.to_le_bytes());
-    // vk record at 4240: sig(2) name_len(2)=0 data_len(4)=16
-    // data_offset(4) type(4)=3 (REG_BINARY).
-    v[vk_cell as usize..vk_cell as usize + 4].copy_from_slice(&(-24i32).to_le_bytes());
-    let vk = vk_cell + 4;
-    v[vk as usize..vk as usize + 2].copy_from_slice(b"vk");
-    v[vk as usize + 2..vk as usize + 4].copy_from_slice(&0u16.to_le_bytes());
-    v[vk as usize + 4..vk as usize + 8].copy_from_slice(&16u32.to_le_bytes()); // data_len
-                                                                               // Non-inline: data_offset points at a CELL relative to 0x1000.
-                                                                               // Target cell at absolute 5216 -> field = 1120. That cell holds a
-                                                                               // signed size header (-24) then the payload.
-    v[vk as usize + 8..vk as usize + 12].copy_from_slice(&1120u32.to_le_bytes());
-    v[vk as usize + 12..vk as usize + 16].copy_from_slice(&3u32.to_le_bytes()); // REG_BINARY
-    let data_cell: u64 = 5216;
-    v[data_cell as usize..data_cell as usize + 4].copy_from_slice(&(-24i32).to_le_bytes());
+    // Root nk CELL at 4128 (record at 4132).
+    let rec: usize = 4132;
+    v[4128..4132].copy_from_slice(&(-(4 + 88i32)).to_le_bytes());
+    v[rec..rec + 2].copy_from_slice(b"nk");
+    v[rec + 2..rec + 4].copy_from_slice(&0x0020u16.to_le_bytes());
+    v[rec + 16..rec + 20].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // no parent
+    v[rec + 36..rec + 40].copy_from_slice(&1u32.to_le_bytes()); // value count
+                                                                // Value-list CELL at 4220 (contiguous after the nk cell).
+    let list_cell: usize = 4220;
+    v[rec + 40..rec + 44].copy_from_slice(&((list_cell - 4096) as u32).to_le_bytes());
+    v[rec + 72..rec + 74].copy_from_slice(&4u16.to_le_bytes()); // name_len
+    v[rec + 76..rec + 80].copy_from_slice(b"ROOT");
+    // Value list: [size -8][vk CELL offset].
+    v[list_cell..list_cell + 4].copy_from_slice(&(-8i32).to_le_bytes());
+    let vk_cell: usize = 4228;
+    v[list_cell + 4..list_cell + 8].copy_from_slice(&((vk_cell - 4096) as u32).to_le_bytes());
+    // vk CELL at 4228 (record at 4232): data_len 16, data_off -> data
+    // cell at absolute 5216 (field = 1120), type REG_BINARY.
+    let vk: usize = 4232;
+    v[vk_cell..vk_cell + 4].copy_from_slice(&(-28i32).to_le_bytes());
+    v[vk..vk + 2].copy_from_slice(b"vk");
+    v[vk + 2..vk + 4].copy_from_slice(&0u16.to_le_bytes());
+    v[vk + 4..vk + 8].copy_from_slice(&16u32.to_le_bytes());
+    v[vk + 8..vk + 12].copy_from_slice(&1120u32.to_le_bytes());
+    v[vk + 12..vk + 16].copy_from_slice(&3u32.to_le_bytes());
+    let data_cell: usize = 5216;
+    v[data_cell..data_cell + 4].copy_from_slice(&(-24i32).to_le_bytes());
     // Payload in the data cell (target + 4 = 5220).
     v[5220..5236].copy_from_slice(&[0xB7u8; 16]);
     let graph = engine().analyze(&ByteSource::from_vec(v), true);
