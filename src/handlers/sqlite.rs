@@ -108,6 +108,7 @@ impl Handler for SqliteHandler {
 
         // Page 1 (at `base`): sqlite_schema b-tree root. Cell content
         // offsets are absolute within the page starting at 100 (header).
+        let mut pages_visited = 0usize;
         let schema_rows = walk_table_page(
             src,
             base,
@@ -117,6 +118,7 @@ impl Handler for SqliteHandler {
             0,
             limits,
             &mut warnings,
+            &mut pages_visited,
         )?;
 
         // Emit schema-page rows as record children (sqlite_schema rows).
@@ -175,6 +177,7 @@ impl Handler for SqliteHandler {
                 1,
                 limits,
                 &mut warnings,
+                &mut pages_visited,
             )?;
             total_rows += rows.len() as u64;
             for row in rows.iter().take(64) {
@@ -281,11 +284,20 @@ fn walk_table_page(
     depth: u32,
     limits: &crate::engine::EngineLimits,
     warnings: &mut Vec<String>,
+    pages_visited: &mut usize,
 ) -> Result<Vec<TableRow>> {
     let mut rows = Vec::new();
     if depth > 12 {
         warnings.push("b-tree depth cap reached; subtree skipped".to_string());
         return Ok(rows);
+    }
+    // B3: the page cap actually constrains the recursive walk.
+    *pages_visited += 1;
+    if *pages_visited > limits.max_sqlite_pages {
+        return Err(Error::LimitExceeded {
+            limit: "max_sqlite_pages",
+            detail: format!("b-tree walk exceeded {} pages", limits.max_sqlite_pages),
+        });
     }
     if rows.len() > limits.max_records {
         return Ok(rows);
@@ -333,6 +345,7 @@ fn walk_table_page(
                         depth + 1,
                         limits,
                         warnings,
+                        pages_visited,
                     )?;
                     rows.extend(sub);
                 }
@@ -344,12 +357,17 @@ fn walk_table_page(
                 let (rowid, n2) = read_varint(src, cell_off + n1)?;
                 let payload_start = cell_off + n1 + n2;
                 let usable = page_size - u64::from(reserved);
-                // Overflow threshold for table leaf: U-35.
-                let max_local = usable - 35;
-                let payload = if payload_len <= max_local {
+                // B3: exact per-spec local-payload selection for table
+                // leaf cells. X = U-35; if P <= X everything is local.
+                // Otherwise M = ((U-12)*32/255)-23 and
+                // K = M+((P-M) % (U-4)); local = K if K <= X else M.
+                let x = usable - 35;
+                let payload = if payload_len <= x {
                     read_bytes(src, payload_start, payload_len)?
                 } else {
-                    let local = min_local(payload_len, usable);
+                    let m = (usable - 12) * 32 / 255 - 23;
+                    let k = m + (payload_len - m) % (usable - 4);
+                    let local = if k <= x { k } else { m };
                     let mut data = read_bytes(src, payload_start, local)?;
                     let next = be32(src, payload_start + local)? as u64;
                     follow_overflow(
@@ -357,7 +375,7 @@ fn walk_table_page(
                         db_base,
                         next,
                         payload_len - local,
-                        usable,
+                        page_size,
                         limits,
                         &mut data,
                     )?;
@@ -386,6 +404,7 @@ fn walk_table_page(
                 depth + 1,
                 limits,
                 warnings,
+                pages_visited,
             )?;
             rows.extend(sub);
         }
@@ -393,18 +412,12 @@ fn walk_table_page(
     Ok(rows)
 }
 
-fn min_local(payload_len: u64, usable: u64) -> u64 {
-    // Table leaf M formula: M = ((U-12)*32/255) - 23.
-    let m = (usable - 12) * 32 / 255 - 23;
-    m.min(payload_len)
-}
-
 fn follow_overflow(
     src: &ByteSource,
     db_base: u64,
     mut page: u64,
     mut remaining: u64,
-    usable: u64,
+    usable_page_size: u64,
     limits: &crate::engine::EngineLimits,
     out: &mut Vec<u8>,
 ) -> Result<()> {
@@ -416,9 +429,18 @@ fn follow_overflow(
                 reason: "overflow chain cycle".into(),
             });
         }
-        let off = db_base + (page - 1) * usable;
+        // B3: overflow chain pages are charged against the page cap.
+        if visited.len() > limits.max_sqlite_pages {
+            return Err(Error::LimitExceeded {
+                limit: "max_sqlite_pages",
+                detail: "overflow chain exceeded page cap".into(),
+            });
+        }
+        // B3: pages always start at multiples of the FULL page_size;
+        // reserved bytes only shrink the page's usable interior.
+        let off = db_base + (page - 1) * usable_page_size;
         let next = be32(src, off)? as u64;
-        let chunk = (usable - 4).min(remaining);
+        let chunk = (usable_page_size - 4).min(remaining);
         let data = read_bytes(src, off + 4, chunk)?;
         out.extend_from_slice(&data);
         remaining -= chunk;
@@ -640,6 +662,90 @@ mod tests {
         db[16..18].copy_from_slice(&777u16.to_be_bytes());
         let src = ByteSource::from_vec(db);
         assert!(validate_at(&src).is_err());
+    }
+
+    #[test]
+    fn sqlite_overflow_record_decoded_per_spec() {
+        // B3: a payload that legitimately overflows must be decoded with
+        // the exact X/M/K local-size rule AND overflow pages located at
+        // (page-1)*page_size (full page stride, not usable size).
+        // Layout: page 1 leaf + page 2 overflow + page 3 overflow.
+        // Payload: 5000 bytes of text. U=4096, X=4061, M=((4096-12)*32/255)-23.
+        let page_size: u64 = 4096;
+        let usable = page_size; // reserved=0
+        let x = usable - 35;
+        let m = ((usable - 12) * 32 / 255) - 23;
+        let payload_len: u64 = 5000;
+        let payload_len_total = 3u64 + payload_len; // header byte + serial varint(2) + data
+        let k = m + (payload_len_total - m) % (usable - 4);
+        let local = if k <= x { k } else { m } as usize;
+
+        let mut db = vec![0u8; 3 * page_size as usize];
+        db[0..16].copy_from_slice(SQLITE_MAGIC);
+        db[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
+        db[20] = 0;
+        db[56..60].copy_from_slice(&1u32.to_be_bytes());
+        db[100] = 0x0D;
+        db[103..105].copy_from_slice(&1u16.to_be_bytes());
+        // Record: header len 2, serial 0xB9 (text len (0xB9-13)/2 = 85?),
+        // use big text: serial = 13 + 2*len, len=5000 -> varint serial.
+        // 13 + 10000 = 10013 -> serial varint.
+        let mut record: Vec<u8> = vec![0x02]; // header len (1 byte covers 2 fields? no)
+                                              // header: len byte + serial varint(s). text serial 10013 varint.
+        let serial = 13u64 + 2 * payload_len; // text of 5000 chars
+        let mut hdr = vec![0u8]; // placeholder for header length
+        hdr.extend(write_varint(serial));
+        hdr[0] = hdr.len() as u8;
+        record = hdr;
+        record.extend(vec![b'A'; payload_len as usize]);
+
+        // Cell at some offset on page 1.
+        let mut cell = write_varint(payload_len_total);
+        cell.extend(write_varint(1));
+        cell.extend_from_slice(&record[..local]);
+        cell.extend_from_slice(&2u32.to_be_bytes()); // overflow page 2
+        let cell_off = page_size as usize - cell.len();
+        db[108..110].copy_from_slice(&(cell_off as u16).to_be_bytes());
+        db[cell_off..cell_off + cell.len()].copy_from_slice(&cell);
+
+        // Overflow page 2: data chunk = min(page_size-4, remaining).
+        let remaining = payload_len_total as usize - local;
+        let first_chunk = (page_size as usize - 4).min(remaining);
+        let second_start = local + first_chunk;
+        let second_chunk = remaining - first_chunk;
+        // Point to page 3 only when there is a second chunk.
+        let next_page: u32 = if second_chunk > 0 { 3 } else { 0 };
+        db[page_size as usize..page_size as usize + 4].copy_from_slice(&next_page.to_be_bytes());
+        db[page_size as usize + 4..page_size as usize + 4 + first_chunk]
+            .copy_from_slice(&record[local..local + first_chunk]);
+        if second_chunk > 0 {
+            db[2 * page_size as usize..2 * page_size as usize + 4]
+                .copy_from_slice(&0u32.to_be_bytes());
+            db[2 * page_size as usize + 4..2 * page_size as usize + 4 + second_chunk]
+                .copy_from_slice(&record[second_start..]);
+        }
+
+        let src = ByteSource::from_vec(db);
+        let out = validate_at(&src).expect("overflow record must validate");
+        let art = &out.artifacts[0];
+        assert_eq!(art.confidence, Confidence::Validated);
+        // The row must decode to a 5000-char text value (summary is
+        // truncated in the label at 48 chars, so look for 48 'A's).
+        let decoded = art
+            .children
+            .iter()
+            .find(|c| c.label.contains("sqlite_schema[1]"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "overflow row decoded; children: {:?}",
+                    art.children.iter().map(|c| &c.label).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            decoded.label.contains(&"A".repeat(48)),
+            "text payload fully reassembled: {}",
+            decoded.label
+        );
     }
 
     #[test]

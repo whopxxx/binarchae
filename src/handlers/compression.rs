@@ -79,39 +79,6 @@ fn decompressed_output(
     }
 }
 
-/// Tracks how many compressed bytes the decoder consumed.
-pub(crate) struct CountingReader<'a> {
-    inner: &'a [u8],
-    read: usize,
-}
-
-impl<'a> CountingReader<'a> {
-    fn new(inner: &'a [u8]) -> Self {
-        CountingReader { inner, read: 0 }
-    }
-
-    /// Total compressed bytes read so far (the exact consumed count the
-    /// boundary math uses).
-    fn consumed(&self) -> usize {
-        self.read
-    }
-}
-
-impl Read for CountingReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = match self.inner.get(self.read..) {
-            Some(rest) => {
-                let n = rest.len().min(buf.len());
-                buf[..n].copy_from_slice(&rest[..n]);
-                n
-            }
-            None => 0,
-        };
-        self.read += n;
-        Ok(n)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // zlib (RFC 1950)
 // ---------------------------------------------------------------------------
@@ -180,15 +147,17 @@ impl Handler for ZlibHandler {
 
         let available = src.len() - base;
         let cap = output_cap(available, limits, true);
-        let region = src.slice(base, available)?;
-        let data = region.read_all()?;
+        // B2: stream from the source itself — no read_all() over the
+        // whole tail before limits apply. Decompressors pull bounded
+        // chunks through ByteSource's Read impl; the take() bounds the
+        // compressed input independently of output caps.
+        let mut region = src.slice(base, available)?;
         let mut out = Vec::new();
-        let mut counting = CountingReader::new(&data);
         let consumed;
         {
             // ZlibDecoder expects the 2-byte header at the start of its
             // input, so feed the FULL region (header included).
-            let mut decoder = flate2::read::ZlibDecoder::new(&mut counting);
+            let mut decoder = flate2::read::ZlibDecoder::new(&mut region);
             let mut chunk = [0u8; 64 * 1024];
             loop {
                 let n = decoder
@@ -212,8 +181,7 @@ impl Handler for ZlibHandler {
                 out.extend_from_slice(&chunk[..n]);
             }
             // total_in counts only the bytes the decoder actually
-            // consumed (header + deflate + trailer it verified); the
-            // counting reader's read count includes read-ahead.
+            // consumed (header + deflate + trailer it verified).
             consumed = decoder.total_in();
         }
         if out.is_empty() {
@@ -364,13 +332,12 @@ impl Handler for Bzip2Handler {
 
         let available = src.len() - base;
         let cap = output_cap(available, limits, true);
-        let region = src.slice(base, available)?;
-        let data = region.read_all()?;
+        // B2: bounded-memory streaming — no read_all() over the tail.
+        let mut region = src.slice(base, available)?;
         let mut out = Vec::new();
         let consumed;
         {
-            let mut counting = CountingReader::new(&data);
-            let mut decoder = bzip2::read::BzDecoder::new(&mut counting);
+            let mut decoder = bzip2::read::BzDecoder::new(&mut region);
             let mut chunk = [0u8; 64 * 1024];
             loop {
                 let n = decoder
@@ -531,19 +498,29 @@ impl Handler for ZstdHandler {
 
         let available = src.len() - base;
         let cap = output_cap(available, limits, true);
-        let region = src.slice(base, available)?;
-        let data = region.read_all()?;
+        // B2: bounded-memory streaming — no read_all() over the tail.
+        let mut region = src.slice(base, available)?;
         let mut out = Vec::new();
         let consumed;
         {
-            let mut counting = CountingReader::new(&data);
-            let mut decoder = zstd::stream::Decoder::new(&mut counting)
+            let mut decoder = zstd::stream::Decoder::new(&mut region)
                 .map_err(|e| Error::Decompression(format!("zstd init: {e}")))?;
             let mut chunk = [0u8; 64 * 1024];
             loop {
-                let n = decoder
-                    .read(&mut chunk)
-                    .map_err(|e| Error::Decompression(format!("zstd stream: {e}")))?;
+                let n = match decoder.read(&mut chunk) {
+                    Ok(n) => n,
+                    Err(e)
+                        if e.to_string().contains("Unknown frame descriptor")
+                            || e.to_string().contains("Frame header") =>
+                    {
+                        // The single-frame stream ended cleanly and the
+                        // decoder attempted to interpret trailing bytes
+                        // (after our frame) as a new frame. The first
+                        // frame's output stands; the cursor marks its end.
+                        break;
+                    }
+                    Err(e) => return Err(Error::Decompression(format!("zstd stream: {e}"))),
+                };
                 if n == 0 {
                     break;
                 }
@@ -562,7 +539,38 @@ impl Handler for ZstdHandler {
                 out.extend_from_slice(&chunk[..n]);
             }
             drop(decoder);
-            consumed = counting.consumed() as u64;
+            // B2: exact frame end via zstd_safe::find_frame_compressed_size
+            // over a BOUNDED prefix (never read_all of the whole tail).
+            // If the frame is larger than the bounded window, fall back
+            // to the streaming cursor with over-read correction.
+            let probe_len = limits
+                .max_child_size
+                .min(src.len() - base)
+                .min(64 * 1024 * 1024);
+            let probe = src.slice(base, probe_len).and_then(|r| r.read_all());
+            consumed = match probe
+                .ok()
+                .map(|buf| zstd::zstd_safe::find_frame_compressed_size(&buf))
+            {
+                Some(Ok(frame_size)) => frame_size as u64,
+                _ => {
+                    // Frame larger than the probe window (or probe failed):
+                    // streaming cursor, corrected for EndMark over-read.
+                    let cursor = region.stream_pos();
+                    let mut end = cursor;
+                    for back in 0..=8u64 {
+                        let cand = cursor.saturating_sub(back);
+                        if cand >= base + 4 && cand <= src.len() {
+                            let mut zb = [0u8; 4];
+                            if src.read_at(cand - 4, &mut zb).is_ok() && zb == [0, 0, 0, 0] {
+                                end = cand;
+                                break;
+                            }
+                        }
+                    }
+                    end - base
+                }
+            };
         }
         if out.is_empty() {
             return Err(Error::Validation {
@@ -637,40 +645,55 @@ impl Handler for Lz4Handler {
         src.read_at(base, &mut magic)?;
         let available = src.len() - base;
         let cap = output_cap(available, limits, true);
-        let region = src.slice(base, available)?;
-        let data = region.read_all()?;
+        // B2: bounded-memory streaming. The legacy walker reads blocks
+        // in bounded pieces; the modern frame path streams through the
+        // ByteSource Read impl. No read_all() over the whole tail.
+        let mut region = src.slice(base, available)?;
         let mut out = Vec::new();
         let mut evidence = Vec::new();
         let mut metadata = BTreeMap::new();
+        let frame_end: u64;
 
         if magic == LZ4_LEGACY_MAGIC {
             // Legacy frame: sequence of 8MB blocks with 4-byte LE sizes,
             // terminated by size 0. lz4_flex has no legacy reader; walk
             // blocks ourselves via frame-decoder on each block.
-            let mut off = 4usize;
+            // Legacy frame: bounded per-block reads through read_at.
+            let mut off = 4u64;
             loop {
-                if off + 4 > data.len() {
+                if off + 4 > available {
                     return Err(Error::Validation {
                         format: "lz4",
                         reason: "legacy frame truncated in block list".into(),
                     });
                 }
-                let bsize =
-                    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
-                        as usize;
+                let mut sb = [0u8; 4];
+                region.read_at(off, &mut sb)?;
+                let bsize = u32::from_le_bytes(sb) as u64;
                 off += 4;
                 if bsize == 0 {
                     break;
                 }
-                if off + bsize > data.len() {
+                if off + bsize > available {
                     return Err(Error::Validation {
                         format: "lz4",
                         reason: "legacy block truncated".into(),
                     });
                 }
-                let decoded =
-                    lz4_flex::block::decompress_size_prepended(&data[off..off + bsize])
-                        .map_err(|e| Error::Decompression(format!("lz4 legacy block: {e}")))?;
+                // Block header: 4-byte prepended uncompressed size.
+                let mut szb = [0u8; 4];
+                region.read_at(off, &mut szb)?;
+                let declared = u32::from_le_bytes(szb) as u64;
+                if declared > cap {
+                    return Err(Error::LimitExceeded {
+                        limit: "compression-expansion-ratio/child-size",
+                        detail: format!("lz4 legacy block output would exceed {cap} bytes"),
+                    });
+                }
+                let mut block = vec![0u8; bsize as usize];
+                region.read_at(off, &mut block)?;
+                let decoded = lz4_flex::block::decompress_size_prepended(&block)
+                    .map_err(|e| Error::Decompression(format!("lz4 legacy block: {e}")))?;
                 if out.len() as u64 + decoded.len() as u64 > cap {
                     return Err(Error::LimitExceeded {
                         limit: "compression-expansion-ratio/child-size",
@@ -686,12 +709,13 @@ impl Handler for Lz4Handler {
                 out.extend_from_slice(&decoded);
                 off += bsize;
             }
+            // B2: exact frame end = after the 0 terminator.
+            frame_end = off + 4;
             evidence.push("LZ4 legacy frame walked block-by-block".to_string());
             metadata.insert("frame".to_string(), "legacy".to_string());
         } else {
-            // Modern frame: hand the bytes to lz4_flex frame decoder.
-            let mut counting = CountingReader::new(&data);
-            let mut decoder = lz4_flex::frame::FrameDecoder::new(&mut counting);
+            // Modern frame: stream through the ByteSource Read impl.
+            let mut decoder = lz4_flex::frame::FrameDecoder::new(&mut region);
             let mut chunk = [0u8; 64 * 1024];
             loop {
                 let n = decoder
@@ -714,6 +738,12 @@ impl Handler for Lz4Handler {
                 }
                 out.extend_from_slice(&chunk[..n]);
             }
+            drop(decoder);
+            // B2: exact frame end. lz4_flex consumed through the
+            // trailing EndMark (4 zero bytes); the streaming cursor is
+            // the end of the frame. Verify the EndMark to anchor it.
+            let cursor = region.stream_pos();
+            frame_end = lz4_endmark_end(src, base, cursor)?;
             evidence.push("LZ4 frame magic + descriptor walked".to_string());
             metadata.insert("frame".to_string(), "modern".to_string());
         }
@@ -728,7 +758,7 @@ impl Handler for Lz4Handler {
             "lz4",
             "LZ4 frame",
             base,
-            data.len() as u64, // framing consumed to end of walked region
+            frame_end, // B2: exact frame end; trailing data stays discoverable
             vec![
                 evidence.join("; "),
                 "decoded natively via lz4_flex".to_string(),
@@ -737,6 +767,25 @@ impl Handler for Lz4Handler {
             out,
         ))
     }
+}
+
+/// Locate the LZ4 frame EndMark (a 0u32) and return the frame end
+/// offset (absolute). The streaming cursor after a clean frame decode
+/// includes the EndMark lz4_flex read; verify it and anchor the exact
+/// boundary so trailing data after the frame stays discoverable.
+fn lz4_endmark_end(src: &ByteSource, base: u64, cursor: u64) -> Result<u64> {
+    for c in [cursor, cursor.saturating_sub(4)] {
+        if c >= base + 8 && c <= src.len() {
+            let mut zb = [0u8; 4];
+            if src.read_at(c - 4, &mut zb).is_ok() && zb == [0, 0, 0, 0] {
+                return Ok(c);
+            }
+        }
+    }
+    Err(Error::Validation {
+        format: "lz4",
+        reason: "frame EndMark not found at consumed boundary".into(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -854,6 +903,64 @@ mod tests {
         let art = &out.artifacts[0];
         assert_eq!(art.confidence, Confidence::Validated);
         assert_eq!(art.children[0].content.to_bytes().unwrap(), payload);
+    }
+
+    #[test]
+    fn lz4_frame_exact_boundary_with_trailing_data() {
+        // B2: the artifact must end at the frame EndMark, not swallow
+        // trailing bytes appended after it.
+        let payload = b"lz4 bounded payload ".repeat(50);
+        let mut compressed = Vec::new();
+        {
+            let mut enc = lz4_flex::frame::FrameEncoder::new(&mut compressed);
+            std::io::Write::write_all(&mut enc, &payload).unwrap();
+            enc.finish().unwrap();
+        }
+        let mut blob = compressed.clone();
+        blob.extend_from_slice(b"TRAILING-DATA-NOT-LZ4");
+        let src = ByteSource::from_vec(blob);
+        let out = validate_at(&Lz4Handler, &src, 0).expect("lz4 validates");
+        let art = &out.artifacts[0];
+        assert_eq!(art.size, compressed.len() as u64, "frame end must be exact");
+    }
+
+    #[test]
+    fn zlib_exact_boundary_with_trailing_data() {
+        let payload = b"zlib trailing test payload 1234567890 ".repeat(20);
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &payload).unwrap();
+        let compressed = enc.finish().unwrap();
+        let mut blob = compressed.clone();
+        blob.extend_from_slice(b"TAIL");
+        let src = ByteSource::from_vec(blob);
+        let out = validate_at(&ZlibHandler, &src, 0).expect("zlib validates");
+        assert_eq!(out.artifacts[0].size, compressed.len() as u64);
+    }
+
+    #[test]
+    fn bzip2_exact_boundary_with_trailing_data() {
+        let payload = b"bzip2 trailing boundary test ".repeat(100);
+        let compressed = {
+            let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::new(6));
+            std::io::Write::write_all(&mut enc, &payload).unwrap();
+            enc.finish().unwrap()
+        };
+        let mut blob = compressed.clone();
+        blob.extend_from_slice(b"TAIL");
+        let src = ByteSource::from_vec(blob);
+        let out = validate_at(&Bzip2Handler, &src, 0).expect("bzip2 validates");
+        assert_eq!(out.artifacts[0].size, compressed.len() as u64);
+    }
+
+    #[test]
+    fn zstd_exact_boundary_with_trailing_data() {
+        let payload = b"zstd trailing boundary test ".repeat(50);
+        let compressed = zstd::bulk::compress(&payload, 3).unwrap();
+        let mut blob = compressed.clone();
+        blob.extend_from_slice(b"TAIL");
+        let src = ByteSource::from_vec(blob);
+        let out = validate_at(&ZstdHandler, &src, 0).expect("zstd validates");
+        assert_eq!(out.artifacts[0].size, compressed.len() as u64);
     }
 
     #[test]

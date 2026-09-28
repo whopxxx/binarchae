@@ -123,6 +123,44 @@ impl Handler for ElfHandler {
             _ => "unknown",
         };
 
+        // B6: prove the structural end. The section table end is the
+        // strongest provable boundary; walk section headers for
+        // sh_offset+sh_size as well (last section can extend beyond the
+        // table). Without a provable end the artifact is Partial.
+        let mut struct_end = shoff + shnum.checked_mul(shentsize).unwrap_or(0);
+        if shentsize > 0 && shnum > 0 && shnum as usize <= limits.max_records {
+            for i in 0..shnum {
+                let sh = base + shoff + i * shentsize;
+                // SHT_NOBITS (8) occupies no file bytes.
+                let sh_type = u32_at(src, sh + 4).unwrap_or(0);
+                let (sh_offset, sh_size) = if is64 {
+                    (
+                        u64_at(src, sh + 24).unwrap_or(0),
+                        u64_at(src, sh + 32).unwrap_or(0),
+                    )
+                } else {
+                    (
+                        u64::from(u32_at(src, sh + 16).unwrap_or(0)),
+                        u64::from(u32_at(src, sh + 20).unwrap_or(0)),
+                    )
+                };
+                if sh_type != 8 {
+                    struct_end = struct_end.max(sh_offset + sh_size);
+                }
+            }
+        }
+        let proven_end = base + struct_end <= src.len();
+        let elf_size = if proven_end {
+            struct_end
+        } else {
+            src.len() - base
+        };
+        let elf_confidence = if proven_end {
+            Confidence::Validated
+        } else {
+            Confidence::Partial
+        };
+
         let mut metadata = BTreeMap::new();
         metadata.insert(
             "class".to_string(),
@@ -144,8 +182,8 @@ impl Handler for ElfHandler {
                     if is64 { "64-bit" } else { "32-bit" }
                 ),
                 offset: base,
-                size: src.len() - base,
-                confidence: Confidence::Validated,
+                size: elf_size,
+                confidence: elf_confidence,
                 evidence: Evidence::facts([
                     "ELF magic + ident validated".to_string(),
                     format!("{} section headers at +{shoff}", shnum),
@@ -270,6 +308,31 @@ impl Handler for PeHandler {
             _ => "unknown",
         };
 
+        // B6: provable structural end = end of the section table plus the
+        // furthest section raw data (PointerToRawData + SizeOfRawData).
+        let mut struct_end =
+            (pe_at - base) + 24 + opt_header_size as u64 + num_sections as u64 * 40;
+        for i in 0..num_sections {
+            let sh = base + (pe_at - base) + 24 + opt_header_size as u64 + i as u64 * 40;
+            if sh + 40 > src.len() {
+                break;
+            }
+            let raw_size = crate::handlers::media_read_u32_le(src, sh + 16).unwrap_or(0) as u64;
+            let raw_ptr = crate::handlers::media_read_u32_le(src, sh + 20).unwrap_or(0) as u64;
+            struct_end = struct_end.max(raw_ptr + raw_size);
+        }
+        let proven_end = base + struct_end <= src.len();
+        let pe_size = if proven_end {
+            struct_end
+        } else {
+            src.len() - base
+        };
+        let pe_confidence = if proven_end {
+            Confidence::Validated
+        } else {
+            Confidence::Partial
+        };
+
         let mut metadata = BTreeMap::new();
         metadata.insert("machine".to_string(), arch.to_string());
         metadata.insert("sections".to_string(), num_sections.to_string());
@@ -279,14 +342,19 @@ impl Handler for PeHandler {
                 format: "pe".to_string(),
                 label: format!("PE executable ({arch}, {} sections)", num_sections),
                 offset: base,
-                size: src.len() - base,
-                confidence: Confidence::Validated,
+                size: pe_size,
+                confidence: pe_confidence,
                 evidence: Evidence::facts([
                     "DOS header + PE signature validated".to_string(),
                     format!(
                         "{} sections, optional header {} bytes",
                         num_sections, opt_header_size
                     ),
+                    if proven_end {
+                        "structural end proven via section raw data".to_string()
+                    } else {
+                        "section data extends past source; Partial".to_string()
+                    },
                 ]),
                 metadata,
                 warnings: Vec::new(),
@@ -295,6 +363,13 @@ impl Handler for PeHandler {
             }],
         })
     }
+}
+
+/// Read a u64 LE at `off` (two u32 LE reads). Mach-O LE helper.
+fn macho_u64(src: &ByteSource, off: u64) -> u64 {
+    let lo = crate::handlers::media_read_u32_le(src, off).unwrap_or(0) as u64;
+    let hi = crate::handlers::media_read_u32_le(src, off + 4).unwrap_or(0) as u64;
+    lo | (hi << 32)
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +444,52 @@ impl Handler for MachOHandler {
             _ => "unknown",
         };
 
+        // B6: provable structural end = end of the load-command list plus
+        // the furthest segment's file offset+filesize.
+        let mut cmds_end = base + (if is64 { 32 } else { 28 }) as u64;
+        let mut struct_end = 0u64;
+        let mut off = cmds_end;
+        for _ in 0..ncmds {
+            if off + 8 > src.len() {
+                break;
+            }
+            let cmdsize = u32_at(src, off + 4).unwrap_or(0) as u64;
+            if cmdsize < 8 || off + cmdsize > src.len() {
+                break;
+            }
+            let cmd = u32_at(src, off).unwrap_or(0);
+            off += cmdsize;
+            // LC_SEGMENT = 0x1, LC_SEGMENT_64 = 0x19.
+            if cmd == 0x1 || cmd == 0x19 {
+                let seg64 = cmd == 0x19;
+                let cmd_start = off - cmdsize;
+                let fileoff_off = cmd_start + if seg64 { 40 } else { 32 };
+                let filesize_off = fileoff_off + if seg64 { 8 } else { 4 };
+                let (fileoff, filesize) = if seg64 {
+                    (macho_u64(src, fileoff_off), macho_u64(src, filesize_off))
+                } else {
+                    (
+                        u64::from(u32_at(src, fileoff_off).unwrap_or(0)),
+                        u64::from(u32_at(src, filesize_off).unwrap_or(0)),
+                    )
+                };
+                struct_end = struct_end.max(fileoff + filesize);
+            }
+        }
+        cmds_end = off;
+        struct_end = struct_end.max(cmds_end - base);
+        let proven_end = base + struct_end <= src.len();
+        let macho_size = if proven_end {
+            struct_end
+        } else {
+            src.len() - base
+        };
+        let macho_confidence = if proven_end {
+            Confidence::Validated
+        } else {
+            Confidence::Partial
+        };
+
         let mut metadata = BTreeMap::new();
         metadata.insert("arch".to_string(), arch.to_string());
         metadata.insert(
@@ -382,8 +503,8 @@ impl Handler for MachOHandler {
                 format: "macho".to_string(),
                 label: format!("Mach-O ({arch}, {} load commands)", ncmds),
                 offset: base,
-                size: src.len() - base,
-                confidence: Confidence::Validated,
+                size: macho_size,
+                confidence: macho_confidence,
                 evidence: Evidence::facts([
                     "Mach-O magic validated".to_string(),
                     format!("{} load commands declared", ncmds),
@@ -775,6 +896,22 @@ mod exec_tests {
             art.metadata.get("section_count").map(String::as_str),
             Some("3")
         );
+    }
+
+    #[test]
+    fn elf_boundary_proves_trailing_region() {
+        // B6: the ELF artifact must end at the section table end
+        // (shoff=64 + 3*64 = 256), NOT at end-of-source, so appended
+        // bytes stay discoverable as trailing data.
+        let mut e = elf64();
+        let elf_len = e.len(); // 64 + 192 = 256
+        assert_eq!(elf_len, 256);
+        e.extend_from_slice(b"APPENDED-NOT-ELF");
+        let src = ByteSource::from_vec(e);
+        let out = validate_at(&ElfHandler, &src, 0).expect("elf validates");
+        let art = &out.artifacts[0];
+        assert_eq!(art.size, 256, "ELF size must be the structural end");
+        assert_eq!(art.confidence, Confidence::Validated);
     }
 
     #[test]

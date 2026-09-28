@@ -150,9 +150,13 @@ impl Handler for PcapHandler {
     }
 
     fn find_candidates(&self, src: &ByteSource) -> Vec<Candidate> {
+        // B4: all FOUR libpcap savefile magics must be discoverable —
+        // microsecond LE/BE and nanosecond LE/BE.
         let mut hits: Vec<Candidate> = find_all(src, &[0xD4, 0xC3, 0xB2, 0xA1])
             .into_iter()
             .chain(find_all(src, &[0xA1, 0xB2, 0xC3, 0xD4]))
+            .chain(find_all(src, &[0x4D, 0x3C, 0xB2, 0xA1]))
+            .chain(find_all(src, &[0xA1, 0xB2, 0x3C, 0x4D]))
             .map(|offset| Candidate { offset })
             .collect();
         hits.sort_by_key(|c| c.offset);
@@ -240,13 +244,25 @@ impl Handler for PcapHandler {
         );
         metadata.insert("nanosecond".to_string(), nanosecond.to_string());
 
+        // B4: a capture cut off mid-record is NOT fully validated — the
+        // record chain was not walked to a clean end. Downgrade honestly.
+        let confidence = if truncated {
+            Confidence::Partial
+        } else {
+            Confidence::Validated
+        };
+
         Ok(HandlerOutput {
             artifacts: vec![ArtifactDraft {
                 format: "pcap".to_string(),
-                label: format!("PCAP capture ({} packets)", packets.len()),
+                label: format!(
+                    "PCAP capture ({} packets{})",
+                    packets.len(),
+                    if truncated { ", truncated" } else { "" }
+                ),
                 offset: base,
                 size: off - base,
-                confidence: Confidence::Validated,
+                confidence,
                 evidence: Evidence::facts([
                     "PCAP global header validated".to_string(),
                     format!("{} packet records walked", packets.len()),
@@ -425,54 +441,109 @@ impl Handler for MinidumpHandler {
         let _ = check;
 
         // Walk stream directory: 12-byte entries (type, size, rva).
+        // B5: RVAs are file offsets relative to the DUMP START, so every
+        // location must add the candidate `base` for embedded minidumps.
         let mut streams_seen = Vec::new();
         let mut memory_streams = 0usize;
         let mut children = Vec::new();
         for i in 0..stream_count {
-            let entry = dir_rva + 12 * i as u64;
+            let entry = base + dir_rva + 12 * i as u64;
             if entry + 12 > src.len() {
                 break;
             }
             let stype = le32(src, entry).unwrap_or(0);
             let ssize = le32(src, entry + 4).unwrap_or(0) as u64;
-            let srva = le32(src, entry + 8).unwrap_or(0) as u64;
+            let srva = base + le32(src, entry + 8).unwrap_or(0) as u64;
             streams_seen.push(stype);
-            // Memory64ListStream = 9, MemoryListStream = 5.
-            if stype == 5 || stype == 9 {
-                memory_streams += 1;
-                // MemoryList: count(4) then MINIDUMP_MEMORY_DESCRIPTOR
-                // (start_addr 8, data_size 4, rva 4).
-                if srva + 4 <= src.len() {
-                    let count = le32(src, srva).unwrap_or(0) as usize;
-                    let count = count.min(limits.max_records);
-                    for m in 0..count {
-                        let desc = srva + 4 + 16 * m as u64;
-                        if desc + 16 > src.len() {
-                            break;
+            match stype {
+                5 => {
+                    memory_streams += 1;
+                    // MemoryListStream: u32 count then MINIDUMP_MEMORY_DESCRIPTOR
+                    // (u64 start_addr, u32 data_size, u32 rva) - 16 bytes each.
+                    if srva + 4 <= src.len() {
+                        let count = le32(src, srva).unwrap_or(0) as usize;
+                        let count = count.min(limits.max_records);
+                        for m in 0..count {
+                            let desc = srva + 4 + 16 * m as u64;
+                            if desc + 16 > src.len() {
+                                break;
+                            }
+                            let data_size = le32(src, desc + 8).unwrap_or(0) as u64;
+                            let data_rva = base + le32(src, desc + 12).unwrap_or(0) as u64;
+                            if data_size == 0
+                                || children.len() >= limits.max_records
+                                || data_rva + data_size > src.len()
+                            {
+                                continue;
+                            }
+                            let region = src.slice(data_rva, data_size)?;
+                            let mut meta = BTreeMap::new();
+                            meta.insert("memory_index".to_string(), m.to_string());
+                            meta.insert("stream".to_string(), "MemoryList".to_string());
+                            children.push(ChildDraft {
+                                relation: RelationKind::MemoryRange,
+                                label: format!("memory range {} ({} bytes)", m, data_size),
+                                format_hint: "raw",
+                                content: ChildContent::Source(region),
+                                size: data_size,
+                                metadata: meta,
+                                warnings: Vec::new(),
+                                entry_name: None,
+                            });
                         }
-                        let data_size = le32(src, desc + 8).unwrap_or(0) as u64;
-                        let data_rva = le32(src, desc + 12).unwrap_or(0) as u64;
-                        if data_size == 0
-                            || children.len() >= limits.max_records
-                            || data_rva + data_size > src.len()
-                        {
-                            continue;
-                        }
-                        let region = src.slice(data_rva, data_size)?;
-                        let mut meta = BTreeMap::new();
-                        meta.insert("memory_index".to_string(), m.to_string());
-                        children.push(ChildDraft {
-                            relation: RelationKind::MemoryRange,
-                            label: format!("memory range {} ({} bytes)", m, data_size),
-                            format_hint: "raw",
-                            content: ChildContent::Source(region),
-                            size: data_size,
-                            metadata: meta,
-                            warnings: Vec::new(),
-                            entry_name: None,
-                        });
                     }
                 }
+                9 => {
+                    memory_streams += 1;
+                    // B5: Memory64ListStream has its own layout -
+                    // u64 NumberOfMemoryRanges, u64 BaseRva, then 16-byte
+                    // descriptors (u64 start_addr, u64 data_size). The raw
+                    // memory is laid out CONTIGUOUSLY starting at BaseRva;
+                    // there is NO per-descriptor data RVA.
+                    if srva + 16 <= src.len() {
+                        let count = (le32(src, srva).unwrap_or(0) as u64)
+                            | ((le32(src, srva + 4).unwrap_or(0) as u64) << 32);
+                        let base_rva = (le32(src, srva + 8).unwrap_or(0) as u64)
+                            | ((le32(src, srva + 12).unwrap_or(0) as u64) << 32);
+                        let count = count.min(limits.max_records as u64) as usize;
+                        let mut data_off = base + base_rva;
+                        for m in 0..count {
+                            let desc = srva + 16 + 16 * m as u64;
+                            if desc + 16 > src.len() {
+                                break;
+                            }
+                            let data_size = (le32(src, desc + 8).unwrap_or(0) as u64)
+                                | ((le32(src, desc + 12).unwrap_or(0) as u64) << 32);
+                            if data_size == 0 || children.len() >= limits.max_records {
+                                continue;
+                            }
+                            if data_off + data_size > src.len() {
+                                break; // dump truncated mid-memory; stop cleanly
+                            }
+                            let region = src.slice(data_off, data_size)?;
+                            let mut meta = BTreeMap::new();
+                            meta.insert("memory_index".to_string(), m.to_string());
+                            meta.insert("stream".to_string(), "Memory64List".to_string());
+                            meta.insert("start_addr".to_string(), {
+                                let lo = le32(src, desc).unwrap_or(0) as u64;
+                                let hi = le32(src, desc + 4).unwrap_or(0) as u64;
+                                format!("{:#x}", lo | (hi << 32))
+                            });
+                            children.push(ChildDraft {
+                                relation: RelationKind::MemoryRange,
+                                label: format!("memory64 range {} ({} bytes)", m, data_size),
+                                format_hint: "raw",
+                                content: ChildContent::Source(region),
+                                size: data_size,
+                                metadata: meta,
+                                warnings: Vec::new(),
+                                entry_name: None,
+                            });
+                            data_off += data_size;
+                        }
+                    }
+                }
+                _ => {}
             }
             let _ = ssize;
         }
@@ -669,6 +740,67 @@ mod tests {
     }
 
     #[test]
+    fn pcap_nanosecond_magic_discovered() {
+        // B4: the nanosecond magic must be found by find_candidates and
+        // validate to a full packet.
+        let mut p = Vec::new();
+        p.extend_from_slice(&[0x4D, 0x3C, 0xB2, 0xA1]); // ns LE magic
+        p.extend(2u16.to_le_bytes());
+        p.extend(4u16.to_le_bytes());
+        p.extend(0u32.to_le_bytes());
+        p.extend(0u32.to_le_bytes());
+        p.extend(262144u32.to_le_bytes());
+        p.extend(1u32.to_le_bytes());
+        p.extend(1u32.to_le_bytes());
+        p.extend(0u32.to_le_bytes());
+        p.extend(4u32.to_le_bytes());
+        p.extend(4u32.to_le_bytes());
+        p.extend(b"DATA");
+        let src = ByteSource::from_vec(p);
+        assert!(
+            !PcapHandler.find_candidates(&src).is_empty(),
+            "ns magic found"
+        );
+        let out = validate_at(&PcapHandler, &src, 0).expect("ns pcap validates");
+        assert_eq!(out.artifacts[0].confidence, Confidence::Validated);
+        assert_eq!(out.artifacts[0].children.len(), 1);
+    }
+
+    #[test]
+    fn pcap_truncated_capture_not_validated() {
+        // B4: a capture cut off mid-record must NOT be Validated.
+        let mut p = Vec::new();
+        p.extend_from_slice(&[0xD4, 0xC3, 0xB2, 0xA1]);
+        p.extend(2u16.to_le_bytes());
+        p.extend(4u16.to_le_bytes());
+        p.extend(0u32.to_le_bytes());
+        p.extend(0u32.to_le_bytes());
+        p.extend(262144u32.to_le_bytes());
+        p.extend(1u32.to_le_bytes());
+        // One complete packet.
+        p.extend(1u32.to_le_bytes());
+        p.extend(0u32.to_le_bytes());
+        p.extend(4u32.to_le_bytes());
+        p.extend(4u32.to_le_bytes());
+        p.extend(b"OKAY");
+        // A truncated record header (declares 100 bytes, only 2 present).
+        p.extend(2u32.to_le_bytes());
+        p.extend(0u32.to_le_bytes());
+        p.extend(100u32.to_le_bytes());
+        p.extend(100u32.to_le_bytes());
+        p.extend(b"XY");
+        let src = ByteSource::from_vec(p);
+        let out = validate_at(&PcapHandler, &src, 0).expect("truncated pcap still parsed");
+        let art = &out.artifacts[0];
+        assert_eq!(
+            art.confidence,
+            Confidence::Partial,
+            "truncated capture must be Partial, not Validated"
+        );
+        assert_eq!(art.children.len(), 1, "complete packet kept");
+    }
+
+    #[test]
     fn pcapng_shb_epb_walk() {
         let mut p = Vec::new();
         // SHB: type, len, bom, version, section len, options, len.
@@ -737,6 +869,55 @@ mod tests {
         assert_eq!(art.children.len(), 1);
         assert_eq!(art.children[0].relation, RelationKind::MemoryRange);
         assert_eq!(art.children[0].size, 32);
+    }
+
+    #[test]
+    fn minidump_embedded_base_relative_rva_and_memory64() {
+        // B5: RVAs must resolve relative to the dump start (base), and
+        // Memory64List must use the contiguous BaseRva layout.
+        let mut m = Vec::new();
+        m.extend(b"JUNKJUNK"); // 8-byte prefix: dump embedded at base=8
+                               // Header at 8: magic, version, 1 stream, dir rva 32 (relative).
+        m.extend(b"MDMP");
+        m.extend(42899u32.to_le_bytes());
+        m.extend(1u32.to_le_bytes());
+        m.extend(32u32.to_le_bytes());
+        m.extend(0u32.to_le_bytes());
+        m.extend(0u32.to_le_bytes());
+        m.extend(0u64.to_le_bytes());
+        // Dir entry: type 9 (Memory64List), size 24, rva 48 (relative).
+        m.extend(9u32.to_le_bytes());
+        m.extend(24u32.to_le_bytes());
+        m.extend(48u32.to_le_bytes());
+        // Pad to 56 absolute (48 relative + 8 base).
+        m.resize(8 + 48, 0);
+        // Memory64List: u64 count=1, u64 base_rva=80 (relative -> abs 88,
+        // right after the descriptor).
+        m.extend(1u64.to_le_bytes());
+        m.extend(80u64.to_le_bytes());
+        // Descriptor: start_addr 0x1000, data_size 16.
+        m.extend(0x1000u64.to_le_bytes());
+        m.extend(16u64.to_le_bytes());
+        // Raw memory at base+80 = 88.
+        m.resize(8 + 80, 0);
+        m.extend((0xC0u8..0xD0).collect::<Vec<u8>>()); // 16 bytes
+        let src = ByteSource::from_vec(m);
+        let out = validate_at(&MinidumpHandler, &src, 8).expect("embedded minidump validates");
+        let art = &out.artifacts[0];
+        assert_eq!(art.confidence, Confidence::Validated);
+        assert_eq!(art.children.len(), 1, "memory64 range found");
+        assert_eq!(art.children[0].size, 16);
+        assert_eq!(
+            art.children[0].metadata.get("stream").map(String::as_str),
+            Some("Memory64List")
+        );
+        match &art.children[0].content {
+            ChildContent::Source(r) => {
+                let bytes = r.read_all().unwrap();
+                assert_eq!(bytes[0], 0xC0, "data must come from BaseRva position");
+            }
+            _ => panic!("memory range must be source-backed"),
+        }
     }
 
     #[test]

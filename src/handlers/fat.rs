@@ -119,13 +119,48 @@ impl FatHandler {
             });
         }
 
-        let fat_offset = reserved as u64 * bps;
-        let root_dir_offset = fat_offset + fat_count as u64 * fat_size * bps;
+        // B1: full checked layout arithmetic. A hostile BPB must be
+        // rejected, never allowed to underflow into a huge cluster count
+        // (debug panic / release wrap).
+        let reserved64 = reserved as u64;
+        let fat_count64 = fat_count as u64;
+        let fat_size64 = fat_size;
+        let fat_sectors = fat_count64
+            .checked_mul(fat_size64)
+            .ok_or_else(|| Error::Validation {
+                format: "fat",
+                reason: "FAT area overflows".into(),
+            })?;
+        if reserved64
+            .checked_add(fat_sectors)
+            .ok_or_else(|| Error::Validation {
+                format: "fat",
+                reason: "layout overflows".into(),
+            })?
+            > total_sectors
+        {
+            return Err(Error::Validation {
+                format: "fat",
+                reason: format!(
+                    "reserved ({reserved64}) + FAT sectors ({fat_sectors}) exceed total {total_sectors}"
+                ),
+            });
+        }
+        let fat_offset = reserved64 * bps;
+        let root_dir_offset = fat_offset + fat_sectors * bps;
         let root_dir_sectors = ((root_entries * 32) as u64).div_ceil(bps);
+        let after_fat = total_sectors - reserved64 - fat_sectors;
+        if root_dir_sectors > after_fat {
+            return Err(Error::Validation {
+                format: "fat",
+                reason: format!(
+                    "root dir sectors ({root_dir_sectors}) exceed remaining {after_fat}"
+                ),
+            });
+        }
         let data_offset = root_dir_offset + root_dir_sectors * bps;
         let cluster_size = spc as u64 * bps;
-        let data_sectors =
-            total_sectors - reserved as u64 - fat_count as u64 * fat_size - root_dir_sectors;
+        let data_sectors = after_fat - root_dir_sectors;
         let cluster_count = (data_sectors / spc as u64) as u32;
 
         let fat_type = declared_type.unwrap_or(if root_entries > 0 {
@@ -694,6 +729,29 @@ mod tests {
         img[13] = 3; // spc not power of two
         let src = ByteSource::from_vec(img);
         assert!(validate_at(&src, 0).is_err());
+    }
+
+    #[test]
+    fn fat16_hostile_bpb_layout_rejected() {
+        // B1: reserved + FAT sectors must not exceed total (would
+        // underflow data_sectors). reserved=3, fat_count=2, fat_size=1
+        // on a 4-sector volume => 3+2 > 4.
+        let mut img = fat16_image();
+        img.resize(4 * 512, 0);
+        img[19..21].copy_from_slice(&4u16.to_le_bytes()); // total16 = 4
+        img[14..16].copy_from_slice(&3u16.to_le_bytes()); // reserved = 3
+        img[16] = 2; // fat count = 2
+        let src = ByteSource::from_vec(img);
+        assert!(
+            validate_at(&src, 0).is_err(),
+            "underflowing layout must be rejected, not wrapped"
+        );
+
+        // FAT area itself overflowing (fat_size huge) must also reject.
+        let mut img2 = fat16_image();
+        img2[22..24].copy_from_slice(&0xFFFFu16.to_le_bytes()); // fat_size = 65535
+        let src2 = ByteSource::from_vec(img2);
+        assert!(validate_at(&src2, 0).is_err());
     }
 
     #[test]
