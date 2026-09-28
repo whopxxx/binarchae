@@ -428,14 +428,7 @@ fn walk_table_page(
                         limits,
                         page_work: pages_visited,
                     };
-                    follow_overflow(
-                        src,
-                        db_base,
-                        next,
-                        payload_len - local,
-                        &mut ctx,
-                        &mut data,
-                    )?;
+                    follow_overflow(src, db_base, next, payload_len - local, &mut ctx, &mut data)?;
                     data
                 };
                 if let Some(row) = decode_record(&payload, rowid) {
