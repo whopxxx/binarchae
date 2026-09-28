@@ -371,7 +371,6 @@ fn b7_pcap_http_reconstruction() {
         p.extend((pkt.len() as u32).to_le_bytes());
         p.extend_from_slice(pkt);
     }
-    let part1_len = part1.len() - 6; // header bytes before the body
     let graph = engine().analyze(&ByteSource::from_vec(p), true);
 
     let pcap_id = graph
@@ -382,13 +381,13 @@ fn b7_pcap_http_reconstruction() {
     assert!(pcap_id.is_some(), "pcap validated");
     let mut found = false;
     for (r, c) in graph.children(pcap_id.unwrap()) {
-        if c.label.contains("HTTP object")
+        if c.label.contains("HTTP body")
             && r == RelationKind::ReconstructedFrom
             && c.metadata.get("complete").map(String::as_str) == Some("true")
         {
-            // Body must have been reassembled from the two segments:
-            // Body must be reassembled from the two segments.
-            if c.size == (part1_len + 11) as u64 {
+            // The reassembled BODY (headers stripped per §7.2) must be
+            // exactly the 11-byte flag.
+            if c.size == 11 {
                 found = true;
             }
         }
