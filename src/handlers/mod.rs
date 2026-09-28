@@ -4,6 +4,7 @@
 pub mod archives;
 pub mod compression;
 pub mod cpio;
+pub mod cramfs;
 pub mod disk;
 pub mod exec;
 pub mod fat;
@@ -16,6 +17,7 @@ pub mod media;
 pub mod pdf;
 pub mod png;
 pub mod recovery;
+pub mod romfs;
 pub mod sqlite;
 pub mod tar;
 pub mod uimage;

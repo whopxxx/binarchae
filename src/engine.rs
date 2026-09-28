@@ -237,6 +237,8 @@ pub fn builtin_handlers() -> Vec<Box<dyn Handler>> {
         Box::new(handlers::filesystems::ExtHandler),
         Box::new(handlers::filesystems::NtfsHandler),
         Box::new(handlers::filesystems::UbiHandler),
+        Box::new(handlers::romfs::RomfsHandler),
+        Box::new(handlers::cramfs::CramfsHandler),
         Box::new(handlers::firmware::DtbHandler),
         Box::new(handlers::firmware::AndroidBootHandler),
         Box::new(handlers::firmware::TrxHandler),
