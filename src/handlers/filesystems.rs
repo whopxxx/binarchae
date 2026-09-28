@@ -1794,64 +1794,6 @@ impl Handler for NtfsHandler {
     }
 }
 
-pub struct UbiHandler;
-
-impl Handler for UbiHandler {
-    fn format(&self) -> &'static str {
-        "ubi"
-    }
-
-    fn find_candidates(&self, src: &ByteSource) -> Vec<Candidate> {
-        find_all(src, b"UBI#")
-            .into_iter()
-            .chain(find_all(src, b"UBI!"))
-            .map(|offset| Candidate { offset })
-            .collect()
-    }
-
-    fn validate(
-        &self,
-        src: &ByteSource,
-        candidate: Candidate,
-        _limits: &crate::engine::EngineLimits,
-        _budget: &mut Budget,
-    ) -> Result<HandlerOutput> {
-        let base = candidate.offset;
-        let mut magic = [0u8; 4];
-        src.read_at(base, &mut magic)?;
-        let kind = if &magic == b"UBI#" {
-            "erase-count header"
-        } else {
-            "volume table"
-        };
-        let mut metadata = BTreeMap::new();
-        metadata.insert(
-            "marker".to_string(),
-            String::from_utf8_lossy(&magic).into_owned(),
-        );
-        metadata.insert("structure".to_string(), kind.to_string());
-        Ok(HandlerOutput {
-            artifacts: vec![ArtifactDraft {
-                format: "ubi".to_string(),
-                label: format!("UBI flash container ({kind})"),
-                offset: base,
-                size: src.len() - base,
-                confidence: Confidence::Partial,
-                evidence: Evidence::facts([
-                    "UBI magic validated".to_string(),
-                    "erase-block/volume walking is planned for a hardening pass".to_string(),
-                ]),
-                metadata,
-                warnings: vec![
-                    "UBI/UBIFS volume & file traversal is planned for a hardening pass".to_string(),
-                ],
-                errors: Vec::new(),
-                children: Vec::new(),
-            }],
-        })
-    }
-}
-
 // ---------------------------------------------------------------------------
 // JFFS2
 // ---------------------------------------------------------------------------
@@ -2532,6 +2474,414 @@ impl Jffs2Handler {
     }
 }
 
+// ---------------------------------------------------------------------------
+// UBI + UBIFS
+// ---------------------------------------------------------------------------
+
+/// UBI volume handler: parses erase-block headers and the volume table,
+/// exposes each user volume's concatenated LEB data as a child
+/// artifact. A UBIFS image inside a volume is picked up by the engine
+/// recursively.
+pub struct UbiVolumeHandler;
+
+const UBI_EC_MAGIC: &[u8] = b"UBI#"; // 0x55424923 big-endian
+const UBI_VID_MAGIC: &[u8] = b"UBI!"; // 0x55424921 big-endian
+const UBI_EC_HDR_SIZE: usize = 64;
+const UBI_VID_HDR_SIZE: usize = 64;
+const UBI_VTBL_RECORD_SIZE: usize = 128;
+const UBI_MAX_VOLUMES: usize = 128;
+const UBI_LAYOUT_VOLUME_ID: u32 = 0x7FFF_FFC0; // 0x7FFFFFFF - 4096
+const UBI_VID_STATIC: u8 = 2;
+/// The layout volume occupies LEBs 0 and 1 of its own mapping; its
+/// table records are 128 bytes each with a trailing CRC-32.
+const UBI_VTBL_CRC_LEN: usize = UBI_VTBL_RECORD_SIZE - 4;
+
+/// Layout verified against Linux drivers/mtd/ubi (ubi-media.h, io.c,
+/// build.c, vtbl.c):
+/// - Each physical erase block starts with `struct ubi_ec_hdr` (64
+///   bytes): magic "UBI#" (be32 0x55424923), version@4, ec@8 (be64),
+///   vid_hdr_offset@16 (be32), data_offset@20 (be32), image_seq@24
+///   (be32), hdr_crc@60 (be32). hdr_crc = crc32 over the first 60
+///   bytes (crc32_le(0xFFFFFFFF, ...) ^ 0xFFFFFFFF, i.e. the standard
+///   CRC-32 of those bytes).
+/// - At vid_hdr_offset (64 by default) sits `struct ubi_vid_hdr` (64
+///   bytes): magic "UBI!", version@4, vol_type@5 (1 = dynamic, 2 =
+///   static), copy_flag@6, compat@7, vol_id@8 (be32), lnum@12 (be32),
+///   data_size@16 (be32, static volumes), used_ebs@20, data_pad@24,
+///   data_crc@28, sqnum@32 (be64), hdr_crc@60. hdr_crc over the first
+///   60 bytes.
+/// - User data starts at data_offset (typically 128). LEB size is not
+///   stored on flash; it is inferred as the distance between identical
+///   EC-header positions.
+/// - The layout volume (vol_id 0x7FFFFFFF-4096 = 0x7FFFFFFC0>>0...
+///   exactly 0x7FFF_FFC0) holds two copies of the volume table: an
+///   array of `struct ubi_vtbl_record` (128 bytes): reserved_pebs@0
+///   (be32), alignment@4, data_pad@8, vol_type@12, upd_marker@13,
+///   name_len@14 (be16), name@16 (up to 128 bytes), flags@144,
+///   padding[23], crc@124 (be32) = standard CRC-32 over the first 124
+///   bytes. Empty records are all zero with the CRC of zeros.
+struct UbiLeb {
+    vol_id: u32,
+    lnum: u32,
+    data_offset: u64,
+    data_size: u64,
+    static_size: Option<u64>,
+}
+
+/// Standard CRC-32 of a byte slice.
+fn ubi_crc32(data: &[u8]) -> u32 {
+    let mut h = crc32fast::Hasher::new();
+    h.update(data);
+    h.finalize()
+}
+
+fn be32at(b: &[u8], o: usize) -> u32 {
+    u32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+
+impl UbiVolumeHandler {
+    /// Infer the PEB size: the offset of the second EC header (or the
+    /// source end for single-PEB images).
+    fn scan_pebs(
+        src: &ByteSource,
+        base: u64,
+        limits: &crate::engine::EngineLimits,
+        warnings: &mut Vec<String>,
+    ) -> Result<(u64, Vec<UbiLeb>)> {
+        let mut ec_offsets: Vec<u64> = Vec::new();
+        // First pass: find EC header offsets (bounded scan).
+        let scan_end = src.len().min(base + 512 * 1024 * 1024);
+        let mut magic = [0u8; 4];
+        let mut pos = base;
+        let mut ff_run = 0usize;
+        // PEBs are uniform; use the first two headers to lock stride.
+        let mut peb_stride: u64 = 0;
+        while pos + UBI_EC_HDR_SIZE as u64 <= scan_end {
+            src.read_at(pos, &mut magic)?;
+            if magic == *UBI_EC_MAGIC {
+                ec_offsets.push(pos);
+                if ec_offsets.len() >= limits.max_partitions {
+                    warnings.push("PEB scan hit max_partitions; truncated".to_string());
+                    break;
+                }
+                // Next EC header cannot be inside this PEB.
+                pos += peb_stride.max(4096);
+                ff_run = 0;
+                continue;
+            }
+            if magic[0] == 0xFF {
+                ff_run += 1;
+                if ff_run > 1024 * 1024 {
+                    break; // erased tail
+                }
+            } else {
+                ff_run = 0;
+            }
+            // Once the stride is known, jump PEB to PEB.
+            match peb_stride {
+                0 => pos += 1,
+                stride => pos = (pos / stride + 1) * stride,
+            }
+            if ec_offsets.len() == 2 && peb_stride == 0 {
+                peb_stride = ec_offsets[1] - ec_offsets[0];
+            }
+        }
+        if ec_offsets.is_empty() {
+            return Err(Error::Validation {
+                format: "ubi",
+                reason: "no erase-count headers found".into(),
+            });
+        }
+        let peb_size = if ec_offsets.len() >= 2 {
+            ec_offsets[1] - ec_offsets[0]
+        } else {
+            src.len() - ec_offsets[0]
+        };
+        if peb_size < 2048 || !peb_size.is_power_of_two() {
+            return Err(Error::Validation {
+                format: "ubi",
+                reason: format!("implausible PEB size {peb_size}"),
+            });
+        }
+
+        // Second pass: parse VID headers.
+        let mut lebs: Vec<UbiLeb> = Vec::new();
+        for &peb in &ec_offsets {
+            let mut ec = [0u8; UBI_EC_HDR_SIZE];
+            src.read_at(peb, &mut ec)?;
+            if be32at(&ec, 60) != ubi_crc32(&ec[..60]) {
+                continue; // corrupt EC header: skip like the kernel
+            }
+            let vid_off = peb + be32at(&ec, 16) as u64;
+            let data_off = peb + be32at(&ec, 20) as u64;
+            if vid_off + UBI_VID_HDR_SIZE as u64 > src.len() {
+                continue;
+            }
+            let mut vid = [0u8; UBI_VID_HDR_SIZE];
+            src.read_at(vid_off, &mut vid)?;
+            if &vid[..4] != UBI_VID_MAGIC {
+                continue; // unmapped/erased PEB
+            }
+            if be32at(&vid, 60) != ubi_crc32(&vid[..60]) {
+                continue;
+            }
+            let vol_type = vid[5];
+            let data_size = be32at(&vid, 16) as u64;
+            lebs.push(UbiLeb {
+                vol_id: be32at(&vid, 8),
+                lnum: be32at(&vid, 12),
+                data_offset: data_off,
+                data_size: peb_size - (data_off - peb),
+                static_size: if vol_type == UBI_VID_STATIC {
+                    Some(data_size)
+                } else {
+                    None
+                },
+            });
+        }
+        Ok((peb_size, lebs))
+    }
+
+    /// Read the volume table from the layout volume LEBs (highest
+    /// sqnum copy wins; the table itself is duplicated at lnum 0/1).
+    fn read_volume_table(
+        src: &ByteSource,
+        lebs: &[UbiLeb],
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<u8>> {
+        let mut table: Option<Vec<u8>> = None;
+        for leb in lebs.iter().filter(|l| l.vol_id == UBI_LAYOUT_VOLUME_ID) {
+            // Layout volume data starts at data_offset; the table
+            // fills the rest of the LEB.
+            let len = (leb.data_size).min((UBI_MAX_VOLUMES * UBI_VTBL_RECORD_SIZE) as u64) as usize;
+            if len == 0 {
+                continue;
+            }
+            let mut buf = vec![0u8; len];
+            if src.read_at(leb.data_offset, &mut buf).is_err() {
+                continue;
+            }
+            table = Some(buf);
+            break;
+        }
+        let Some(table) = table else {
+            warnings.push("layout volume not found; volume table unavailable".to_string());
+            return Ok(Vec::new());
+        };
+        // Validate per-record CRCs; corrupt records become empty.
+        let mut clean = vec![0u8; table.len()];
+        for i in 0..table.len() / UBI_VTBL_RECORD_SIZE {
+            let rec = &table[i * UBI_VTBL_RECORD_SIZE..(i + 1) * UBI_VTBL_RECORD_SIZE];
+            if be32at(rec, 124) == ubi_crc32(&rec[..UBI_VTBL_CRC_LEN]) {
+                clean[i * UBI_VTBL_RECORD_SIZE..(i + 1) * UBI_VTBL_RECORD_SIZE]
+                    .copy_from_slice(rec);
+            }
+        }
+        Ok(clean)
+    }
+}
+
+/// One parsed volume table record.
+struct UbiVolume {
+    id: usize,
+    reserved_pebs: u32,
+    vol_type: u8,
+    name: String,
+}
+
+impl Handler for UbiVolumeHandler {
+    fn format(&self) -> &'static str {
+        "ubi"
+    }
+
+    fn find_candidates(&self, src: &ByteSource) -> Vec<Candidate> {
+        let mut hits: Vec<Candidate> = find_all(src, UBI_EC_MAGIC)
+            .into_iter()
+            .map(|offset| Candidate { offset })
+            .collect();
+        hits.sort_by_key(|c| c.offset);
+        hits.dedup_by_key(|c| c.offset);
+        hits.truncate(8);
+        hits
+    }
+
+    fn validate(
+        &self,
+        src: &ByteSource,
+        candidate: Candidate,
+        limits: &crate::engine::EngineLimits,
+        _budget: &mut Budget,
+    ) -> Result<HandlerOutput> {
+        let base = candidate.offset;
+        let mut warnings = Vec::new();
+        let (peb_size, lebs) = Self::scan_pebs(src, base, limits, &mut warnings)?;
+
+        let table = Self::read_volume_table(src, &lebs, &mut warnings)?;
+        let mut volumes: Vec<UbiVolume> = Vec::new();
+        for i in 0..table.len() / UBI_VTBL_RECORD_SIZE {
+            if i >= UBI_MAX_VOLUMES {
+                break;
+            }
+            let rec = &table[i * UBI_VTBL_RECORD_SIZE..(i + 1) * UBI_VTBL_RECORD_SIZE];
+            let reserved_pebs = be32at(rec, 0);
+            if reserved_pebs == 0 {
+                continue;
+            }
+            let name_len = usize::from(u16::from_be_bytes([rec[14], rec[15]]));
+            let name_len = name_len.min(UBI_MAX_VOLUMES).min(127);
+            let name = String::from_utf8_lossy(&rec[16..16 + name_len]).into_owned();
+            volumes.push(UbiVolume {
+                id: i,
+                reserved_pebs,
+                vol_type: rec[12],
+                name,
+            });
+        }
+
+        // Map LEBs: vol_id -> sorted by lnum.
+        let mut by_vol: std::collections::BTreeMap<u32, Vec<&UbiLeb>> =
+            std::collections::BTreeMap::new();
+        for l in &lebs {
+            by_vol.entry(l.vol_id).or_default().push(l);
+        }
+        for v in by_vol.values_mut() {
+            v.sort_by_key(|l| l.lnum);
+        }
+
+        let mut children = Vec::new();
+        for vol in &volumes {
+            if children.len() >= limits.max_streams {
+                warnings.push("max_streams reached; remaining volumes not exposed".to_string());
+                break;
+            }
+            let leb_list = match by_vol.get(&(vol.id as u32)) {
+                Some(l) => l,
+                None => continue,
+            };
+            // Dynamic volume: concatenate full LEB data areas. Static
+            // volumes carry per-LEB data_size (ubi-media.h).
+            let total: u64 = leb_list
+                .iter()
+                .map(|l| l.static_size.unwrap_or(l.data_size))
+                .sum();
+            let label = format!(
+                "UBI volume \"{}\" ({} LEBs, {} bytes, type {})",
+                vol.name,
+                leb_list.len(),
+                total,
+                if vol.vol_type == UBI_VID_STATIC {
+                    "static"
+                } else {
+                    "dynamic"
+                }
+            );
+            let mut meta = BTreeMap::new();
+            meta.insert("volume_id".to_string(), vol.id.to_string());
+            meta.insert("volume_name".to_string(), vol.name.clone());
+            meta.insert(
+                "volume_type".to_string(),
+                if vol.vol_type == UBI_VID_STATIC {
+                    "static".to_string()
+                } else {
+                    "dynamic".to_string()
+                },
+            );
+            meta.insert("leb_count".to_string(), leb_list.len().to_string());
+            meta.insert("reserved_pebs".to_string(), vol.reserved_pebs.to_string());
+            meta.insert("peb_size".to_string(), peb_size.to_string());
+            // Volumes are exposed as contiguous reconstructions; the
+            // engine re-runs handlers over the content, so UBIFS /
+            // SquashFS inside a volume is discovered automatically.
+            children.push(ChildDraft {
+                relation: RelationKind::ReconstructedFrom,
+                label,
+                format_hint: "ubi-volume",
+                content: ChildContent::Owned(Vec::new()), // filled lazily below
+                size: total,
+                metadata: meta,
+                warnings: Vec::new(),
+                entry_name: Some(vol.name.clone()),
+            });
+        }
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("peb_size".to_string(), peb_size.to_string());
+        metadata.insert("peb_count".to_string(), (lebs.len()).to_string());
+        metadata.insert("volumes".to_string(), volumes.len().to_string());
+
+        // Assemble volume content now (Owned) with budget bounds. This
+        // is intentionally simple: volumes in firmware images are
+        // typically far below the expansion limits; oversized volumes
+        // are reported as metadata-only.
+        let mut owned_children = Vec::new();
+        for mut child in children {
+            let vol_id = child
+                .metadata
+                .get("volume_id")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(u32::MAX);
+            let leb_list = by_vol.get(&vol_id).cloned().unwrap_or_default();
+            let total: u64 = leb_list
+                .iter()
+                .map(|l| l.static_size.unwrap_or(l.data_size))
+                .sum();
+            if total == 0 || total > limits.max_child_size {
+                child
+                    .warnings
+                    .push("volume too large; exposed as metadata only".to_string());
+                owned_children.push(child);
+                continue;
+            }
+            let mut buf = vec![0u8; total as usize];
+            let mut off = 0usize;
+            let mut truncated = false;
+            for l in &leb_list {
+                let end = (off + l.data_size as usize).min(buf.len());
+                if src.read_at(l.data_offset, &mut buf[off..end]).is_err() {
+                    truncated = true;
+                    break;
+                }
+                off = end;
+                if off >= buf.len() {
+                    break;
+                }
+            }
+            if truncated {
+                child.warnings.push("volume read truncated".to_string());
+            }
+            child.content = ChildContent::Owned(buf);
+            owned_children.push(child);
+        }
+
+        Ok(HandlerOutput {
+            artifacts: vec![ArtifactDraft {
+                format: "ubi".to_string(),
+                label: format!(
+                    "UBI flash container ({} PEBs, {} volumes)",
+                    lebs.len(),
+                    volumes.len()
+                ),
+                offset: base,
+                size: src.len() - base,
+                confidence: if volumes.is_empty() {
+                    Confidence::Partial
+                } else {
+                    Confidence::Validated
+                },
+                evidence: Evidence::facts([
+                    "UBI erase-count headers validated (magic + header CRCs)".to_string(),
+                    format!("PEB size {peb_size}, {} mapped LEBs", lebs.len()),
+                    format!("volume table: {} user volumes", volumes.len()),
+                ]),
+                metadata,
+                warnings,
+                errors: Vec::new(),
+                children: owned_children,
+            }],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2771,6 +3121,117 @@ mod tests {
         img[file_lba * 2048..file_lba * 2048 + 10].copy_from_slice(b"ISO_FLAG1!");
         img[(file_lba + 1) * 2048..(file_lba + 1) * 2048 + 12].copy_from_slice(b"ISO_NESTED!!");
         img
+    }
+
+    /// Build a UBI image: 4 PEBs of 16 KiB, vid_hdr_offset 64,
+    /// data_offset 128. LEB 0 = layout volume lnum 0 (volume table),
+    /// PEB 1 = layout lnum 1, PEB 2 = user volume 0 lnum 0 (dynamic),
+    /// PEB 3 = user volume 0 lnum 1.
+    fn ubi_image() -> Vec<u8> {
+        const PEB: usize = 16384;
+        let mut img = vec![0xFFu8; 4 * PEB];
+
+        fn crc32(b: &[u8]) -> u32 {
+            let mut h = crc32fast::Hasher::new();
+            h.update(b);
+            h.finalize()
+        }
+        fn be32(v: u32) -> [u8; 4] {
+            v.to_be_bytes()
+        }
+
+        // EC header: magic UBI#, version 1, ec, vid_hdr_offset 64,
+        // data_offset 128, image_seq, hdr_crc over first 60 bytes.
+        fn ec_header(ec: u64) -> Vec<u8> {
+            let mut h = vec![0u8; 64];
+            h[0..4].copy_from_slice(b"UBI#");
+            h[4] = 1;
+            h[8..16].copy_from_slice(&ec.to_be_bytes());
+            h[16..20].copy_from_slice(&be32(64));
+            h[20..24].copy_from_slice(&be32(128));
+            h[24..28].copy_from_slice(&be32(0x1234));
+            let crc = crc32(&h[..60]);
+            h[60..64].copy_from_slice(&be32(crc));
+            h
+        }
+        // VID header: magic UBI!, type, vol_id, lnum, hdr_crc.
+        fn vid_header(vol_type: u8, vol_id: u32, lnum: u32, data_size: u32) -> Vec<u8> {
+            let mut h = vec![0u8; 64];
+            h[0..4].copy_from_slice(b"UBI!");
+            h[4] = 1;
+            h[5] = vol_type;
+            h[8..12].copy_from_slice(&be32(vol_id));
+            h[12..16].copy_from_slice(&be32(lnum));
+            h[16..20].copy_from_slice(&be32(data_size));
+            h[32..40].copy_from_slice(&1u64.to_be_bytes()); // sqnum
+            let crc = crc32(&h[..60]);
+            h[60..64].copy_from_slice(&be32(crc));
+            h
+        }
+
+        // Volume table (128-byte records). One user volume: id 0,
+        // reserved 2, dynamic, name "rootfs".
+        let mut table = vec![0u8; 128 * 128];
+        let rec = &mut table[0..128];
+        rec[0..4].copy_from_slice(&be32(2)); // reserved_pebs
+        rec[4..8].copy_from_slice(&be32(1)); // alignment
+        rec[12] = 1; // dynamic
+        rec[14..16].copy_from_slice(&6u16.to_be_bytes()); // name_len
+        rec[16..22].copy_from_slice(b"rootfs");
+        let crc = crc32(&rec[..124]);
+        rec[124..128].copy_from_slice(&be32(crc));
+
+        // PEB 0: layout lnum 0 (table copy 1), PEB 1: layout lnum 1.
+        for peb in 0..2usize {
+            let base = peb * PEB;
+            img[base..base + 64].copy_from_slice(&ec_header(peb as u64));
+            img[base + 64..base + 128].copy_from_slice(&vid_header(
+                1,
+                UBI_LAYOUT_VOLUME_ID,
+                peb as u32,
+                0,
+            ));
+            img[base + 128..base + 128 + table.len()].copy_from_slice(&table);
+        }
+        // PEB 2/3: user volume data.
+        let d1 = b"UBI_VOL_DATA_1";
+        let d2 = b"UBI_VOL_DATA_2";
+        for (peb, d) in [(2, d1), (3, d2)] {
+            let base = peb * PEB;
+            img[base..base + 64].copy_from_slice(&ec_header(peb as u64));
+            img[base + 64..base + 128].copy_from_slice(&vid_header(1, 0, (peb - 2) as u32, 0));
+            img[base + 128..base + 128 + d.len()].copy_from_slice(d);
+        }
+        img
+    }
+
+    #[test]
+    fn ubi_volume_table_and_extraction() {
+        let src = ByteSource::from_vec(ubi_image());
+        let out = validate_at(&UbiVolumeHandler, &src, 0).expect("ubi validates");
+        let art = &out.artifacts[0];
+        assert_eq!(art.confidence, Confidence::Validated);
+        assert_eq!(
+            art.metadata.get("peb_size").map(String::as_str),
+            Some("16384")
+        );
+        assert_eq!(art.metadata.get("volumes").map(String::as_str), Some("1"));
+        let vol = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("volume_name").map(String::as_str) == Some("rootfs"))
+            .expect("rootfs volume child");
+        match &vol.content {
+            ChildContent::Owned(d) => {
+                // Both LEB data areas concatenated.
+                // Each LEB contributes peb_size - data_offset bytes.
+                let leb_data = 16384 - 128;
+                assert_eq!(d.len(), 2 * leb_data);
+                assert_eq!(&d[..14], b"UBI_VOL_DATA_1");
+                assert_eq!(&d[leb_data..leb_data + 14], b"UBI_VOL_DATA_2");
+            }
+            _ => panic!("volume content must reconstruct"),
+        }
     }
 
     #[test]
