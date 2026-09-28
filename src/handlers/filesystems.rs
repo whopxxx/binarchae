@@ -7,8 +7,9 @@
 //! compressor id), inode/directory metadata walking is deferred; the
 //! archive region is claimed as one artifact with compressor metadata
 //! and honest Partial confidence for entry extraction.
-//! ISO9660: PVD detection at sector 16, volume metadata, root
-//! directory record extent (source-backed child when bounded).
+//! ISO9660: descriptor-chain validation (PVD + Joliet SVD), recursive
+//! directory traversal with source-backed file extents, multi-extent
+//! reconstruction.
 
 use crate::artifact::{Confidence, Evidence, RelationKind};
 use crate::bytesource::ByteSource;
@@ -462,10 +463,7 @@ impl SquashfsHandler {
                 let stored = frag.size & !COMPRESSED_BIT_BLOCK;
                 let uncompressed = frag.size & COMPRESSED_BIT_BLOCK != 0;
                 let frag_abs = sb.data_start + frag.start_block;
-                if stored > 0
-                    && frag_abs + u64::from(stored) <= src.len()
-                    && ino.offset < bs
-                {
+                if stored > 0 && frag_abs + u64::from(stored) <= src.len() && ino.offset < bs {
                     let mut raw = vec![0u8; stored as usize];
                     src.read_at(frag_abs, &mut raw)?;
                     let block = if uncompressed {
@@ -1071,25 +1069,399 @@ impl Handler for SquashfsHandler {
 
 pub struct Iso9660Handler;
 
+/// `flags` bit 0x2 marks a directory (fs/isofs/isoinode.c: `de->flags & 2`).
+const ISO_FLAG_DIR: u8 = 0x02;
+/// `flags` bit 0x80 marks a multi-extent file: another directory record
+/// holding the next section follows (isoinode.c: `more_entries =
+/// de->flags & 0x80`).
+const ISO_FLAG_MORE: u8 = 0x80;
+/// ISO9660 optical sector size. Volume descriptors and directory
+/// records never span a sector boundary: a zero record length means
+/// "skip to the rest of this sector" (fs/isofs/isoinode.c
+/// do_isofs_readdir).
+const ISO_SECTOR: u64 = 2048;
+/// The Primary Volume Descriptor occupies sector 16 of the image, so
+/// the image origin sits 32 KiB before it.
+const ISO_PVD_SECTOR: u64 = 16;
+/// Cap on how much of one directory extent is walked before truncating.
+const ISO_MAX_DIR_BYTES: u64 = 1024 * 1024;
+
+/// Layout verified against Linux fs/isofs (isofs.h, isoinode.c):
+/// - `struct iso_volume_descriptor`: type@0 (711), id@1..6 ("CD001"),
+///   version@6. Descriptors live in consecutive 2048-byte sectors from
+///   sector 16; the chain ends with a type-255 terminator.
+/// - `struct iso_primary_descriptor`: volume_id@40..72,
+///   volume_space_size@80..88 (733 both-endian), logical_block_size@
+///   128..130 (723), root_directory_record@156..190 (a 34-byte record).
+/// - `struct iso_supplementary_descriptor` (Joliet): escape@88..120.
+///   Joliet = escape[0] 0x25, escape[1] 0x2F, escape[2] 0x40 (level 1),
+///   0x43 (level 2) or 0x45 (level 3) (isoinode.c isofs_fill_super).
+///   Joliet identifiers and the volume id are UCS-2 big-endian. When a
+///   Joliet SVD is present the kernel switches the whole tree to the
+///   SVD root (`pri = (struct iso_primary_descriptor *) sec`), which we
+///   mirror.
+/// - `struct iso_directory_record`: length@0, ext_attr_length@1,
+///   extent@2..10 (733), size@10..18 (733), date@18..25, flags@25,
+///   volume_sequence_number@28..32, name_len@32, name[]@33. First data
+///   extent = 733(extent) + 711(ext_attr_length) (isoinode.c
+///   isofs_iget). Names carry a ";version" suffix that is not part of
+///   the identifier; single-byte names 0x00/0x01 are "." and "..".
+///
+/// Both-endian 733 field read little-endian (isofs isonum_733).
+fn iso733(b: &[u8]) -> u64 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64
+}
+
+/// Both-endian 723 field read little-endian (isofs isonum_723).
+fn iso723(b: &[u8]) -> u64 {
+    u16::from_le_bytes([b[0], b[1]]) as u64
+}
+
+/// Strip the ";1" version suffix and a trailing '.' from a level-1
+/// identifier.
+fn iso_name_ascii(raw: &[u8]) -> String {
+    let s = String::from_utf8_lossy(raw);
+    let base = s.split(';').next().unwrap_or("");
+    base.strip_suffix('.').unwrap_or(base).to_string()
+}
+
+/// Joliet identifiers are UCS-2 big-endian, also with ";1" suffixes.
+fn iso_name_utf16be(raw: &[u8]) -> String {
+    let mut units = Vec::with_capacity(raw.len() / 2);
+    for ch in raw.chunks_exact(2) {
+        units.push(u16::from_be_bytes([ch[0], ch[1]]));
+    }
+    let s = String::from_utf16_lossy(&units);
+    let base = s.split(';').next().unwrap_or("");
+    base.strip_suffix('.').unwrap_or(base).to_string()
+}
+
+fn iso_volume_id_ascii(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw)
+        .trim_end_matches([' ', '\0'])
+        .to_string()
+}
+
+fn iso_volume_id_utf16be(raw: &[u8]) -> String {
+    let mut units = Vec::with_capacity(raw.len() / 2);
+    for ch in raw.chunks_exact(2) {
+        units.push(u16::from_be_bytes([ch[0], ch[1]]));
+    }
+    String::from_utf16_lossy(&units)
+        .trim_end_matches([' ', '\0'])
+        .to_string()
+}
+
+/// The tree-relevant fields of a PVD or Joliet SVD.
+struct IsoDescriptor {
+    root_extent: u64,
+    root_size: u64,
+    volume_id: String,
+    logical_block: u64,
+    volume_space: u64,
+}
+
+fn parse_volume_descriptor(d: &[u8]) -> Option<IsoDescriptor> {
+    if &d[1..6] != b"CD001" {
+        return None;
+    }
+    let (volume_id, _joliet) = match d[0] {
+        1 => (iso_volume_id_ascii(&d[40..72]), false),
+        2 => (iso_volume_id_utf16be(&d[40..72]), true),
+        _ => return None,
+    };
+    let root = &d[156..156 + 34];
+    Some(IsoDescriptor {
+        root_extent: iso733(&root[2..6]) + u64::from(root[1]),
+        root_size: iso733(&root[10..14]),
+        volume_id,
+        logical_block: iso723(&d[128..132]),
+        volume_space: iso733(&d[80..88]),
+    })
+}
+
+/// One directory record as read from disk.
+struct IsoDirEntry {
+    extent: u64,
+    size: u64,
+    flags: u8,
+    name: String,
+}
+
+impl Iso9660Handler {
+    /// Parse one directory record at `off` in `buf`. Returns None when
+    /// the record is truncated.
+    fn parse_dir_entry(buf: &[u8], off: usize, joliet: bool) -> Option<(IsoDirEntry, usize)> {
+        let len = usize::from(*buf.get(off)?);
+        if len < 34 || off + len > buf.len() {
+            return None;
+        }
+        let r = &buf[off..off + len];
+        let name_len = usize::from(r[32]);
+        if 33 + name_len > len {
+            return None;
+        }
+        let raw_name = &r[33..33 + name_len];
+        let name = if name_len == 1 && raw_name[0] == 0 {
+            ".".to_string()
+        } else if name_len == 1 && raw_name[0] == 1 {
+            "..".to_string()
+        } else if joliet {
+            iso_name_utf16be(raw_name)
+        } else {
+            iso_name_ascii(raw_name)
+        };
+        Some((
+            IsoDirEntry {
+                extent: iso733(&r[2..6]) + u64::from(r[1]),
+                size: iso733(&r[10..14]),
+                flags: r[25],
+                name,
+            },
+            len,
+        ))
+    }
+
+    /// Walk one directory extent and emit children, recursing into
+    /// subdirectories. Extents are absolute LBAs from the image start
+    /// (`image_base` = candidate PVD sector − 32 KiB). Multi-extent
+    /// records (flag 0x80) chain extra directory records whose sizes
+    /// are summed with honest provenance.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_dir(
+        &self,
+        src: &ByteSource,
+        image_base: u64,
+        lba_size: u64,
+        extent: u64,
+        size: u64,
+        path: &str,
+        joliet: bool,
+        depth: u32,
+        limits: &crate::engine::EngineLimits,
+        warnings: &mut Vec<String>,
+        out: &mut Vec<ChildDraft>,
+    ) -> Result<()> {
+        if depth > 16 {
+            warnings.push("directory nesting deeper than 16 not walked".to_string());
+            return Ok(());
+        }
+        let walk_bytes = size.min(ISO_MAX_DIR_BYTES).min(limits.max_child_size);
+        let dir_abs = image_base + extent * lba_size;
+        if dir_abs + walk_bytes > src.len() {
+            warnings.push(format!(
+                "directory extent {extent} extends past source; truncated"
+            ));
+            return Ok(());
+        }
+        let mut buf = vec![0u8; walk_bytes as usize];
+        src.read_at(dir_abs, &mut buf)?;
+
+        let mut off = 0usize;
+        let mut visited: Vec<(u64, u64)> = Vec::new();
+        while off < buf.len() {
+            if out.len() >= limits.max_fs_entries {
+                warnings.push("max_fs_entries reached; walk truncated".to_string());
+                return Ok(());
+            }
+            // Records never span a sector; length 0 skips the rest of
+            // the current sector.
+            if buf[off] == 0 {
+                let next = ((off as u64 / ISO_SECTOR) + 1) * ISO_SECTOR;
+                if next as usize >= buf.len() {
+                    break;
+                }
+                off = next as usize;
+                continue;
+            }
+            let Some((de, len)) = Self::parse_dir_entry(&buf, off, joliet) else {
+                warnings.push(format!(
+                    "truncated directory record at extent offset {off}; walk stopped"
+                ));
+                return Ok(());
+            };
+            off += len;
+            if de.name == "." || de.name == ".." {
+                continue;
+            }
+            let child_path = if path.is_empty() {
+                de.name.clone()
+            } else {
+                format!("{path}/{}", de.name)
+            };
+            let is_dir = de.flags & ISO_FLAG_DIR != 0;
+            let mut meta = BTreeMap::new();
+            meta.insert("path".to_string(), child_path.clone());
+            meta.insert("extent_lba".to_string(), de.extent.to_string());
+            if de.flags & ISO_FLAG_MORE != 0 {
+                meta.insert("multi_extent".to_string(), "true".to_string());
+            }
+            let entry_name = Some(de.name.clone());
+            if is_dir {
+                // Loop guard: repeated directory extents are cyclic.
+                if visited.contains(&(de.extent, de.size)) {
+                    warnings.push(format!(
+                        "directory {child_path} repeats an already-visited extent; skipped"
+                    ));
+                    continue;
+                }
+                visited.push((de.extent, de.size));
+                meta.insert("type".to_string(), "directory".to_string());
+                out.push(ChildDraft {
+                    relation: RelationKind::FilesystemEntry,
+                    label: format!("iso9660 directory {child_path}"),
+                    format_hint: "metadata",
+                    content: ChildContent::Owned(Vec::new()),
+                    size: 0,
+                    metadata: meta,
+                    warnings: Vec::new(),
+                    entry_name,
+                });
+                self.walk_dir(
+                    src,
+                    image_base,
+                    lba_size,
+                    de.extent,
+                    de.size,
+                    &child_path,
+                    joliet,
+                    depth + 1,
+                    limits,
+                    warnings,
+                    out,
+                )?;
+                continue;
+            }
+            meta.insert("type".to_string(), "file".to_string());
+            meta.insert("declared_size".to_string(), de.size.to_string());
+            // Multi-extent (flag 0x80): the following records hold the
+            // further sections; sum their sizes.
+            let (total_size, sections) = if de.flags & ISO_FLAG_MORE != 0 {
+                let mut total = de.size;
+                let mut sections = 1u32;
+                let mut scan = off;
+                while sections <= 32 {
+                    let Some((next, next_len)) = Self::parse_dir_entry(&buf, scan, joliet) else {
+                        break;
+                    };
+                    scan += next_len;
+                    total += next.size;
+                    sections += 1;
+                    if next.flags & ISO_FLAG_MORE == 0 {
+                        break;
+                    }
+                }
+                off = scan;
+                (total, sections)
+            } else {
+                (de.size, 1)
+            };
+            if sections > 1 {
+                meta.insert("sections".to_string(), sections.to_string());
+            }
+            let content = self.file_content(
+                src, image_base, lba_size, de.extent, total_size, limits, warnings,
+            );
+            out.push(ChildDraft {
+                relation: if sections > 1 {
+                    RelationKind::ReconstructedFrom
+                } else {
+                    RelationKind::FilesystemEntry
+                },
+                label: format!(
+                    "iso9660 file {child_path} ({} bytes{})",
+                    content_size(&content),
+                    if sections > 1 {
+                        format!(", {sections} extents")
+                    } else {
+                        String::new()
+                    }
+                ),
+                format_hint: "raw",
+                content,
+                size: total_size,
+                metadata: meta,
+                warnings: if sections > 1 {
+                    vec![
+                        "multi-extent file reconstructed from chained directory records"
+                            .to_string(),
+                    ]
+                } else {
+                    Vec::new()
+                },
+                entry_name,
+            });
+        }
+        Ok(())
+    }
+
+    /// File content as a source-backed region when contiguous and in
+    /// bounds; Owned empty with a warning otherwise. File extents are
+    /// contiguous by construction in ISO9660.
+    #[allow(clippy::too_many_arguments)]
+    fn file_content(
+        &self,
+        src: &ByteSource,
+        image_base: u64,
+        lba_size: u64,
+        extent: u64,
+        size: u64,
+        limits: &crate::engine::EngineLimits,
+        warnings: &mut Vec<String>,
+    ) -> ChildContent {
+        if size == 0 {
+            return ChildContent::Owned(Vec::new());
+        }
+        let start = image_base + extent * lba_size;
+        if start + size > src.len() {
+            warnings.push(format!(
+                "file at LBA {extent} ({size} bytes) extends past source; not exposed"
+            ));
+            return ChildContent::Owned(Vec::new());
+        }
+        if size > limits.max_child_size {
+            warnings.push(format!(
+                "file at LBA {extent} ({size} bytes) exceeds max_child_size; not exposed"
+            ));
+            return ChildContent::Owned(Vec::new());
+        }
+        match src.slice(start, size) {
+            Ok(r) => ChildContent::Source(r),
+            Err(_) => ChildContent::Owned(Vec::new()),
+        }
+    }
+}
+
+fn content_size(c: &ChildContent) -> u64 {
+    match c {
+        ChildContent::Source(r) => r.len(),
+        ChildContent::Owned(v) => v.len() as u64,
+    }
+}
+
 impl Handler for Iso9660Handler {
     fn format(&self) -> &'static str {
         "iso9660"
     }
 
     fn find_candidates(&self, src: &ByteSource) -> Vec<Candidate> {
-        // PVD lives at sector 16 (offset 32768) with "CD001" at +1;
-        // embedded images sit at multiples of 2048 (optical sector).
+        // Volume descriptors sit in 2048-byte sectors starting at
+        // sector 16; "CD001" is at descriptor offset 1. Embedded images
+        // appear at multiples of 2048 inside larger artifacts.
         let data = match src.read_prefix(64 * 1024 * 1024) {
             Ok(d) => d,
             Err(_) => return Vec::new(),
         };
         let mut hits = Vec::new();
-        for i in 0..data.len().saturating_sub(32776) {
-            // Look for CD001 descriptors at 2048-aligned offsets.
-            if i % 2048 == 1 && &data[i..i + 5] == b"CD001" {
+        let mut i = 1usize;
+        while i + 5 <= data.len() {
+            if &data[i..i + 5] == b"CD001" {
                 hits.push(Candidate {
                     offset: i as u64 - 1,
                 });
+                i += 2048;
+            } else {
+                i += 1;
             }
         }
         hits.truncate(16);
@@ -1104,81 +1476,135 @@ impl Handler for Iso9660Handler {
         _budget: &mut Budget,
     ) -> Result<HandlerOutput> {
         let base = candidate.offset;
-        if base + 2048 > src.len() {
+        if base % ISO_SECTOR != 0 {
+            return Err(Error::Validation {
+                format: "iso9660",
+                reason: "volume descriptor not sector aligned".into(),
+            });
+        }
+        if base + ISO_SECTOR > src.len() {
             return Err(Error::Validation {
                 format: "iso9660",
                 reason: "volume descriptor truncated".into(),
             });
         }
-        let mut pvd = [0u8; 2048];
-        src.read_at(base, &mut pvd)?;
-        if pvd[0] != 1 {
-            // Only Primary Volume Descriptors claim the region.
+        // Walk the descriptor chain: PVD (type 1) is mandatory; a
+        // Joliet SVD (type 2 with %/@, %/C or %/E escape) overrides the
+        // tree; type 255 ends the chain. The candidate may be any
+        // descriptor in the chain, so scan backward too for the PVD.
+        let max_descriptors = 64i64;
+        let start_sector = (base / ISO_SECTOR) as i64;
+        let mut pvd: Option<IsoDescriptor> = None;
+        let mut svd: Option<IsoDescriptor> = None;
+        let mut terminated = false;
+        let mut first_sector: i64 = -1;
+        let mut d = [0u8; 2048];
+        for step in 0..max_descriptors {
+            let sector = start_sector + step;
+            let off = sector as u64 * ISO_SECTOR;
+            if off + ISO_SECTOR > src.len() {
+                break;
+            }
+            src.read_at(off, &mut d)?;
+            if &d[1..6] != b"CD001" {
+                break; // end of descriptor chain
+            }
+            if first_sector < 0 {
+                first_sector = sector;
+            }
+            match d[0] {
+                1 => {
+                    if pvd.is_none() {
+                        pvd = parse_volume_descriptor(&d);
+                    }
+                }
+                2 => {
+                    // Joliet SVD escape sequence (isoinode.c).
+                    if d[88] == 0x25
+                        && d[89] == 0x2F
+                        && matches!(d[90], 0x40 | 0x43 | 0x45)
+                        && svd.is_none()
+                    {
+                        svd = parse_volume_descriptor(&d);
+                    }
+                }
+                255 => {
+                    terminated = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if terminated && first_sector < 0 {
             return Err(Error::Validation {
                 format: "iso9660",
-                reason: format!("descriptor type {} (only PVD=1 claims)", pvd[0]),
+                reason: "terminator without any volume descriptor".into(),
             });
         }
-        // Volume space size is a both-endian field: LE at 80..84
-        // (repeated big-endian at 84..88).
-        let size_le = u32::from_le_bytes([pvd[80], pvd[81], pvd[82], pvd[83]]) as u64;
-        let logical_block = u16::from_le_bytes([pvd[128], pvd[129]]) as u64;
-        if logical_block != 512 && logical_block != 1024 && logical_block != 2048 {
+        let Some(pvd) = pvd else {
+            return Err(Error::Validation {
+                format: "iso9660",
+                reason: "no Primary Volume Descriptor in chain".into(),
+            });
+        };
+        // The PVD anchors the image origin: sector 16 of the volume.
+        let image_base =
+            (first_sector.max(ISO_PVD_SECTOR as i64) as u64 - ISO_PVD_SECTOR) * ISO_SECTOR;
+        // Kernel semantics: Joliet tree wins when present (isoinode.c
+        // switches `pri` to the supplementary descriptor).
+        let (tree, joliet) = match &svd {
+            Some(s) => (s, true),
+            None => (&pvd, false),
+        };
+        let logical_block = tree.logical_block;
+        if !(512..=32768).contains(&logical_block) || !logical_block.is_power_of_two() {
             return Err(Error::Validation {
                 format: "iso9660",
                 reason: format!("implausible logical block size {logical_block}"),
             });
         }
-        let root_record = &pvd[156..156 + 34];
-        let root_extent = u32::from_le_bytes([
-            root_record[2],
-            root_record[3],
-            root_record[4],
-            root_record[5],
-        ]) as u64;
-        let root_len = u32::from(root_record[10]) as u64;
 
-        let volume_id = String::from_utf8_lossy(&pvd[40..72])
-            .trim_end_matches([' ', '\0'])
-            .to_string();
-
-        let total_bytes = size_le * logical_block;
-        // Root directory: source-backed child when it fits.
         let mut children = Vec::new();
         let mut warnings = Vec::new();
-        let root_off = root_extent * logical_block;
-        if root_len > 0 && root_off + root_len <= src.len() {
-            if children.len() < limits.max_fs_entries {
-                let region = src.slice(root_off, root_len)?;
-                let mut meta = BTreeMap::new();
-                meta.insert("path".to_string(), "/".to_string());
-                meta.insert("extent_lba".to_string(), root_extent.to_string());
-                children.push(ChildDraft {
-                    relation: RelationKind::FilesystemEntry,
-                    label: format!("ISO root directory ({root_len} bytes)"),
-                    format_hint: "raw",
-                    content: ChildContent::Source(region),
-                    size: root_len,
-                    metadata: meta,
-                    warnings: Vec::new(),
-                    entry_name: Some("/".to_string()),
-                });
-            }
-        } else if root_len > 0 {
-            warnings.push("root directory extent past source; not exposed".to_string());
+        if tree.root_size > 0 {
+            self.walk_dir(
+                src,
+                image_base,
+                logical_block,
+                tree.root_extent,
+                tree.root_size,
+                "",
+                joliet,
+                0,
+                limits,
+                &mut warnings,
+                &mut children,
+            )?;
+        } else {
+            warnings.push("root directory record has zero size".to_string());
         }
 
         let mut metadata = BTreeMap::new();
-        metadata.insert("volume_id".to_string(), volume_id.clone());
+        metadata.insert("volume_id".to_string(), pvd.volume_id.clone());
+        if let Some(s) = &svd {
+            metadata.insert("joliet_volume_id".to_string(), s.volume_id.clone());
+        }
         metadata.insert("logical_block_size".to_string(), logical_block.to_string());
-        metadata.insert("volume_sectors".to_string(), size_le.to_string());
+        metadata.insert("joliet".to_string(), joliet.to_string());
+        metadata.insert("entries".to_string(), children.len().to_string());
 
+        let total_bytes = tree.volume_space * logical_block;
         Ok(HandlerOutput {
             artifacts: vec![ArtifactDraft {
                 format: "iso9660".to_string(),
-                label: format!("ISO9660 image \"{volume_id}\""),
+                label: format!(
+                    "ISO9660 image \"{}\"{} ({} entries)",
+                    tree.volume_id,
+                    if joliet { " [Joliet]" } else { "" },
+                    children.len()
+                ),
                 offset: base,
-                size: total_bytes.min(src.len() - base),
+                size: total_bytes.max(ISO_SECTOR).min(src.len() - base),
                 confidence: if children.is_empty() {
                     Confidence::Partial
                 } else {
@@ -1186,8 +1612,13 @@ impl Handler for Iso9660Handler {
                 },
                 evidence: Evidence::facts([
                     "Primary Volume Descriptor validated (type 1, CD001)".to_string(),
-                    format!("volume id {volume_id:?}"),
+                    if joliet {
+                        "Joliet SVD present; using UCS-2 tree".to_string()
+                    } else {
+                        "no Joliet SVD; using level-1 ASCII tree".to_string()
+                    },
                     format!("logical block size {logical_block}"),
+                    format!("root directory walked: {} entries", children.len()),
                 ]),
                 metadata,
                 warnings,
@@ -1557,24 +1988,115 @@ mod tests {
         }
     }
 
-    #[test]
-    fn iso_pvd_finds_root_extent() {
-        // Image of 64 sectors of 2048; PVD at sector 16.
-        let sectors = 64u64;
-        let mut img = vec![0u8; (sectors * 2048) as usize];
+    /// Build an ISO9660 image: PVD at sector 16, root dir at LBA 18,
+    /// one nested directory and two files. `joliet` adds a supplementary
+    /// descriptor (sector 17) with a UCS-2 volume id and its own tree.
+    fn iso_image(joliet: bool) -> Vec<u8> {
+        let mut img = vec![0u8; 40 * 2048];
+
+        // Both-endian 733 write.
+        fn put733(buf: &mut [u8], off: usize, v: u32) {
+            buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            buf[off + 4..off + 8].copy_from_slice(&v.to_be_bytes());
+        }
+        // Write a 34-byte directory record. Returns bytes consumed.
+        fn put_record(
+            buf: &mut [u8],
+            off: usize,
+            extent: u32,
+            size: u32,
+            flags: u8,
+            name: &[u8],
+        ) -> usize {
+            let name_len = name.len();
+            let rec_len = 33 + name_len + (1 - name_len % 2); // pad to even
+            buf[off] = rec_len as u8;
+            buf[off + 1] = 0; // ext_attr_length
+            put733(buf, off + 2, extent);
+            put733(buf, off + 10, size);
+            buf[off + 25] = flags;
+            buf[off + 32] = name_len as u8;
+            buf[off + 33..off + 33 + name_len].copy_from_slice(name);
+            rec_len
+        }
+
+        // PVD at sector 16.
         let pvd = 16 * 2048;
-        img[pvd] = 1; // type: PVD
+        img[pvd] = 1;
         img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
         img[pvd + 40..pvd + 49].copy_from_slice(b"CTF_IMAGE");
-        // volume size: 64 blocks of 2048.
-        img[pvd + 80..pvd + 84].copy_from_slice(&64u32.to_le_bytes());
+        put733(&mut img, pvd + 80, 40); // volume space: 40 sectors
         img[pvd + 128..pvd + 130].copy_from_slice(&2048u16.to_le_bytes());
-        // Root record at 156: len 34, extent 18, size 2048.
-        img[pvd + 156 + 2..pvd + 156 + 6].copy_from_slice(&18u32.to_le_bytes());
-        img[pvd + 156 + 10] = 34;
-        // Root content marker at LBA 18.
-        img[18 * 2048..18 * 2048 + 8].copy_from_slice(b"ISODATA1");
-        let src = ByteSource::from_vec(img);
+        img[pvd + 130..pvd + 132].copy_from_slice(&2048u16.to_be_bytes());
+        // Root record: extent 18, size 2048, dir flag.
+        let rlen = put_record(&mut img, pvd + 156, 18, 2048, 0x02, b"\x00");
+        assert_eq!(rlen, 34);
+
+        if joliet {
+            // SVD at sector 17 with escape %/@ (level 1).
+            let svd = 17 * 2048;
+            img[svd] = 2;
+            img[svd + 1..svd + 6].copy_from_slice(b"CD001");
+            let vol: Vec<u8> = "CTF_ISO"
+                .encode_utf16()
+                .flat_map(|u| u.to_be_bytes())
+                .collect();
+            img[svd + 40..svd + 40 + vol.len()].copy_from_slice(&vol);
+            img[svd + 88] = 0x25;
+            img[svd + 89] = 0x2F;
+            img[svd + 90] = 0x40;
+            put733(&mut img, svd + 80, 40);
+            img[svd + 128..svd + 130].copy_from_slice(&2048u16.to_le_bytes());
+            img[svd + 130..svd + 132].copy_from_slice(&2048u16.to_be_bytes());
+            let _ = put_record(&mut img, svd + 156, 20, 2048, 0x02, b"\x00");
+        }
+
+        // Joliet identifiers are UCS-2 big-endian without version
+        // suffixes.
+        let u16be = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_be_bytes).collect() };
+        let flag_name: Vec<u8> = if joliet {
+            u16be("FLAG.TXT")
+        } else {
+            b"FLAG.TXT;1".to_vec()
+        };
+        let dir_name: Vec<u8> = if joliet {
+            u16be("DIR")
+        } else {
+            b"DIR;1".to_vec()
+        };
+        let nested_name: Vec<u8> = if joliet {
+            u16be("NESTED.TXT")
+        } else {
+            b"NESTED.TXT;1".to_vec()
+        };
+        let dir_lba = if joliet { 20 } else { 18 };
+        let file_lba = if joliet { 22 } else { 20 };
+        let dir = dir_lba * 2048;
+        // Root listing: FLAG.TXT (file @file_lba, 10 bytes), then a
+        // subdirectory DIR (dir_lba+1, 2048 bytes), then the next file
+        // NESTED.TXT inside the subdirectory.
+        let mut off = dir;
+        // "." and ".."
+        off += put_record(&mut img, off, dir_lba as u32, 2048, 0x02, b"\x00");
+        off += put_record(&mut img, off, dir_lba as u32, 2048, 0x02, b"\x01");
+        off += put_record(&mut img, off, file_lba as u32, 10, 0, &flag_name);
+        let sub_lba = dir_lba + 1;
+        let _ = put_record(&mut img, off, sub_lba as u32, 2048, 0x02, &dir_name);
+        // Subdirectory listing (pad to next record position).
+        let sub = sub_lba * 2048;
+        let mut soff = sub;
+        soff += put_record(&mut img, soff, sub_lba as u32, 2048, 0x02, b"\x00");
+        soff += put_record(&mut img, soff, dir_lba as u32, 2048, 0x02, b"\x01");
+        let _ = put_record(&mut img, soff, (file_lba + 1) as u32, 12, 0, &nested_name);
+        img[file_lba * 2048..file_lba * 2048 + 10].copy_from_slice(b"ISO_FLAG1!");
+        img[(file_lba + 1) * 2048..(file_lba + 1) * 2048 + 12].copy_from_slice(b"ISO_NESTED!!");
+        img
+    }
+
+    #[test]
+    fn iso_recursive_traversal() {
+        let src = ByteSource::from_vec(iso_image(false));
+        let pvd = 16 * 2048;
         let out = validate_at(&Iso9660Handler, &src, pvd as u64).expect("iso validates");
         let art = &out.artifacts[0];
         assert_eq!(art.confidence, Confidence::Validated);
@@ -1582,14 +2104,72 @@ mod tests {
             art.metadata.get("volume_id").map(String::as_str),
             Some("CTF_IMAGE")
         );
-        match &art.children[0].content {
+        assert_eq!(
+            art.metadata.get("joliet").map(String::as_str),
+            Some("false")
+        );
+        let flag = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("path").map(String::as_str) == Some("FLAG.TXT"))
+            .expect("FLAG.TXT child");
+        assert_eq!(flag.size, 10);
+        match &flag.content {
             ChildContent::Source(r) => {
-                let mut buf = [0u8; 8];
+                let mut buf = [0u8; 10];
                 r.read_at(0, &mut buf).unwrap();
-                assert_eq!(&buf, b"ISODATA1");
+                assert_eq!(&buf, b"ISO_FLAG1!");
             }
-            _ => panic!("root dir must be source-backed"),
+            _ => panic!("file must be source-backed"),
         }
+        let nested = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("path").map(String::as_str) == Some("DIR/NESTED.TXT"))
+            .expect("nested child");
+        assert_eq!(nested.size, 12);
+        match &nested.content {
+            ChildContent::Source(r) => {
+                let mut buf = [0u8; 12];
+                r.read_at(0, &mut buf).unwrap();
+                assert_eq!(&buf, b"ISO_NESTED!!");
+            }
+            _ => panic!("nested file must be source-backed"),
+        }
+    }
+
+    #[test]
+    fn iso_joliet_tree_preferred() {
+        let src = ByteSource::from_vec(iso_image(true));
+        let pvd = 16 * 2048;
+        let out = validate_at(&Iso9660Handler, &src, pvd as u64).expect("iso validates");
+        let art = &out.artifacts[0];
+        assert_eq!(art.confidence, Confidence::Validated);
+        assert_eq!(art.metadata.get("joliet").map(String::as_str), Some("true"));
+        assert_eq!(
+            art.metadata.get("joliet_volume_id").map(String::as_str),
+            Some("CTF_ISO")
+        );
+        // The Joliet tree lives at LBA 20/22; FLAG.TXT must come from
+        // there (content identical, but the extent metadata differs).
+        let flag = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("path").map(String::as_str) == Some("FLAG.TXT"))
+            .expect("FLAG.TXT in joliet tree");
+        assert_eq!(
+            flag.metadata.get("extent_lba").map(String::as_str),
+            Some("22")
+        );
+        let dir = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("path").map(String::as_str) == Some("DIR"))
+            .expect("DIR in joliet tree");
+        assert_eq!(
+            dir.metadata.get("type").map(String::as_str),
+            Some("directory")
+        );
     }
 
     #[test]
