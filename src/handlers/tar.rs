@@ -116,15 +116,18 @@ impl Handler for TarHandler {
                 })?;
             if data_end > src.len() {
                 // Truncated final entry: salvage the bytes that exist.
+                // FINAL-B1: `have` is bounded by the SOURCE length (an
+                // honest already-in-memory bound, not a declared one),
+                // and the budget is charged before the allocation.
                 let have = src.len() - data_start;
-                let mut buf = vec![0u8; have as usize];
-                src.read_at(data_start, &mut buf)?;
                 if !budget.charge(limits, have) {
                     return Err(Error::LimitExceeded {
                         limit: "max-total-expanded-bytes",
                         detail: format!("tar salvage {name:?} +{have} bytes"),
                     });
                 }
+                let mut buf = vec![0u8; have as usize];
+                src.read_at(data_start, &mut buf)?;
                 let _ = typeflag;
                 names.push(name.clone());
                 children.push(ChildDraft {

@@ -2164,20 +2164,24 @@ impl Jffs2Handler {
                 continue;
             }
             let take = (f.dsize as u64).min(isize - start) as usize;
-            let mut raw = vec![0u8; f.csize as usize];
-            if f.data_abs + f.csize as u64 > src.len() {
+            // FINAL-B1: bounds-check csize BEFORE allocating `raw`, and
+            // cap dsize so a hostile fragment cannot request a huge
+            // decompressed allocation (dsize feeds vec! inside the
+            // decompressors).
+            if f.csize as u64 > limits.max_child_size || f.data_abs + f.csize as u64 > src.len() {
                 warnings.push(format!(
                     "inode {ino}: fragment data at {} out of bounds; skipped",
                     f.data_abs
                 ));
                 continue;
             }
+            let mut raw = vec![0u8; f.csize as usize];
             src.read_at(f.data_abs, &mut raw)?;
             if crc32fast::hash(&raw) != f.data_crc {
                 warnings.push(format!("inode {ino}: fragment data CRC mismatch; skipped"));
                 continue;
             }
-            let decoded = match Self::decompress_fragment(f.compr, &raw, f.dsize as usize)? {
+            let decoded = match Self::decompress_fragment(f.compr, &raw, take)? {
                 Some(d) => d,
                 None => {
                     warnings.push(format!(

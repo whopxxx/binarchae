@@ -593,9 +593,16 @@ impl Handler for SevenZHandler {
                                 "entry {} exceeds max_child_size; skipped",
                                 entry.name()
                             ));
-                            // Drain politely so the block decoder stays in sync.
-                            let mut sink = Vec::new();
-                            let _ = stream.read_to_end(&mut sink);
+                            // FINAL-B1: drain with a FIXED buffer (read
+                            // into a scratch chunk, discard) so an
+                            // attacker-declared huge entry can never
+                            // grow an allocation.
+                            let mut scratch = [0u8; 64 * 1024];
+                            while let Ok(n) = stream.read(&mut scratch) {
+                                if n == 0 {
+                                    break;
+                                }
+                            }
                             return Ok(true);
                         }
                         let mut out = Vec::new();
@@ -685,16 +692,30 @@ struct RarMember {
 
 impl RarHandler {
     /// Decode one member trying each password candidate (empty first).
+    /// FINAL-B1: `read_member_at` materializes the whole member, so the
+    /// caller MUST gate on the header's declared unpacked size before
+    /// calling this — the resource limit has to prevent the allocation,
+    /// not observe it after the fact.
     fn decode_member(
         archive: &rars::Archive,
         index: usize,
         limits: &crate::engine::EngineLimits,
+        declared: u64,
     ) -> Result<Option<RarMember>> {
+        if declared > limits.max_child_size {
+            return Err(Error::Validation {
+                format: "rar",
+                reason: format!("member declared size {declared} exceeds max_child_size"),
+            });
+        }
         let mut candidates: Vec<Option<String>> = vec![None];
         candidates.extend(limits.passwords.iter().cloned().map(Some));
         for candidate in candidates {
             match archive.read_member_at(index, candidate.as_deref().map(str::as_bytes)) {
                 Ok(Some(data)) => {
+                    // Defense in depth: a lying header that passed the
+                    // declared-size gate still cannot deliver more
+                    // bytes than the limit.
                     if data.len() as u64 > limits.max_child_size {
                         return Err(Error::Validation {
                             format: "rar",
@@ -778,7 +799,7 @@ impl Handler for RarHandler {
                     member_count += 1;
                     let name = member.meta.name_lossy();
                     let declared = member.meta.unpacked_size;
-                    match Self::decode_member(&archive, index, limits)? {
+                    match Self::decode_member(&archive, index, limits, declared)? {
                         Some(member_bytes) => {
                             if let Some(p) = member_bytes.password {
                                 encrypted_hits = true;

@@ -467,11 +467,14 @@ impl ExtHandler {
         budget: &mut Budget,
         warnings: &mut Vec<String>,
     ) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(ino.size as usize);
+        // FINAL-B1: bound-check BEFORE any allocation. `ino.size` is
+        // attacker-controlled; with_capacity on it invited a multi-GiB
+        // OOM (fuzz-found: 0xffff0000 → ~4 GiB).
         if ino.size > limits.max_child_size {
             warnings.push("file exceeds max_child_size; truncated".to_string());
             return Ok(Vec::new());
         }
+        let mut out = Vec::with_capacity(ino.size as usize);
         if ino.uses_extents() {
             let mut runs = Vec::new();
             Self::walk_extents(
@@ -786,12 +789,15 @@ impl ExtHandler {
                 });
                 return Ok(());
             }
+            let data_len = data.len() as u64;
             out.push(ChildDraft {
                 relation: RelationKind::ReconstructedFrom,
-                label: format!("ext file {child_path} ({} bytes)", data.len()),
+                label: format!("ext file {child_path} ({data_len} bytes)"),
                 format_hint: "raw",
                 content: ChildContent::Owned(data),
-                size: inode.size,
+                // FINAL-B1: report what was RECONSTRUCTED, never the
+                // attacker-controlled declared size.
+                size: data_len,
                 metadata: meta,
                 warnings: vec!["content reconstructed from block pointers".to_string()],
                 entry_name,
@@ -1134,5 +1140,37 @@ mod tests {
             ChildContent::Owned(d) => assert_eq!(*d, b"EXTENT_DATA_1234".to_vec()),
             _ => panic!("extent file must reconstruct"),
         }
+    }
+
+    /// FINAL-B1 regression (fuzz OOM): a hostile inode declaring
+    /// size 0xffff0000 (~4 GiB) must be rejected by max_child_size
+    /// BEFORE any allocation, not after.
+    #[test]
+    fn ext4_huge_inode_size_not_allocated() {
+        let mut img = ext4_extent_image();
+        let f = 4096 + (12 - 1) * INODE_SIZE as usize;
+        img[f + 4..f + 8].copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
+        let src = ByteSource::from_vec(img);
+        // Must not OOM/abort. The child is emitted with EMPTY content
+        // (read_file bails before allocating) and the warning explains
+        // the truncation.
+        let out = validate_at(&src, 0).expect("ext4 validates");
+        let art = &out.artifacts[0];
+        let child = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("path").map(String::as_str) == Some("DATA.BIN"))
+            .expect("entry still listed");
+        assert_eq!(child.size, 0, "no oversized content exposed");
+        match &child.content {
+            ChildContent::Owned(d) => assert!(d.is_empty(), "no huge allocation delivered"),
+            _ => panic!("owned empty content expected"),
+        }
+        assert!(
+            art.warnings
+                .iter()
+                .any(|w| w.contains("exceeds max_child_size")),
+            "honest warning expected"
+        );
     }
 }
