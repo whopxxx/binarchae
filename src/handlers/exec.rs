@@ -811,7 +811,8 @@ struct OleHeader {
 
 impl OleHandler {
     fn parse_header(src: &ByteSource, base: u64) -> Result<OleHeader> {
-        let mut hdr = [0u8; 80];
+        // DIFAT[109] spans 0x4C..0x200; read the full 512-byte header.
+        let mut hdr = [0u8; 512];
         src.read_at(base, &mut hdr)?;
         let sector_shift = u16::from_le_bytes([hdr[30], hdr[31]]);
         let mini_shift = u16::from_le_bytes([hdr[32], hdr[33]]);
@@ -823,8 +824,11 @@ impl OleHandler {
         }
         let num_fat = u32::from_le_bytes(hdr[0x2C..0x30].try_into().unwrap());
         let first_dir_sector = u32::from_le_bytes(hdr[0x30..0x34].try_into().unwrap());
-        let mini_cutoff = u64::from_le_bytes(hdr[0x38..0x40].try_into().unwrap());
-        if mini_cutoff != OLE_MINI_CUTOFF {
+        // MS-CFB 2.2: 0x34 transaction, 0x38 mini-stream cutoff (u32),
+        // 0x3C first mini FAT sector, 0x40 num mini FAT sectors,
+        // 0x44 first DIFAT sector, 0x48 num DIFAT sectors.
+        let mini_cutoff = u32::from_le_bytes(hdr[0x38..0x3C].try_into().unwrap());
+        if u64::from(mini_cutoff) != OLE_MINI_CUTOFF {
             return Err(Error::Validation {
                 format: "ole",
                 reason: format!("unsupported mini-stream cutoff {mini_cutoff}"),
@@ -955,6 +959,136 @@ impl OleHandler {
         }
         Ok(entries)
     }
+
+    /// FINAL-B5: read the mini-FAT chain (mini FAT sectors follow a FAT
+    /// chain rooted at hdr.mini_fat_start) into u32 entries.
+    fn read_mini_fat(
+        src: &ByteSource,
+        base: u64,
+        hdr: &OleHeader,
+        fat: &[u32],
+        limits: &crate::engine::EngineLimits,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<u32>> {
+        let entries_per_sector = hdr.sector_size as usize / 4;
+        let chain = Self::follow_chain(fat, hdr.mini_fat_start, limits.max_records, warnings);
+        let mut mini_fat = Vec::new();
+        let mut buf = vec![0u8; hdr.sector_size as usize];
+        for s in &chain {
+            src.read_at(base + (1 + u64::from(*s)) * hdr.sector_size, &mut buf)?;
+            for c in buf.chunks_exact(4) {
+                mini_fat.push(u32::from_le_bytes(c.try_into().unwrap()));
+            }
+        }
+        Ok(mini_fat
+            .into_iter()
+            .take(entries_per_sector * chain.len().min(limits.max_records))
+            .collect())
+    }
+
+    /// Read the mini-stream (root entry's own sector chain) as raw bytes.
+    fn read_mini_stream(
+        src: &ByteSource,
+        base: u64,
+        hdr: &OleHeader,
+        fat: &[u32],
+        root: &OleDirEntry,
+        limits: &crate::engine::EngineLimits,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<u8>> {
+        let chain = Self::follow_chain(fat, root.start_sector, limits.max_records, warnings);
+        let max_bytes = limits
+            .max_child_size
+            .min(limits.max_records.max(1) as u64 * hdr.sector_size);
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; hdr.sector_size as usize];
+        for s in &chain {
+            src.read_at(base + (1 + u64::from(*s)) * hdr.sector_size, &mut buf)?;
+            out.extend_from_slice(&buf);
+            if out.len() as u64 > max_bytes {
+                warnings.push("mini-stream exceeds extraction cap; truncated".to_string());
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Extract one stream's bytes: regular FAT streams come from the
+    /// sector chain; mini streams come from the root's mini-stream
+    /// sliced by the mini-FAT chain. Extraction is budget-capped.
+    #[allow(clippy::too_many_arguments)]
+    fn extract_stream(
+        src: &ByteSource,
+        base: u64,
+        hdr: &OleHeader,
+        fat: &[u32],
+        mini_fat: &[u32],
+        mini_stream: &[u8],
+        entry: &OleDirEntry,
+        budget: &mut Budget,
+        limits: &crate::engine::EngineLimits,
+        warnings: &mut Vec<String>,
+    ) -> Option<Vec<u8>> {
+        if entry.size == 0 || entry.size > limits.max_child_size {
+            return None;
+        }
+        if entry.size < OLE_MINI_CUTOFF {
+            // Mini stream: follow the mini-FAT chain.
+            let mini_ss = hdr.mini_sector_size as usize;
+            let mut out = Vec::new();
+            let mut cur = entry.start_sector;
+            const ENDOFCHAIN: u32 = 0xFFFF_FFFE;
+            const FREESECT: u32 = 0xFFFF_FFFF;
+            while cur != ENDOFCHAIN && cur != FREESECT {
+                if cur as usize >= mini_fat.len() {
+                    warnings.push("mini-FAT chain past table; truncated".to_string());
+                    break;
+                }
+                let start = cur as usize * mini_ss;
+                let end = start + mini_ss;
+                if end > mini_stream.len() {
+                    warnings.push("mini-stream slice out of range; truncated".to_string());
+                    break;
+                }
+                out.extend_from_slice(&mini_stream[start..end]);
+                if out.len() as u64 >= entry.size {
+                    break;
+                }
+                cur = mini_fat[cur as usize];
+            }
+            out.truncate(entry.size as usize);
+            Some(out)
+        } else {
+            // Regular stream: sector chain.
+            let chain = Self::follow_chain(fat, entry.start_sector, limits.max_records, warnings);
+            let mut out = Vec::new();
+            let mut buf = vec![0u8; hdr.sector_size as usize];
+            for s in &chain {
+                if src
+                    .read_at(base + (1 + u64::from(*s)) * hdr.sector_size, &mut buf)
+                    .is_err()
+                {
+                    warnings.push("FAT chain sector unreadable; truncated".to_string());
+                    break;
+                }
+                out.extend_from_slice(&buf);
+                if out.len() as u64 >= entry.size {
+                    break;
+                }
+            }
+            out.truncate(entry.size as usize);
+            Some(out)
+        }
+        .and_then(|bytes| {
+            // Budget: only commit if the run-wide accounting accepts.
+            if budget.charge(limits, bytes.len() as u64) {
+                Some(bytes)
+            } else {
+                warnings.push("stream extraction budget exhausted".to_string());
+                None
+            }
+        })
+    }
 }
 
 fn fat_sectors_len(hdr: &OleHeader) -> usize {
@@ -978,7 +1112,7 @@ impl Handler for OleHandler {
         src: &ByteSource,
         candidate: Candidate,
         limits: &crate::engine::EngineLimits,
-        _budget: &mut Budget,
+        budget: &mut Budget,
     ) -> Result<HandlerOutput> {
         let base = candidate.offset;
         if base + 80 > src.len() {
@@ -1012,7 +1146,13 @@ impl Handler for OleHandler {
             });
         }
 
-        // Walk the red-black tree of each storage, listing streams.
+        // Walk the red-black tree of each storage; FINAL-B5 extracts
+        // stream bytes (regular FAT chains and mini-FAT streams from
+        // the root's mini-stream) as children with provenance.
+        let root = entries[0].clone();
+        let mini_fat = Self::read_mini_fat(src, base, &hdr, &fat, limits, &mut warnings)?;
+        let mini_stream =
+            Self::read_mini_stream(src, base, &hdr, &fat, &root, limits, &mut warnings)?;
         let mut visited = std::collections::HashSet::new();
         fn visit(
             entries: &[OleDirEntry],
@@ -1050,6 +1190,65 @@ impl Handler for OleHandler {
         let mut names = Vec::new();
         visit(&entries, entries[0].child, "", &mut visited, &mut names);
 
+        // FINAL-B5: extract streams as children (bounded + budgeted).
+        let mut children: Vec<ChildDraft> = Vec::new();
+        {
+            let mut ordered = std::collections::HashSet::new();
+            let mut stack = vec![(entries[0].child, String::new())];
+            while let Some((i, p)) = stack.pop() {
+                if i == OLE_NOSTREAM || !ordered.insert(i) || i as usize >= entries.len() {
+                    continue;
+                }
+                let e = &entries[i as usize];
+                let child_path = if p.is_empty() {
+                    e.name.clone()
+                } else {
+                    format!("{p}/{}", e.name)
+                };
+                if e.obj_type == OBJ_STREAM {
+                    if children.len() >= limits.max_archive_entries {
+                        warnings.push("stream child cap reached; extraction truncated".to_string());
+                    } else if let Some(bytes) = Self::extract_stream(
+                        src,
+                        base,
+                        &hdr,
+                        &fat,
+                        &mini_fat,
+                        &mini_stream,
+                        e,
+                        budget,
+                        limits,
+                        &mut warnings,
+                    ) {
+                        let mut meta = BTreeMap::new();
+                        meta.insert("path".to_string(), child_path.clone());
+                        meta.insert(
+                            "storage".to_string(),
+                            if e.size < OLE_MINI_CUTOFF {
+                                "mini-fat"
+                            } else {
+                                "fat"
+                            }
+                            .to_string(),
+                        );
+                        children.push(ChildDraft {
+                            relation: RelationKind::Contains,
+                            label: format!("OLE stream {child_path} ({} bytes)", bytes.len()),
+                            format_hint: "raw",
+                            content: ChildContent::Owned(bytes),
+                            size: e.size,
+                            metadata: meta,
+                            warnings: Vec::new(),
+                            entry_name: Some(child_path.replace('/', "_")),
+                        });
+                    }
+                }
+                stack.push((e.left, p.clone()));
+                stack.push((e.right, p.clone()));
+                stack.push((e.child, child_path.clone()));
+            }
+        }
+
         let mut metadata = BTreeMap::new();
         metadata.insert("major_version".to_string(), major.to_string());
         metadata.insert("sector_size".to_string(), hdr.sector_size.to_string());
@@ -1079,7 +1278,7 @@ impl Handler for OleHandler {
                 metadata,
                 warnings,
                 errors: Vec::new(),
-                children: Vec::new(),
+                children,
             }],
         })
     }
@@ -1434,5 +1633,151 @@ mod exec_tests {
                 .contains('X'),
             ".data must not be executable"
         );
+    }
+    /// FINAL-B5: synthetic CFB (v3, 512B sectors) with one regular FAT
+    /// stream and one mini-FAT stream; both must be extracted as
+    /// children with the correct storage provenance.
+    fn ole_cfb() -> Vec<u8> {
+        const SS: usize = 512;
+        let mut f: Vec<u8> = Vec::new();
+        // Header (512 bytes).
+        f.extend_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        f.extend([0u8; 16]); // CLSID
+        f.extend(0x003Eu16.to_le_bytes()); // minor
+        f.extend(0x0003u16.to_le_bytes()); // major v3
+        f.extend(0xFFFEu16.to_le_bytes()); // byte order
+        f.extend(9u16.to_le_bytes()); // sector shift (512)
+        f.extend(6u16.to_le_bytes()); // mini shift (64)
+        f.extend([0u8; 6]); // reserved + dir sect len
+        f.extend(0u32.to_le_bytes()); // num dir sectors (v3: 0)
+        f.extend(1u32.to_le_bytes()); // num FAT sectors
+        f.extend(1u32.to_le_bytes()); // first dir sector
+        f.extend(0u32.to_le_bytes()); // transaction
+        f.extend(4096u32.to_le_bytes()); // mini cutoff
+        f.extend(4u32.to_le_bytes()); // first mini FAT sector
+        f.extend(1u32.to_le_bytes()); // num mini FAT sectors
+        f.extend(0xFFFF_FFFFu32.to_le_bytes()); // first DIFAT sector
+        f.extend(0u32.to_le_bytes()); // num DIFAT sectors
+                                      // DIFAT: 109 entries; FAT at sector 0.
+        f.extend(0u32.to_le_bytes());
+        for _ in 1..109 {
+            f.extend(0xFFFF_FFFFu32.to_le_bytes());
+        }
+        assert_eq!(f.len(), 512);
+        // Sector 0: FAT. Layout: [0]=FATSECT(0xFFFFFFFD) [1]=END [2]=END
+        // [3]=END (dir chain of one sector).
+        // Sector allocation: FAT@0, dir@1, regstream@2, ministream@3.
+        let mut fat: Vec<u32> = vec![0xFFFF_FFFF; SS / 4];
+        fat[0] = 0xFFFF_FFFD; // FATSECT
+        fat[1] = 0xFFFF_FFFE; // dir: single sector chain
+        fat[2] = 0xFFFF_FFFE; // regular stream: single sector
+        fat[3] = 0xFFFF_FFFE; // mini stream container: single sector
+        fat[4] = 0xFFFF_FFFE; // mini FAT: single sector
+        for v in fat {
+            f.extend(v.to_le_bytes());
+        }
+        // Sector 1: directory. 4 entries x 128 bytes. Root's mini
+        // stream lives in sector 3; the small stream uses mini sector 0.
+        // Helper fields: red-black tree as flat list (left=right=child=NOSTREAM
+        // for leaves; root's child -> entry 1; entry 1 right -> entry 2;
+        // entry 2 right -> entry 3).
+        let mut dir = vec![0u8; 4 * 128];
+        let mut put = |idx: usize,
+                       name: &str,
+                       typ: u8,
+                       left: u32,
+                       right: u32,
+                       child: u32,
+                       start: u32,
+                       size: u64| {
+            let e = &mut dir[idx * 128..(idx + 1) * 128];
+            let units: Vec<u16> = name.encode_utf16().collect();
+            for (i, u) in units.iter().enumerate() {
+                e[i * 2..i * 2 + 2].copy_from_slice(&u.to_le_bytes());
+            }
+            let name_field = (units.len() * 2 + 2) as u16;
+            e[64..66].copy_from_slice(&name_field.to_le_bytes());
+            e[66] = typ;
+            e[67] = 0x01; // black
+            e[68..72].copy_from_slice(&left.to_le_bytes());
+            e[72..76].copy_from_slice(&right.to_le_bytes());
+            e[76..80].copy_from_slice(&child.to_le_bytes());
+            e[116..120].copy_from_slice(&start.to_le_bytes());
+            e[120..128].copy_from_slice(&size.to_le_bytes());
+        };
+        // 0: Root Entry (mini-stream container), start sector 3.
+        put(0, "Root Entry", 5, 0xFFFF_FFFF, 0xFFFF_FFFF, 1, 3, 512);
+        // 1: BIG (regular stream), size 8192 > cutoff, sector 2.
+        put(1, "BIG", 2, 0xFFFF_FFFF, 2, 0xFFFF_FFFF, 2, 8192);
+        // 2: small (mini stream), size 64 < cutoff, mini sector 0.
+        put(2, "small", 2, 0xFFFF_FFFF, 3, 0xFFFF_FFFF, 0, 64);
+        // 3: empty storage.
+        put(3, "dir", 1, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0);
+        f.extend_from_slice(&dir);
+        // Sector 2: regular stream data (512 bytes; declared 8192 is
+        // truncated on disk -> extraction must truncate to what exists).
+        let big: Vec<u8> = (0..512).map(|i| (i % 251) as u8).collect();
+        f.extend_from_slice(&big);
+        // Sector 3: mini-stream container (512 bytes = 8 mini sectors).
+        let mut mini = vec![0u8; 512];
+        let payload = b"MINI_STREAM_PAYLOAD_012345678901234567890123456";
+        mini[0..payload.len()].copy_from_slice(payload);
+        f.extend_from_slice(&mini);
+        // Sector 4: mini FAT (128 x u32): mini sector 0 -> ENDOFCHAIN.
+        let mut mfat: Vec<u32> = vec![0xFFFF_FFFF; SS / 4];
+        mfat[0] = 0xFFFF_FFFE;
+        for v in mfat {
+            f.extend(v.to_le_bytes());
+        }
+        f
+    }
+
+    #[test]
+    fn ole_stream_extraction_fat_and_mini_fat() {
+        let src = ByteSource::from_vec(ole_cfb());
+        let mut budget = Budget::default();
+        let out = OleHandler
+            .validate(
+                &src,
+                Candidate { offset: 0 },
+                &EngineLimits::default(),
+                &mut budget,
+            )
+            .expect("ole validates");
+        let art = &out.artifacts[0];
+        let big = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("path").map(String::as_str) == Some("BIG"))
+            .expect("regular FAT stream extracted");
+        assert_eq!(big.metadata.get("storage").map(String::as_str), Some("fat"));
+        match &big.content {
+            ChildContent::Owned(bytes) => {
+                assert_eq!(bytes.len(), 512, "truncated to on-disk bytes");
+                assert_eq!(&bytes[..4], &[0, 1, 2, 3]);
+            }
+            _ => panic!("stream must be owned bytes"),
+        }
+        // Mini-FAT stream: resolved through the root mini-stream and
+        // the mini FAT chain.
+        let small = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("path").map(String::as_str) == Some("small"))
+            .expect("mini-fat stream extracted");
+        assert_eq!(
+            small.metadata.get("storage").map(String::as_str),
+            Some("mini-fat")
+        );
+        match &small.content {
+            ChildContent::Owned(bytes) => {
+                assert_eq!(bytes.len(), 64);
+                assert!(
+                    bytes.starts_with(b"MINI_STREAM_PAYLOAD"),
+                    "mini stream payload must be read via mini-FAT"
+                );
+            }
+            _ => panic!("stream must be owned bytes"),
+        }
     }
 }

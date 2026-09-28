@@ -608,6 +608,11 @@ const SECTION_RAW: u8 = 0x19;
 const SECTION_PE32: u8 = 0x10;
 const SECTION_TE: u8 = 0x12;
 const SECTION_UI: u8 = 0x15;
+/// LZMA_CUSTOM_DECOMPRESS_GUID {EE4E5898-3914-4259-9D6E-DC7BD79403CF}
+/// (MdePkg/Guid/LzmaCustomDecompressLib.h), byte layout per EFI GUID.
+const LZMA_CUSTOM_DECOMPRESS_GUID: [u8; 16] = [
+    0x98, 0x58, 0x4E, 0xEE, 0x14, 0x39, 0x59, 0x42, 0x9D, 0x6E, 0xDC, 0x7B, 0xD7, 0x94, 0x03, 0xCF,
+];
 
 impl UefiFvHandler {
     /// Walk FFS files inside one firmware volume and emit children.
@@ -644,7 +649,6 @@ impl UefiFvHandler {
             if hdr.iter().all(|&b| b == 0xFF) {
                 break;
             }
-            eprintln!("DBG ffs at {pos} hdr {:02x?}", &hdr[16..24]);
             let size24 =
                 u32::from(hdr[20]) | (u32::from(hdr[21]) << 8) | (u32::from(hdr[22]) << 16);
             let attributes = hdr[19];
@@ -742,9 +746,25 @@ impl UefiFvHandler {
                     }
                     SECTION_COMPRESSION | SECTION_GUID_DEFINED => {
                         section_names.push(format!("0x{stype:02x} (encapsulated)"));
-                        child_warnings.push(format!(
-                            "encapsulated section type 0x{stype:02x} not decompressed; kept as metadata"
-                        ));
+                        // FINAL-B5: decode the common encapsulated
+                        // sections. LZMA-custom-compressed payloads
+                        // (compression type 2 / LZMA GUID) are
+                        // decompressed and their bytes recursed; Tiano
+                        // (type 1) is genuinely unsupported and stays
+                        // metadata-only with an honest warning.
+                        let decoded = Self::decode_encapsulated(
+                            src,
+                            spos,
+                            ssize,
+                            shsize,
+                            stype,
+                            limits,
+                            budget,
+                            &mut child_warnings,
+                        );
+                        if let Some(bytes) = decoded {
+                            section_payloads.push(bytes);
+                        }
                     }
                     SECTION_FV_IMAGE => {
                         section_names.push(format!("0x{stype:02x} (nested FV)"));
@@ -790,6 +810,142 @@ impl UefiFvHandler {
             pos = (pos + file_size + 7) & !7u64;
         }
         Ok(())
+    }
+
+    /// FINAL-B5: decode one encapsulated section (COMPRESSION or
+    /// GUID_DEFINED). Returns Some(payload bytes) when decoding
+    /// succeeded, None when the section stays metadata-only.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_encapsulated(
+        src: &ByteSource,
+        spos: u64,
+        ssize: u64,
+        shsize: u64,
+        stype: u8,
+        limits: &crate::engine::EngineLimits,
+        budget: &mut Budget,
+        warnings: &mut Vec<String>,
+    ) -> Option<Vec<u8>> {
+        let body = spos + shsize;
+        let body_len = ssize - shsize;
+        if stype == SECTION_COMPRESSION {
+            // EFI_COMMON_SECTION_HEADER Compression: u32 Type then
+            // the compressed payload. Type 0 = none, 1 = Tiano,
+            // 2 = LZMA-custom (13-byte props header + raw LZMA1).
+            if body_len < 4 {
+                return None;
+            }
+            let ctype = le32(src, body).unwrap_or(0);
+            let payload_off = body + 4;
+            let payload_len = body_len - 4;
+            match ctype {
+                0 => {
+                    // Uncompressed.
+                    let mut buf = vec![0u8; payload_len.min(limits.max_child_size) as usize];
+                    src.read_at(payload_off, &mut buf).ok()?;
+                    if !budget.charge(limits, buf.len() as u64) {
+                        return None;
+                    }
+                    Some(buf)
+                }
+                2 => {
+                    Self::decode_uefi_lzma(src, payload_off, payload_len, limits, budget, warnings)
+                }
+                other => {
+                    warnings.push(format!(
+                        "COMPRESSION type {other} (Tiano) not supported; kept as metadata"
+                    ));
+                    None
+                }
+            }
+        } else {
+            // GUID_DEFINED: u16 DataOffset, u16 Attributes, then the
+            // section GUID.
+            if body_len < 16 {
+                return None;
+            }
+            let mut guid = [0u8; 16];
+            src.read_at(body, &mut guid).ok()?;
+            let data_offset = le16(src, body + 16).unwrap_or(0) as u64;
+            let payload_off = spos + data_offset.max(shsize + 20);
+            if payload_off >= spos + ssize {
+                return None;
+            }
+            let payload_len = ssize - (payload_off - spos);
+            if guid == LZMA_CUSTOM_DECOMPRESS_GUID {
+                Self::decode_uefi_lzma(src, payload_off, payload_len, limits, budget, warnings)
+            } else {
+                warnings.push(format!(
+                    "GUID_DEFINED section with GUID {} not supported; kept as metadata",
+                    guid_hex(&guid)
+                ));
+                None
+            }
+        }
+    }
+
+    /// Decode an UEFI LZMA-custom payload: 13-byte LZMA-alone header
+    /// (props[1], dict_size[4 LE], uncompressed size[8 LE]) followed
+    /// by raw LZMA1. Charges the budget incrementally while decoding.
+    fn decode_uefi_lzma(
+        src: &ByteSource,
+        off: u64,
+        len: u64,
+        limits: &crate::engine::EngineLimits,
+        budget: &mut Budget,
+        warnings: &mut Vec<String>,
+    ) -> Option<Vec<u8>> {
+        const HDR: usize = 13;
+        if len < HDR as u64 {
+            warnings.push("LZMA payload truncated; kept as metadata".to_string());
+            return None;
+        }
+        let mut hdr = [0u8; HDR];
+        if src.read_at(off, &mut hdr).is_err() {
+            return None;
+        }
+        let props = hdr[0];
+        let dict_size = u32::from_le_bytes(hdr[1..5].try_into().ok()?);
+        let uncomp = u64::from_le_bytes(hdr[5..13].try_into().ok()?);
+        if uncomp > limits.max_child_size {
+            warnings.push("LZMA declared size exceeds max_child_size; not decoded".to_string());
+            return None;
+        }
+        let mut comp = vec![0u8; (len as usize) - HDR];
+        if src.read_at(off + HDR as u64, &mut comp).is_err() {
+            return None;
+        }
+        let mut reader = lzma_rust::LZMAReader::new_with_props(
+            std::io::Cursor::new(&comp[..]),
+            uncomp,
+            props,
+            dict_size,
+            None,
+        )
+        .ok()?;
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            match std::io::Read::read(&mut reader, &mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    out.extend_from_slice(&chunk[..n]);
+                    if out.len() as u64 > limits.max_child_size {
+                        warnings.push("LZMA output exceeds max_child_size; truncated".to_string());
+                        break;
+                    }
+                    if !budget.charge(limits, n as u64) {
+                        return None;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if out.is_empty() {
+            warnings.push("LZMA decode produced no output; kept as metadata".to_string());
+            return None;
+        }
+        Some(out)
     }
 }
 
@@ -1361,6 +1517,99 @@ mod tests {
         match &ffs.content {
             ChildContent::Owned(d) => assert_eq!(d, b"UEFI_RAW_PAYLOAD_1234"),
             _ => panic!("raw section payload must be exposed"),
+        }
+    }
+
+    /// FINAL-B5: a GUID_DEFINED section carrying an LZMA-custom
+    /// payload (LZMA_CUSTOM_DECOMPRESS_GUID) must be DECOMPRESSED and
+    /// the decoded bytes become the FFS file content (recurse-ready),
+    /// while a Tiano COMPRESSION section stays metadata-only with an
+    /// honest warning.
+    #[test]
+    fn uefi_guid_defined_lzma_section_decoded() {
+        // Build the LZMA-custom payload: 13-byte header + raw LZMA1
+        // stream produced by lzma-rust's no-header encoder.
+        let plaintext = b"UEFI_LZMA_DECODED_PAYLOAD_OK!";
+        let options = lzma_rust::LZMA2Options {
+            dict_size: 1 << 16,
+            ..Default::default()
+        };
+        let mut comp: Vec<u8> = Vec::new();
+        {
+            let w = lzma_rust::LZMAWriter::new_no_header(
+                lzma_rust::CountingWriter::new(&mut comp),
+                &options,
+                true, // end marker so the decoder stops without a size
+            )
+            .expect("encoder");
+            // `w` must be finished to flush; restructure: new_no_header
+            // returns the writer directly, so use it in a block.
+            let mut w = w;
+            std::io::Write::write_all(&mut w, plaintext).expect("write");
+            w.finish().expect("finish");
+        }
+        let mut props = [0u8; 1];
+        let mut dictb = [0u8; 4];
+        // The encoder's props byte: reuse a known-good props byte for
+        // default lc/lp/pb (0x5D = lc3/lp0/pb2).
+        props[0] = 0x5D;
+        dictb.copy_from_slice(&(1u32 << 16).to_le_bytes());
+        let mut lzma_payload: Vec<u8> = Vec::new();
+        lzma_payload.extend_from_slice(&props);
+        lzma_payload.extend_from_slice(&dictb);
+        lzma_payload.extend_from_slice(&(plaintext.len() as u64).to_le_bytes());
+        lzma_payload.extend_from_slice(&comp);
+
+        // Build a minimal FV with one FFS file containing a
+        // GUID_DEFINED section wrapping the LZMA payload.
+        let mut img = vec![0u8; 0x1000];
+        img[0x20..0x28].copy_from_slice(&0x1000u64.to_le_bytes());
+        img[0x28..0x2c].copy_from_slice(b"_FVH");
+        img[0x30..0x32].copy_from_slice(&0x48u16.to_le_bytes());
+        let mut ffs = Vec::new();
+        // FFS header: name GUID(16) + integrity(2) + type(1) +
+        // attributes(1) + size(3) + state(1).
+        let data_len = 4 + 16 + 2 + 2 + lzma_payload.len(); // hdr+GUID+DataOffset+Attributes+payload
+        let file_size = 24 + data_len as u32;
+        ffs.extend_from_slice(&[0x11; 16]); // name GUID
+        ffs.extend_from_slice(&[0xAA, 0x99]); // integrity
+        ffs.push(0x02); // type: FREEFORM
+        ffs.push(0x00); // attributes
+        ffs.extend_from_slice(&file_size.to_le_bytes()[..3]);
+        ffs.push(0xF8); // state: valid under 0xFF polarity
+                        // (ffs bytes are copied into the FV at 0x48 below)
+                        // GUID_DEFINED section header: size(3) + type(1) + GUID(16) +
+                        // DataOffset(2) + Attributes(2).
+        let ssize = (4 + 16 + 4 + lzma_payload.len()) as u32;
+        ffs.extend_from_slice(&ssize.to_le_bytes()[..3]);
+        ffs.push(SECTION_GUID_DEFINED);
+        ffs.extend_from_slice(&LZMA_CUSTOM_DECOMPRESS_GUID);
+        ffs.extend_from_slice(&(24u16).to_le_bytes()); // DataOffset
+        ffs.extend_from_slice(&0u16.to_le_bytes()); // Attributes
+                                                    // Payload: 13-byte header + raw stream.
+        ffs.extend_from_slice(&lzma_payload);
+        // Place the FFS file after the FV header (0x48), inside the FV.
+        img[0x48..0x48 + ffs.len()].copy_from_slice(&ffs);
+        let src = ByteSource::from_vec(img);
+        let out = validate_at(&UefiFvHandler, &src, 0).expect("fv validates");
+        let art = &out.artifacts[0];
+        if art.children.is_empty() {
+            panic!("no ffs children; warnings={:?}", art.warnings);
+        }
+        let ffs = art
+            .children
+            .iter()
+            .find(|c| c.metadata.contains_key("ffs_name_guid"))
+            .expect("ffs child");
+        match &ffs.content {
+            ChildContent::Owned(bytes) => {
+                assert!(
+                    bytes.windows(plaintext.len()).any(|w| w == plaintext),
+                    "LZMA payload must be decoded into the file content, got {:02x?}",
+                    &bytes[..bytes.len().min(16)]
+                );
+            }
+            _ => panic!("decoded content must be owned bytes"),
         }
     }
 

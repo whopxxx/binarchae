@@ -3829,16 +3829,66 @@ impl Handler for Yaffs2Handler {
         "yaffs2"
     }
 
-    fn find_candidates(&self, _src: &ByteSource) -> Vec<Candidate> {
-        // Heuristic: an object header chunk for the root object
-        // (obj_id 1, chunk_id 0 with the extra-header flag in the
-        // spare) followed by plausible tags. We look for chunks whose
-        // spare starts with a sane pattern: seq != 0xFFFFFFFF and
-        // chunk_id 0 or small. Simplest robust signal: scan for
-        // 2048/64 stride where the first chunk's spare is non-erased.
-        // Instead: probe every 2112-byte boundary is too expensive;
-        // use the engine by validating at aligned offsets only.
-        Vec::new()
+    fn find_candidates(&self, src: &ByteSource) -> Vec<Candidate> {
+        // FINAL-B5: real candidate discovery. A YAFFS2 image region
+        // shows a chain of 2112-byte chunks whose spares carry packed
+        // tags2: a non-erased sequence number, a sane obj_id, and a
+        // chunk_id that is either 0, an extra-flag header, or a small
+        // chunk index. We probe aligned strides and require K
+        // consecutive plausible chunks at the start of a run — a single
+        // magic dword is not available in this format, so this is the
+        // cheapest honest structural signal.
+        const MIN_CHAIN: usize = 4;
+        const MAX_CHAIN_PROBE: usize = 8;
+        let plausible = |off: u64| -> bool {
+            if off + YAFFS_CHUNK_STRIDE > src.len() {
+                return false;
+            }
+            let mut tags = [0u8; 16];
+            src.read_at(off + YAFFS_DATA_PER_CHUNK, &mut tags).is_ok()
+                && u32::from_le_bytes(tags[0..4].try_into().unwrap()) != YAFFS_ERASED_SEQ
+                && u32::from_le_bytes(tags[0..4].try_into().unwrap()) != 0
+                // obj_id: never erased, small-ish (<= 1M objects).
+                && u32::from_le_bytes(tags[4..8].try_into().unwrap()) != YAFFS_ERASED_SEQ
+                && u32::from_le_bytes(tags[4..8].try_into().unwrap()) <= 0x10_0000
+                && {
+                    let chunk_id = u32::from_le_bytes(tags[8..12].try_into().unwrap());
+                    chunk_id == 0
+                        || chunk_id & YAFFS_EXTRA_HEADER_FLAG != 0
+                        // data chunk index bounded by plausible file size
+                        || chunk_id <= 0x10_0000
+                }
+                // n_bytes: header chunks may record 0xFFFF (full-chunk
+                // headers from mkyaffs2image); data chunks are 1..=2048.
+                && {
+                    let n = u32::from_le_bytes(tags[12..16].try_into().unwrap());
+                    let chunk_id = u32::from_le_bytes(tags[8..12].try_into().unwrap());
+                    (1..=2048).contains(&n)
+                        || (n == 0xFFFF && (chunk_id == 0 || chunk_id & YAFFS_EXTRA_HEADER_FLAG != 0))
+                }
+        };
+        let mut out: Vec<Candidate> = Vec::new();
+        let mut pos: u64 = 0;
+        let len = src.len();
+        while pos + MIN_CHAIN as u64 * YAFFS_CHUNK_STRIDE <= len {
+            if plausible(pos) {
+                // Require a consecutive chain so erased regions and
+                // random payload don't produce candidates.
+                let mut chain = 1usize;
+                let mut next = pos + YAFFS_CHUNK_STRIDE;
+                while chain < MAX_CHAIN_PROBE && plausible(next) {
+                    chain += 1;
+                    next += YAFFS_CHUNK_STRIDE;
+                }
+                if chain >= MIN_CHAIN {
+                    out.push(Candidate { offset: pos });
+                    pos = next;
+                    continue;
+                }
+            }
+            pos += YAFFS_CHUNK_STRIDE;
+        }
+        out
     }
 
     fn validate(
@@ -4898,6 +4948,13 @@ mod tests {
     #[test]
     fn yaffs2_tree_walk_with_data_chunks() {
         let src = ByteSource::from_vec(yaffs2_image());
+        // FINAL-B5: candidate discovery must actually find the image.
+        let cands = Yaffs2Handler.find_candidates(&src);
+        assert!(
+            !cands.is_empty(),
+            "yaffs2 find_candidates must discover the image region"
+        );
+        assert_eq!(cands[0].offset, 0, "image starts at offset 0");
         let out = validate_at(&Yaffs2Handler, &src, 0).expect("yaffs2 validates");
         let art = &out.artifacts[0];
         assert_eq!(art.confidence, Confidence::Validated);
