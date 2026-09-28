@@ -355,26 +355,28 @@ impl Handler for PcapHandler {
                 seg += 1;
                 off2 += 16 + incl_len;
 
+                // T2/S3: the Ethernet header itself must already be
+                // bounded by THIS packet's captured bytes — packet_end
+                // is computed BEFORE any L2/L3/L4 read, and every later
+                // bound checks against it (never src.len()).
+                let packet_end = frame_start + incl_len;
                 // Parse Ethernet: dst(6) src(6) ethertype(2). VLAN(0x8100)
                 // skipped once; IPv4 = 0x0800, IPv6 = 0x86DD.
-                if linktype != 1 || frame_start + 14 > src.len() {
+                if linktype != 1 || frame_start + 14 > packet_end {
                     continue;
                 }
                 let mut eth = [0u8; 14];
                 src.read_at(frame_start, &mut eth)?;
                 let mut ethertype = u16::from_be_bytes([eth[12], eth[13]]);
                 let mut l3 = frame_start + 14;
-                if ethertype == 0x8100 && l3 + 4 <= src.len() {
+                if ethertype == 0x8100 && l3 + 4 <= packet_end {
                     let mut vlan = [0u8; 4];
                     src.read_at(l3, &mut vlan)?;
                     ethertype = u16::from_be_bytes([vlan[2], vlan[3]]);
                     l3 += 4;
                 }
                 // S3: all L2/L3/L4 reads are bounded by THIS captured
-                // packet (incl_len), never by the whole file. A short
-                // record followed by another PCAP record must not be
-                // read across.
-                let packet_end = frame_start + incl_len;
+                // packet (incl_len), never by the whole file.
                 match ethertype {
                     0x0800 => {
                         // IPv4: IHL, protocol, src/dst (4 bytes each).
@@ -394,11 +396,14 @@ impl Handler for PcapHandler {
                         // Normalize direction: order the (src,port,dst,port)
                         // pair so both directions share one key.
                         let (a, b) = (h[12..16].to_vec(), h[16..20].to_vec());
-                        // Peek TCP ports at l3+ihl.
-                        if l3 + ihl + 4 > packet_end {
+                        // T2: read the FULL 20-byte TCP header — the
+                        // ports alone being in range does not prove the
+                        // rest of the header is (it may extend past this
+                        // packet's captured bytes).
+                        if l3 + ihl + 20 > packet_end {
                             continue;
                         }
-                        let mut tp = [0u8; 4];
+                        let mut tp = [0u8; 20];
                         src.read_at(l3 + ihl, &mut tp)?;
                         let (sp, dp) = ([tp[0], tp[1]], [tp[2], tp[3]]);
                         let dir1 = [a.as_slice(), &sp, b.as_slice(), &dp];
@@ -414,16 +419,21 @@ impl Handler for PcapHandler {
                             flow_key[6..10].copy_from_slice(&a);
                             flow_key[10..12].copy_from_slice(&sp);
                         }
-                        // TCP data offset for payload start.
-                        let mut td = [0u8; 20];
-                        src.read_at(l3 + ihl, &mut td)?;
-                        let data_off = u64::from(td[12] >> 4) * 4;
+                        // TCP data offset for payload start (already
+                        // read above as part of the full header).
+                        let data_off = u64::from(tp[12] >> 4) * 4;
                         if data_off < 20 || l3 + ihl + data_off > packet_end {
                             continue;
                         }
-                        // S3: payload length via checked arithmetic against
-                        // the packet end — no unsigned underflow possible.
-                        let payload_len = packet_end.saturating_sub(l3 + ihl + data_off);
+                        // T2/S3: payload bounded by BOTH the packet end
+                        // and the IPv4 total_length field, so Ethernet
+                        // padding (anything after the IP datagram) is
+                        // never treated as TCP payload. checked arithmetic
+                        // — no unsigned underflow possible.
+                        let total_length = u64::from(u16::from_be_bytes([h[2], h[3]])).max(ihl);
+                        let ip_end = l3 + total_length;
+                        let payload_len =
+                            packet_end.min(ip_end).saturating_sub(l3 + ihl + data_off);
                         if payload_len == 0 {
                             continue;
                         }
@@ -445,7 +455,7 @@ impl Handler for PcapHandler {
                     }
                     0x86DD => {
                         // IPv6: fixed 40-byte header, next-header at +6.
-                        if l3 + 40 > src.len() {
+                        if l3 + 40 > packet_end {
                             continue;
                         }
                         let mut h = [0u8; 40];
@@ -453,10 +463,12 @@ impl Handler for PcapHandler {
                         if h[6] != 6 {
                             continue; // TCP only
                         }
-                        if l3 + 44 > src.len() {
+                        // T2: read the FULL 20-byte TCP header, bounded by
+                        // this packet's captured bytes.
+                        if l3 + 60 > packet_end {
                             continue;
                         }
-                        let mut tp = [0u8; 4];
+                        let mut tp = [0u8; 20];
                         src.read_at(l3 + 40, &mut tp)?;
                         let (sp, dp) = ([tp[0], tp[1]], [tp[2], tp[3]]);
                         let a = h[8..24].to_vec();
@@ -476,14 +488,19 @@ impl Handler for PcapHandler {
                         flow_key[10..12].copy_from_slice(&p2);
                         flow_key[12] = 0xEE; // IPv6 marker
 
-                        let mut td = [0u8; 20];
-                        src.read_at(l3 + 40, &mut td)?;
-                        let data_off = u64::from(td[12] >> 4) * 4;
+                        // TCP data offset (already read in the full
+                        // header above).
+                        let data_off = u64::from(tp[12] >> 4) * 4;
                         if data_off < 20 || l3 + 40 + data_off > packet_end {
                             continue;
                         }
-                        // S3: checked subtraction against the packet end.
-                        let payload_len = packet_end.saturating_sub(l3 + 40 + data_off);
+                        // T2/S3: payload bounded by BOTH the packet end and
+                        // the IPv6 payload_length field — Ethernet padding
+                        // is never treated as TCP payload.
+                        let payload_length =
+                            u64::from(u16::from_be_bytes([h[4], h[5]])).max(data_off);
+                        let ip_end = l3 + 40 + payload_length;
+                        let payload_len = packet_end.min(ip_end).saturating_sub(l3 + 40 + data_off);
                         if payload_len == 0
                             || total_reconstructed + payload_len > limits.max_reconstructed_bytes
                         {
@@ -1169,6 +1186,77 @@ mod tests {
             !art.children.iter().any(|c| c.label.contains("HTTP object")),
             "no HTTP object can come from a 1-byte frame"
         );
+    }
+
+    #[test]
+    fn pcap_ethernet_padding_not_treated_as_payload() {
+        // T2: an Ethernet frame pads short packets to 60 bytes. The TCP
+        // payload must be bounded by the IP total_length field, so the
+        // padding after the IP datagram is NOT reassembled into the HTTP
+        // stream (a zero byte in the middle of an HTTP body would corrupt
+        // it, and padding could smuggle a second HTTP header).
+        let frame = |payload: &[u8], pad: usize| -> Vec<u8> {
+            let mut f = Vec::new();
+            f.extend([0x02u8; 6]);
+            f.extend([0x01u8; 6]);
+            f.extend(0x0800u16.to_be_bytes());
+            let ip_total = (20 + 20 + payload.len()) as u16;
+            f.extend(0x45u8.to_be_bytes());
+            f.extend(0u8.to_be_bytes()); // tos
+            f.extend(ip_total.to_be_bytes()); // total_length EXCLUDES padding
+            f.extend(1u16.to_be_bytes());
+            f.extend(0x4000u16.to_be_bytes());
+            f.extend(64u8.to_be_bytes());
+            f.extend(6u8.to_be_bytes());
+            f.extend(0u16.to_be_bytes());
+            f.extend([10u8, 0, 0, 1]);
+            f.extend([10u8, 0, 0, 2]);
+            f.extend(443u16.to_be_bytes());
+            f.extend(55555u16.to_be_bytes());
+            f.extend(1u32.to_be_bytes());
+            f.extend(1u32.to_be_bytes());
+            f.extend(0x5018u16.to_be_bytes()); // data_off 5, PSH|ACK
+            f.extend(0xFFFFu16.to_be_bytes());
+            f.extend(0u16.to_be_bytes());
+            f.extend(0u16.to_be_bytes());
+            f.extend_from_slice(payload);
+            f.extend(vec![0xAA; pad]); // Ethernet padding AFTER the datagram
+            f
+        };
+        let msg = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nBODY";
+        let seg1 = frame(&msg[..20], 20); // header split + padding
+        let seg2 = frame(&msg[20..], 30); // rest + padding
+        let mut p = Vec::new();
+        p.extend_from_slice(&[0xD4, 0xC3, 0xB2, 0xA1]);
+        p.extend(2u16.to_le_bytes());
+        p.extend(4u16.to_le_bytes());
+        p.extend(0u32.to_le_bytes()); // thiszone
+        p.extend(0u32.to_le_bytes()); // sigfigs
+        p.extend(262144u32.to_le_bytes());
+        p.extend(1u32.to_le_bytes()); // Ethernet
+        for pkt in [&seg1, &seg2] {
+            p.extend(1u32.to_le_bytes());
+            p.extend(0u32.to_le_bytes());
+            p.extend((pkt.len() as u32).to_le_bytes());
+            p.extend((pkt.len() as u32).to_le_bytes());
+            p.extend_from_slice(pkt);
+        }
+        let src = ByteSource::from_vec(p);
+        let out = validate_at(&PcapHandler, &src, 0).expect("pcap validates");
+        let http: Vec<_> = out.artifacts[0]
+            .children
+            .iter()
+            .filter(|c| c.label.contains("HTTP object"))
+            .collect();
+        assert_eq!(http.len(), 1, "exactly one HTTP object");
+        let bytes = http[0].content.to_bytes().unwrap();
+        // The reassembled body must be exactly "BODY": no 0xAA padding
+        // bytes smuggled in.
+        assert!(
+            !bytes.contains(&0xAA),
+            "Ethernet padding leaked into reassembled payload"
+        );
+        assert!(bytes.ends_with(b"BODY"));
     }
 
     #[test]

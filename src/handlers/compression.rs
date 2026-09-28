@@ -547,27 +547,34 @@ impl Handler for ZstdHandler {
             // succeeds: every probe is a bounded read, never a
             // candidate-to-EOF read_all, and there is NO heuristic
             // byte-pattern guessing.
+            // T1: the hard ceiling is max_child_size (and the tail).
+            // Start at min(1 MiB, ceiling) and double, but EVERY probe is
+            // clamped to the ceiling first: no probe ever reads past the
+            // cap, whatever its value (small caps and non-power-of-two
+            // caps included).
             let tail_len = src.len() - base;
-            let max_window = limits.max_child_size.min(tail_len).max(1024 * 1024);
+            let ceiling = limits.max_child_size.min(tail_len);
             let mut window: u64 = 1024 * 1024;
             let mut structured: Option<u64> = None;
             loop {
-                let probe_len = window.min(tail_len) as usize;
+                // Probe = the smaller of the desired window and the
+                // ceiling; the desired window may have overshot.
+                let probe_len = window.min(ceiling) as usize;
                 if let Ok(buf) = src.slice(base, probe_len as u64).and_then(|r| r.read_all()) {
                     if let Ok(frame_size) = zstd::zstd_safe::find_frame_compressed_size(&buf) {
                         structured = Some(frame_size as u64);
                         break;
                     }
                 }
-                if window >= max_window {
-                    break; // no structured end within any bounded window
+                if window >= ceiling {
+                    break; // probed the full ceiling already
                 }
                 window = window.saturating_mul(2);
             }
             consumed = match structured {
                 Some(frame_size) => frame_size,
                 None => {
-                    // S1: no structured boundary within the bounded
+                    // T1/S1: no structured boundary within the bounded
                     // windows (frame larger than max_child_size). The
                     // candidate exceeds the cap anyway, so the honest
                     // outcome is a typed limit error, not a guess.
@@ -575,7 +582,7 @@ impl Handler for ZstdHandler {
                         limit: "max_child_size",
                         detail: format!(
                             "zstd frame has no structured end within {} bytes (tail {})",
-                            max_window, tail_len
+                            ceiling, tail_len
                         ),
                     });
                 }
@@ -1033,6 +1040,40 @@ mod tests {
             art.size,
             compressed.len() as u64,
             "frame end (incl. checksum footer) must be exact at base=7"
+        );
+    }
+
+    #[test]
+    fn zstd_probe_respects_small_cap() {
+        // T1: with a small, non-power-of-two cap (3 MiB = 3145728), the
+        // probe must clamp to the cap: a frame that fits inside it is
+        // found via the structured interface; no probe ever reads past
+        // the cap.
+        // Pseudorandom payload: compressed size stays comparable to the
+        // raw size so the expansion-ratio cap never binds before the
+        // child-size cap does.
+        let mut seed = 0x5A17_0001u32;
+        let payload: Vec<u8> = (0..2 * 1024 * 1024)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .collect();
+        let compressed = zstd::bulk::compress(&payload, 3).unwrap();
+        assert!(compressed.len() < 3 * 1024 * 1024);
+        let src = ByteSource::from_vec(compressed.clone());
+        let limits = crate::engine::EngineLimits {
+            max_child_size: 3 * 1024 * 1024, // non-power-of-two cap
+            ..Default::default()
+        };
+        let mut budget = Budget::default();
+        let out = ZstdHandler
+            .validate(&src, Candidate { offset: 0 }, &limits, &mut budget)
+            .expect("frame found within cap");
+        assert_eq!(out.artifacts[0].size, compressed.len() as u64);
+        assert_eq!(
+            out.artifacts[0].children[0].content.to_bytes().unwrap(),
+            payload
         );
     }
 
