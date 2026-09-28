@@ -617,6 +617,213 @@ fn ctf_write_varint(mut v: u64) -> Vec<u8> {
     out
 }
 
+// ---------- FINAL-B4: automatic password discovery -> decrypt -> recurse ----------
+
+/// Build a ZipCrypto-encrypted ZIP (PKWARE stream cipher, per APPNOTE).
+/// The 12-byte encryption header ends with (crc32 >> 24) so the zip
+/// crate's PkzipCrc32 validator accepts the right password.
+fn zipcrypt_keys(password: &[u8]) -> [u32; 3] {
+    let mut k = [0x12345678u32, 0x23456789u32, 0x34567890u32];
+    let table = crc_table();
+    let step = |k: &mut [u32; 3], b: u8| {
+        k[0] = (k[0] >> 8) ^ table[((k[0] ^ b as u32) & 0xff) as usize];
+        k[1] = k[1]
+            .wrapping_add(k[0] & 0xff)
+            .wrapping_mul(0x08088405)
+            .wrapping_add(1);
+        k[2] = (k[2] >> 8) ^ table[((k[2] ^ (k[1] >> 24)) & 0xff) as usize];
+    };
+    for &b in password {
+        step(&mut k, b);
+    }
+    k
+}
+
+fn crc_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    for (i, t) in table.iter_mut().enumerate() {
+        let mut c = i as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                0xEDB88320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+        }
+        *t = c;
+    }
+    table
+}
+
+fn zipcrypt_encrypt(password: &[u8], plain: &[u8], crc_high: u8) -> Vec<u8> {
+    let mut k = zipcrypt_keys(password);
+    let table = crc_table();
+    let update = |k: &mut [u32; 3], b: u8| {
+        k[0] = (k[0] >> 8) ^ table[((k[0] ^ b as u32) & 0xff) as usize];
+        k[1] = k[1]
+            .wrapping_add(k[0] & 0xff)
+            .wrapping_mul(0x08088405)
+            .wrapping_add(1);
+        k[2] = (k[2] >> 8) ^ table[((k[2] ^ (k[1] >> 24)) & 0xff) as usize];
+    };
+    let stream = |k: &[u32; 3]| -> u8 {
+        let temp = ((k[2] & 0xffff) | 2) as u16;
+        (((temp.wrapping_mul(temp ^ 1)) >> 8) & 0xff) as u8
+    };
+    // 12-byte header: 11 arbitrary bytes + crc high byte.
+    let mut out = Vec::new();
+    let header: Vec<u8> = (0..11).map(|i| (i * 7 + 0x31) as u8).collect();
+    for &h in &header {
+        let c = stream(&k) ^ h;
+        update(&mut k, h);
+        out.push(c);
+    }
+    let c = stream(&k) ^ crc_high;
+    update(&mut k, crc_high);
+    out.push(c);
+    for &p in plain {
+        let c = stream(&k) ^ p;
+        update(&mut k, p);
+        out.push(c);
+    }
+    out
+}
+
+/// ZIP with one ZipCrypto-encrypted stored entry and an archive comment.
+/// Field layout is exact per APPNOTE (LFH 30-byte header; CD 46-byte
+/// fixed part: sig, vm, vn, flags, method, time, date, crc, csize,
+/// usize, nl, el, cl, disk, int, ext, lho).
+fn make_encrypted_zip(name: &str, content: &[u8], password: &str, comment: &str) -> Vec<u8> {
+    let crc = crc32(content);
+    let content_crc_high = (crc >> 24) as u8;
+    let cipher = zipcrypt_encrypt(password.as_bytes(), content, content_crc_high);
+    let cipher_len = cipher.len() as u32;
+    let name_len = name.len() as u16;
+    let mut z = Vec::new();
+    // LFH with encryption bit (0x01).
+    z.extend_from_slice(b"PK");
+    z.extend(20u16.to_le_bytes()); // version needed
+    z.extend(1u16.to_le_bytes()); // flags: encrypted
+    z.extend(0u16.to_le_bytes()); // method: stored
+    z.extend(0u16.to_le_bytes()); // time
+    z.extend(0u16.to_le_bytes()); // date
+    z.extend(crc.to_le_bytes());
+    z.extend(cipher_len.to_le_bytes());
+    z.extend(cipher_len.to_le_bytes());
+    z.extend(name_len.to_le_bytes());
+    z.extend(0u16.to_le_bytes()); // extra len
+    z.extend_from_slice(name.as_bytes());
+    z.extend_from_slice(&cipher);
+    let cd_offset = z.len() as u32;
+    // Central directory entry, same flags.
+    let cd_size_pos = z.len();
+    z.extend_from_slice(b"PK");
+    z.extend(20u16.to_le_bytes()); // version made by
+    z.extend(20u16.to_le_bytes()); // version needed
+    z.extend(1u16.to_le_bytes()); // flags: encrypted
+    z.extend(0u16.to_le_bytes()); // method: stored
+    z.extend(0u16.to_le_bytes()); // time
+    z.extend(0u16.to_le_bytes()); // date
+    z.extend(crc.to_le_bytes());
+    z.extend(cipher_len.to_le_bytes());
+    z.extend(cipher_len.to_le_bytes());
+    z.extend(name_len.to_le_bytes());
+    z.extend(0u16.to_le_bytes()); // extra len
+    z.extend(0u16.to_le_bytes()); // comment len
+    z.extend(0u16.to_le_bytes()); // disk number
+    z.extend(0u16.to_le_bytes()); // internal attrs
+    z.extend(0u32.to_le_bytes()); // external attrs
+    z.extend(0u32.to_le_bytes()); // local header offset
+    z.extend_from_slice(name.as_bytes());
+    let cd_size = (z.len() - cd_size_pos) as u32;
+    // EOCD with a COMMENT (the auto-discovered password source).
+    z.extend_from_slice(b"PK");
+    z.extend(0u16.to_le_bytes());
+    z.extend(0u16.to_le_bytes());
+    z.extend(1u16.to_le_bytes());
+    z.extend(1u16.to_le_bytes());
+    z.extend(cd_size.to_le_bytes());
+    z.extend(cd_offset.to_le_bytes());
+    z.extend((comment.len() as u16).to_le_bytes());
+    z.extend_from_slice(comment.as_bytes());
+    z
+}
+
+/// B4 + B8: password auto-discovery chain. The archive comment carries
+/// the password; the engine harvests it (provenance "archive comment"),
+/// the ZIP handler decrypts, and the plaintext recurses into a nested
+/// artifact (gzip inside the encrypted entry).
+#[test]
+fn b4_autodiscovered_password_decrypts_and_recurses() {
+    let secret = make_gzip(b"FLAG{autodiscovered}");
+    let zip = make_encrypted_zip("secret.bin", &secret, "hunter2", "hunter2");
+    let graph = engine().analyze(&ByteSource::from_vec(zip), true);
+
+    let zip_art = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "zip")
+        .expect("zip validated");
+    assert_eq!(
+        zip_art.metadata.get("password").map(String::as_str),
+        Some("hunter2"),
+        "working auto-discovered password surfaced"
+    );
+    assert_eq!(
+        zip_art.metadata.get("password_source").map(String::as_str),
+        Some("archive comment"),
+        "provenance: candidate came from the archive comment"
+    );
+    // Decrypted entry child exists with provenance of its own.
+    let entry = graph
+        .artifacts
+        .iter()
+        .find(|a| a.label.contains("secret.bin"))
+        .expect("decrypted entry artifact");
+    assert_eq!(
+        entry.metadata.get("password").map(String::as_str),
+        Some("hunter2")
+    );
+    assert!(has_ancestor(&graph, entry.id, zip_art.id));
+
+    // Recursion: the decrypted gzip must appear as a nested artifact.
+    let gz = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "gzip")
+        .expect("decrypted content recursed into gzip artifact");
+    assert!(has_ancestor(&graph, gz.id, zip_art.id));
+}
+
+/// B4: with no viable candidate (the comment is NOT the password), the
+/// encrypted entry is not decoded and a warning reports the bounded
+/// attempts. Honesty contract: no invented passwords, no false decrypts.
+#[test]
+fn b4_encrypted_zip_without_candidates_reports_bounded_attempts() {
+    let zip = make_encrypted_zip("secret.bin", b"data", "hunter2", "readme-please");
+    let graph = engine().analyze(&ByteSource::from_vec(zip), true);
+    let zip_art = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "zip")
+        .expect("zip still validates structurally");
+    assert_eq!(
+        zip_art.metadata.get("encrypted").map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        !zip_art.metadata.contains_key("password"),
+        "no password discovered from nothing"
+    );
+    assert!(
+        zip_art
+            .warnings
+            .iter()
+            .any(|w| w.contains("encrypted") && w.contains("tried")),
+        "warning must report the bounded attempt count"
+    );
+}
+
 // ---------- graph helpers ----------
 
 fn has_ancestor(graph: &ctf_tools::artifact::ArtifactGraph, id: u64, ancestor: u64) -> bool {

@@ -54,6 +54,10 @@ pub struct EngineLimits {
     /// try each candidate against password-protected entries and
     /// surface the working one as artifact metadata.
     pub passwords: Vec<String>,
+    /// FINAL-B4: maximum password attempts per encrypted artifact
+    /// across the shared candidate queue (CLI + auto-discovered).
+    /// Bounds the cost of trial decryption against untrusted data.
+    pub max_password_attempts: usize,
 }
 
 impl Default for EngineLimits {
@@ -74,6 +78,7 @@ impl Default for EngineLimits {
             max_string_candidates: 4_096,
             max_fs_entries: 65_536,
             passwords: Vec::new(),
+            max_password_attempts: 32,
         }
     }
 }
@@ -295,10 +300,19 @@ pub struct RecursiveEngine {
     /// exactly once, even when the region is validated multiple times
     /// (root pass, then trailing-region pass) or its draft is deferred.
     spends_by_region: std::collections::HashMap<String, u64>,
+    /// FINAL-B4: shared password-candidate vault. CLI candidates are
+    /// seeded first; handlers/engine harvest further candidates from
+    /// every scanned region (comments, strings, filenames) with
+    /// provenance. One deterministic attempt queue serves all handlers.
+    pub password_vault: crate::passwords::PasswordVault,
 }
 
 impl RecursiveEngine {
     pub fn new(limits: EngineLimits) -> Self {
+        let mut password_vault = crate::passwords::PasswordVault::new();
+        // FINAL-B4: operator-supplied candidates keep highest priority —
+        // they are seeded first and the queue is order-preserving.
+        password_vault.seed_from_cli(&limits.passwords);
         RecursiveEngine {
             limits,
             handlers: builtin_handlers(),
@@ -307,6 +321,7 @@ impl RecursiveEngine {
             byte_cache: std::collections::HashMap::new(),
             region_cache: std::collections::HashMap::new(),
             spends_by_region: std::collections::HashMap::new(),
+            password_vault,
         }
     }
 
@@ -396,6 +411,33 @@ impl RecursiveEngine {
             return;
         }
 
+        // FINAL-B4: harvest password candidates from this region into
+        // the shared vault (comments, strings). CLI candidates were
+        // seeded first and keep queue priority. Dedup + caps keep this
+        // deterministic and bounded regardless of region content.
+        let harvested = crate::passwords::harvest_from_region(src, &self.limits);
+        self.password_vault.merge(harvested);
+        // Effective limits for this region's handler calls: the shared
+        // vault queue is exposed through `passwords` so every encrypted-
+        // container handler (ZIP / 7z / RAR) sees ONE deterministic,
+        // bounded candidate queue without per-handler discovery.
+        let mut effective_limits = self.limits.clone();
+        effective_limits.passwords = self
+            .password_vault
+            .candidates()
+            .iter()
+            .take(self.limits.max_password_attempts)
+            .map(|c| c.password.clone())
+            .collect();
+        // Provenance lookup for accepted drafts (built before the
+        // `spends_by_region` borrow so it can be read inside the loop).
+        let password_sources: std::collections::HashMap<String, &'static str> = self
+            .password_vault
+            .candidates()
+            .iter()
+            .map(|c| (c.password.clone(), c.source.as_str()))
+            .collect();
+
         // Collect drafts from every handler; handler errors are isolated.
         // R1 (transactional accounting): each candidate is validated with
         // a SHADOW of the run-wide budget. Charges commit only when the
@@ -424,9 +466,9 @@ impl RecursiveEngine {
                 //     expansion is billed exactly once, even when a draft
                 //     is deferred to a trailing region and re-validated).
                 let mut shadow = Budget::default();
-                match handler.validate(src, candidate, &self.limits, &mut shadow) {
+                match handler.validate(src, candidate, &effective_limits, &mut shadow) {
                     Ok(output) => {
-                        for draft in output.artifacts {
+                        for mut draft in output.artifacts {
                             // Commit against the run-wide budget under the
                             // real limits; regions already billed commit 0.
                             // G1: when the run-wide commit FAILS, the draft
@@ -439,6 +481,20 @@ impl RecursiveEngine {
                             let already_billed = region_hash
                                 .as_ref()
                                 .is_some_and(|h| spends_by_region.contains_key(h));
+                            // FINAL-B4: enrich any working-password
+                            // metadata with vault provenance (where the
+                            // candidate came from). Handlers that already
+                            // recorded `password_source` are left alone.
+                            if let Some(p) = draft.metadata.get("password").cloned() {
+                                if !draft.metadata.contains_key("password_source") {
+                                    if let Some(s) = password_sources.get(&p) {
+                                        let source = (*s).to_string();
+                                        draft
+                                            .metadata
+                                            .insert("password_source".to_string(), source);
+                                    }
+                                }
+                            }
                             if already_billed {
                                 // One logical expansion per region: no new
                                 // charge. The draft's children still get

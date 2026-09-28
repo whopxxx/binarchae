@@ -94,69 +94,147 @@ impl Handler for ZipHandler {
         let mut encrypted = false;
         let mut warnings: Vec<String> = Vec::new();
         let mut total_expanded: u64 = 0;
+        let mut working_password: Option<crate::passwords::PasswordCandidate> = None;
         let compressed_hint = (archive_end - rel) as u64;
 
         for i in 0..entry_count {
-            let mut entry = archive.by_index(i).map_err(|e| Error::Validation {
-                format: "zip",
-                reason: format!("entry {i} unreadable: {e}"),
-            })?;
-            let raw_name = entry.name().to_string();
-            names.push(raw_name.clone());
-
-            if entry.encrypted() {
-                encrypted = true;
-                warnings.push(format!("entry {raw_name:?} is encrypted"));
-                continue;
-            }
-
+            let raw_name = match archive.by_index_raw(i) {
+                Ok(raw) => raw.name().to_string(),
+                Err(e) => {
+                    warnings.push(format!("entry {i} unreadable: {e}"));
+                    continue;
+                }
+            };
             // Ratio cap per entry based on archive size so far.
             let entry_cap = limits.max_child_size.min(
                 limits
                     .max_expansion_ratio
                     .saturating_mul(compressed_hint.max(1)),
             );
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 64 * 1024];
-            loop {
-                match entry.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        total_expanded += n as u64;
-                        if total_expanded > entry_cap {
-                            return Err(Error::LimitExceeded {
-                                limit: "compression-expansion-ratio/child-size",
-                                detail: format!(
-                                    "zip entries exceeded {entry_cap} bytes (archive {compressed_hint})"
-                                ),
-                            });
+
+            // FINAL-B4: encrypted entries are tried against the shared,
+            // bounded candidate queue (empty first, then
+            // `limits.passwords`, which the engine seeded from the vault).
+            // The ZipFile borrow of `archive` lives only inside one
+            // attempt, so candidates are tried in sequence. Limit errors
+            // ABORT the entry (B1 semantics: caps are not retryable);
+            // wrong-password errors are skipped.
+            enum EntryOutcome {
+                Bytes(Vec<u8>),
+                NoPassword,
+                Decode,
+                Unreadable(String),
+            }
+            let read_result: EntryOutcome = if archive
+                .by_index_raw(i)
+                .map(|raw| raw.encrypted())
+                .unwrap_or(false)
+            {
+                encrypted = true;
+                let vault = if limits.passwords.is_empty() {
+                    None
+                } else {
+                    Some(crate::passwords::PasswordVault::from_passwords(
+                        &limits.passwords,
+                    ))
+                };
+                let candidates = crate::passwords::attempt_queue(limits, vault.as_ref());
+                let mut outcome = EntryOutcome::NoPassword;
+                let mut last_err: Option<String> = None;
+                for c in &candidates {
+                    match archive.by_index_decrypt(i, c.password.as_bytes()) {
+                        Ok(mut entry) => {
+                            match read_entry_capped(
+                                &mut entry,
+                                entry_cap,
+                                compressed_hint,
+                                limits,
+                                budget,
+                                &mut total_expanded,
+                            ) {
+                                Ok(bytes) => {
+                                    if !c.password.is_empty() {
+                                        working_password = Some(c.clone());
+                                    }
+                                    outcome = EntryOutcome::Bytes(bytes);
+                                    break;
+                                }
+                                Err(LimitErr::LimitAbort(msg)) => {
+                                    // Ratio/budget cap: abort, never retry.
+                                    return Err(Error::LimitExceeded {
+                                        limit: "compression-expansion-ratio/child-size",
+                                        detail: msg,
+                                    });
+                                }
+                                Err(LimitErr::LimitIo(e)) => {
+                                    // Genuine decompression failure — for
+                                    // ZipCrypto a wrong password usually
+                                    // fails HERE (1/256 false-accept rate).
+                                    last_err = Some(e.to_string());
+                                }
+                            }
                         }
-                        if !budget.charge(limits, n as u64) {
-                            return Err(Error::LimitExceeded {
-                                limit: "max-total-expanded-bytes",
-                                detail: format!("zip entry {raw_name:?} +{n}"),
-                            });
-                        }
-                        buf.extend_from_slice(&chunk[..n]);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        warnings.push(format!("entry {raw_name:?} failed to decompress: {e}"));
-                        break;
+                        Err(e) => last_err = Some(e.to_string()),
                     }
                 }
-            }
+                if matches!(outcome, EntryOutcome::NoPassword) {
+                    warnings.push(format!(
+                        "entry {raw_name:?} is encrypted; no working password candidate ({} \
+                         tried){}",
+                        candidates.len(),
+                        last_err.map(|e| format!(": {e}")).unwrap_or_default()
+                    ));
+                }
+                outcome
+            } else {
+                match archive.by_index(i) {
+                    Ok(mut entry) => match read_entry_capped(
+                        &mut entry,
+                        entry_cap,
+                        compressed_hint,
+                        limits,
+                        budget,
+                        &mut total_expanded,
+                    ) {
+                        Ok(bytes) => EntryOutcome::Bytes(bytes),
+                        Err(LimitErr::LimitAbort(msg)) => {
+                            return Err(Error::LimitExceeded {
+                                limit: "compression-expansion-ratio/child-size",
+                                detail: msg,
+                            });
+                        }
+                        Err(LimitErr::LimitIo(_e)) => EntryOutcome::Decode,
+                    },
+                    Err(e) => EntryOutcome::Unreadable(e.to_string()),
+                }
+            };
+            names.push(raw_name.clone());
+            let buf = match read_result {
+                EntryOutcome::Bytes(b) => b,
+                EntryOutcome::NoPassword | EntryOutcome::Decode => continue,
+                EntryOutcome::Unreadable(e) => {
+                    warnings.push(format!("entry {raw_name:?} unreadable: {e}"));
+                    continue;
+                }
+            };
+
             if buf.is_empty() {
                 continue;
             }
             let buf_size = buf.len() as u64;
+            let mut child_meta = BTreeMap::new();
+            // FINAL-B4: record WHICH password worked on the child; the
+            // engine (which owns the vault) adds the provenance.
+            if let Some(c) = &working_password {
+                child_meta.insert("password".to_string(), c.password.clone());
+            }
             children.push(ChildDraft {
                 relation: RelationKind::Contains,
                 label: format!("zip entry {raw_name}"),
                 format_hint: "raw",
                 content: ChildContent::Owned(buf),
                 size: buf_size,
-                metadata: BTreeMap::new(),
+                metadata: child_meta,
                 warnings: Vec::new(),
                 entry_name: Some(raw_name),
             });
@@ -165,6 +243,11 @@ impl Handler for ZipHandler {
         let mut metadata = BTreeMap::new();
         metadata.insert("entries".to_string(), entry_count.to_string());
         metadata.insert("encrypted".to_string(), encrypted.to_string());
+        // FINAL-B4: a working auto-discovered password is surfaced; the
+        // engine (which owns the vault) adds the provenance.
+        if let Some(c) = &working_password {
+            metadata.insert("password".to_string(), c.password.clone());
+        }
         if !names.is_empty() {
             metadata.insert("entry_names".to_string(), names.join("\n"));
         }
@@ -191,6 +274,51 @@ impl Handler for ZipHandler {
             }],
         })
     }
+}
+
+/// Error from [`read_entry_capped`]: `LimitAbort` is a resource cap
+/// (abort the entry, never retry); `LimitIo` is a genuine decompression
+/// failure (retryable under the next password candidate).
+enum LimitErr {
+    LimitAbort(String),
+    LimitIo(std::io::Error),
+}
+
+/// Read one zip entry's full decompressed bytes under the per-entry
+/// ratio cap and the run-wide budget. Charges are incremental (B1) so
+/// bombs are cut off mid-stream.
+fn read_entry_capped(
+    entry: &mut zip::read::ZipFile<'_>,
+    entry_cap: u64,
+    compressed_hint: u64,
+    limits: &crate::engine::EngineLimits,
+    budget: &mut Budget,
+    total_expanded: &mut u64,
+) -> std::result::Result<Vec<u8>, LimitErr> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match entry.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                *total_expanded += n as u64;
+                if *total_expanded > entry_cap {
+                    return Err(LimitErr::LimitAbort(format!(
+                        "zip entries exceeded {entry_cap} bytes (archive {compressed_hint})"
+                    )));
+                }
+                if !budget.charge(limits, n as u64) {
+                    return Err(LimitErr::LimitAbort(
+                        "max-total-expanded-bytes exceeded".to_string(),
+                    ));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(LimitErr::LimitIo(e)),
+        }
+    }
+    Ok(buf)
 }
 
 /// Find the archive end: scan backwards for the last EOCD signature whose
