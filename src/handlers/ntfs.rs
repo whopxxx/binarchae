@@ -365,20 +365,28 @@ impl NtfsHandler {
             if pos + offset_size > runs.len() {
                 break;
             }
-            // Little-endian value, sign-extended from offset_size*8 bits.
-            let mut val: u64 = 0;
+            // Little-endian value, sign-extended from offset_size*8
+            // bits. FINAL-B2: offset_size == 8 previously computed
+            // `1i64 << 64` (shift overflow panic in debug / UB-adjacent
+            // behavior); use i128 for the width-sized arithmetic and
+            // keep the accumulator in i64 via checked ops.
+            let mut val: u128 = 0;
             for k in 0..offset_size {
-                val |= u64::from(runs[pos + k]) << (8 * k);
+                val |= u128::from(runs[pos + k]) << (8 * k);
             }
-            let sign_bit = 1u64 << (offset_size * 8 - 1);
-            let delta = if val & sign_bit != 0 {
-                (val as i64).wrapping_sub(1i64 << (offset_size * 8))
+            let width = offset_size * 8;
+            let sign_bit = 1u128 << (width - 1);
+            let delta: i64 = if val & sign_bit != 0 {
+                let ext = (val as i128) - (1i128 << width);
+                // A delta beyond i64 is a corrupt runlist; treat as
+                // invalid by aborting the walk (i64::MAX sentinel).
+                i64::try_from(ext).unwrap_or(i64::MAX)
             } else {
-                val as i64
+                i64::try_from(val).unwrap_or(i64::MAX)
             };
             pos += offset_size;
-            prev_lcn += delta;
-            if delta == 0 {
+            prev_lcn = prev_lcn.wrapping_add(delta);
+            if delta == 0 || delta == i64::MAX {
                 // Zero delta with nonzero offset field is invalid; stop.
                 break;
             }
@@ -980,6 +988,41 @@ mod tests {
         }
 
         img
+    }
+
+    /// FINAL-B2 regression: an 8-byte negative run delta previously
+    /// computed `1i64 << 64` (shift overflow). Wide deltas must decode
+    /// with correct sign extension.
+    #[test]
+    fn ntfs_runlist_wide_negative_delta() {
+        // Header: size field 1 byte, offset field 8 bytes.
+        // len = 1 cluster; delta = -1 as 8-byte LE two's complement.
+        let mut runs = vec![0x81u8];
+        runs.push(1); // len = 1
+        runs.extend_from_slice(&(-1i64).to_le_bytes()); // offset = -1
+        let cluster_size = 512;
+        let parsed = NtfsHandler::unpack_runs(&runs, cluster_size);
+        assert_eq!(parsed.len(), 1, "one run parsed");
+        let (lcn, len) = parsed[0];
+        // Length is in BYTES; LCN is the raw cluster number.
+        assert_eq!(len, cluster_size);
+        // prev LCN starts at 0; delta -1 => LCN -1 (wraps as u64::MAX).
+        assert_eq!(lcn, Some(u64::MAX));
+    }
+
+    /// FINAL-B2: sparse run (offset field 0) plus a following wide run.
+    #[test]
+    fn ntfs_runlist_sparse_then_normal() {
+        let mut runs = vec![0x01u8]; // size only, sparse
+        runs.push(2); // len 2 clusters
+        runs.push(0x81); // 1-byte len, 8-byte offset
+        runs.push(3); // len 3
+        runs.extend_from_slice(&5i64.to_le_bytes()); // delta +5
+        let parsed = NtfsHandler::unpack_runs(&runs, 512);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0], (None, 1024), "sparse run");
+        // LCN raw (5), length in bytes (3 * 512).
+        assert_eq!(parsed[1], (Some(5), 3 * 512), "normal run");
     }
 
     #[test]

@@ -65,6 +65,17 @@ fn le32(src: &ByteSource, off: u64) -> Option<u32> {
     Some(u32::from_le_bytes(b))
 }
 
+/// One mapped extent: logical file-block range -> physical blocks.
+#[derive(Debug, Clone, Copy)]
+struct ExtRun {
+    /// First LOGICAL file block this extent covers (ee_block).
+    logical: u32,
+    /// First physical block on disk.
+    phys: u64,
+    /// Number of blocks (<= MAX_EXTENT_LEN).
+    len: u32,
+}
+
 #[derive(Debug, Clone)]
 struct ExtSb {
     inode_size: u64,
@@ -361,7 +372,7 @@ impl ExtHandler {
         sb: &ExtSb,
         root: Option<(u64, [u32; 15])>,
         blocks_needed: usize,
-        runs: &mut Vec<(u64, u32)>,
+        runs: &mut Vec<ExtRun>,
         warnings: &mut Vec<String>,
     ) -> Result<()> {
         let mut queue: Vec<(u64, u32)> = Vec::new(); // (block offset or inode off encoded, depth)
@@ -441,10 +452,14 @@ impl ExtHandler {
     fn push_extent(
         src: &ByteSource,
         e: u64,
-        runs: &mut Vec<(u64, u32)>,
+        runs: &mut Vec<ExtRun>,
         warnings: &mut Vec<String>,
     ) -> Result<()> {
-        let ee_block = le32(src, e).unwrap_or(0) as u64;
+        // FINAL-B2: ee_block is the extent's LOGICAL file-block start.
+        // It must be carried through — extents with a nonzero logical
+        // offset (sparse files, gapped extents) silently misassembled
+        // when it was discarded.
+        let ee_block = le32(src, e).unwrap_or(0);
         let ee_len = le16(src, e + 4).unwrap_or(0) as u32;
         let hi = le16(src, e + 6).unwrap_or(0) as u64;
         let lo = le32(src, e + 8).unwrap_or(0) as u64;
@@ -452,8 +467,11 @@ impl ExtHandler {
             warnings.push("unwritten/invalid extent skipped".to_string());
             return Ok(());
         }
-        let _ = ee_block;
-        runs.push((lo | (hi << 32), ee_len));
+        runs.push(ExtRun {
+            logical: ee_block,
+            phys: lo | (hi << 32),
+            len: ee_len,
+        });
         Ok(())
     }
 
@@ -485,27 +503,39 @@ impl ExtHandler {
                 &mut runs,
                 warnings,
             )?;
-            // Sort by logical position encoded earlier (we pushed
-            // sequential order during the walk, so keep as-is).
-            for (phys, len) in runs {
-                let want = (ino.size - out.len() as u64).min(u64::from(len) * sb.block_size);
+            // FINAL-B2: place each extent at its LOGICAL file offset
+            // (ee_block * block_size). Runs are sorted by logical start
+            // so sparse holes between extents become zero fill.
+            runs.sort_by_key(|r| r.logical);
+            for run in runs {
+                let file_off = u64::from(run.logical) * sb.block_size;
+                if file_off >= ino.size {
+                    break;
+                }
+                // Grow output with zeros up to the extent's logical
+                // position (holes).
+                if file_off > out.len() as u64 {
+                    let fill = (file_off - out.len() as u64) as usize;
+                    out.resize(out.len() + fill, 0);
+                }
+                let want = (ino.size - out.len() as u64).min(u64::from(run.len) * sb.block_size);
                 if want == 0 {
                     break;
                 }
-                let off = sb.base + phys * sb.block_size;
+                let off = sb.base + run.phys * sb.block_size;
                 let mut chunk = vec![0u8; want as usize];
                 if off + want <= src.len() {
                     src.read_at(off, &mut chunk)?;
                 } else {
                     warnings.push("extent past source; zero-filled".to_string());
                 }
-                out.extend_from_slice(&chunk);
                 if !budget.charge(limits, want) {
                     return Err(Error::LimitExceeded {
                         limit: "max-total-expanded-bytes",
                         detail: "ext file reconstruction".into(),
                     });
                 }
+                out.extend_from_slice(&chunk);
                 if out.len() as u64 >= ino.size {
                     break;
                 }
@@ -578,9 +608,12 @@ impl ExtHandler {
                 &mut runs,
                 warnings,
             )?;
-            for (phys, len) in runs {
-                for k in 0..len {
-                    let off = sb.base + (phys + u64::from(k)) * sb.block_size;
+            // Directories are small; extents are read in logical
+            // order (sorted) so gapped extents still land in order.
+            runs.sort_by_key(|r| r.logical);
+            for run in runs {
+                for k in 0..run.len {
+                    let off = sb.base + (run.phys + u64::from(k)) * sb.block_size;
                     let mut block = vec![0u8; sb.block_size as usize];
                     if off + sb.block_size <= src.len() {
                         src.read_at(off, &mut block)?;
@@ -1139,6 +1172,69 @@ mod tests {
         match &data.content {
             ChildContent::Owned(d) => assert_eq!(*d, b"EXTENT_DATA_1234".to_vec()),
             _ => panic!("extent file must reconstruct"),
+        }
+    }
+
+    /// FINAL-B2 regression: extents with nonzero ee_block (logical
+    /// offset) must land at the right file position; the hole before
+    /// them is zero-filled, not collapsed.
+    #[test]
+    fn ext4_gapped_extent_logical_placement() {
+        let mut img = ext2_image();
+        let sb = 1024usize;
+        img[sb + 0x60..sb + 0x64].copy_from_slice(&0x40u32.to_le_bytes());
+        let f = 4096 + (12 - 1) * INODE_SIZE as usize;
+        macro_rules! put32 {
+            ($o:expr, $v:expr) => {
+                img[$o..$o + 4].copy_from_slice(&($v as u32).to_le_bytes());
+            };
+        }
+        macro_rules! put16 {
+            ($o:expr, $v:expr) => {
+                img[$o..$o + 2].copy_from_slice(&($v as u16).to_le_bytes());
+            };
+        }
+        put16!(f, 0o100644);
+        // size = 2 blocks (block 1 is the hole).
+        put32!(f + 4, 2 * BS as u32);
+        put32!(f + 36, EXTENTS_FL);
+        put16!(f + 40, EXTENT_MAGIC);
+        put16!(f + 42, 1); // entries
+        put16!(f + 44, 4); // max
+        put16!(f + 46, 0); // depth
+        put32!(f + 48, 0);
+        // extent: ee_block 1 (LOGICAL block 1), len 1, at physical 13.
+        put32!(f + 52, 1);
+        put16!(f + 56, 1);
+        put16!(f + 58, 0);
+        put32!(f + 60, 13);
+        // Root dir: FLAG.TXT entry -> inode 12.
+        let d = 10 * BS as usize;
+        put16!(d + 24 + 4, 16);
+        let de = d + 40;
+        put32!(de, 12);
+        put16!(de + 4, 1024 - 40);
+        img[de + 6] = 8;
+        img[de + 7] = 1;
+        img[de + 8..de + 16].copy_from_slice(b"DATA.BIN");
+        // Data at physical block 13: "GAPPED".
+        img[13 * BS as usize..13 * BS as usize + 6].copy_from_slice(b"GAPPED");
+
+        let src = ByteSource::from_vec(img);
+        let out = validate_at(&src, 0).expect("ext4 validates");
+        let data = out.artifacts[0]
+            .children
+            .iter()
+            .find(|c| c.metadata.get("path").map(String::as_str) == Some("DATA.BIN"))
+            .expect("DATA.BIN child");
+        assert_eq!(data.size, 2 * BS);
+        match &data.content {
+            ChildContent::Owned(d) => {
+                // Logical block 0 = hole (zeros), block 1 = "GAPPED...".
+                assert!(d[..BS as usize].iter().all(|&b| b == 0), "hole is zeros");
+                assert_eq!(&d[BS as usize..BS as usize + 6], b"GAPPED");
+            }
+            _ => panic!("owned content"),
         }
     }
 

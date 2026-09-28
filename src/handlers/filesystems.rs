@@ -425,21 +425,32 @@ impl SquashfsHandler {
         let bs = u64::from(sb.block_size);
         let total = ino.file_size.min(limits.max_child_size);
         let mut out = Vec::with_capacity(total as usize);
+        // FINAL-B2: data blocks are stored CONTIGUOUSLY starting at
+        // start_block; the inode block list gives each block's STORED
+        // (compressed) size. Previously every block was read from the
+        // same start_block offset, so multi-block files repeated block
+        // 0. Keep a running cursor instead.
+        let mut cursor = sb.data_start + u64::from(ino.start_block);
         for &blk in &ino.block_list {
             let stored = blk & !COMPRESSED_BIT_BLOCK;
             if stored == 0 {
-                // Sparse block.
+                // Sparse block: consumes a full logical block but NO
+                // stored bytes — the cursor does not advance for it
+                // (there is nothing stored on disk for it).
                 let take = bs.min(total - out.len() as u64);
                 out.resize(out.len() + take as usize, 0);
                 continue;
             }
-            let blk_abs = sb.data_start + u64::from(ino.start_block);
+            let blk_abs = cursor;
             if blk_abs + u64::from(stored) > src.len() {
                 warnings.push("file block past source; truncated".to_string());
                 break;
             }
             let mut raw = vec![0u8; stored as usize];
             src.read_at(blk_abs, &mut raw)?;
+            // FINAL-B1: bounds-checked before allocation; cursor only
+            // advances after the block proved readable.
+            cursor += u64::from(stored);
             let data = if blk & COMPRESSED_BIT_BLOCK != 0 {
                 raw.clone() // uncompressed flag set
             } else {
@@ -4222,6 +4233,124 @@ mod tests {
         img.extend_from_slice(&inode_meta);
         img.extend_from_slice(&dir_meta);
         img
+    }
+
+    /// FINAL-B2 regression: a multi-block file must assemble blocks
+    /// CONTIGUOUSLY from start_block (the block list gives each block's
+    /// stored size), not re-read block 0 for every entry. Block A holds
+    /// "AAAA", block B holds "BBBB"; the old bug produced "AAAA" twice.
+    #[test]
+    fn squashfs_multiblock_file_contiguous() {
+        use std::io::Write as _;
+
+        fn meta_block(data: &[u8]) -> Vec<u8> {
+            let mut enc =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(data).unwrap();
+            let comp = enc.finish().unwrap();
+            let mut out = Vec::new();
+            out.extend_from_slice(&(comp.len() as u16).to_le_bytes());
+            out.extend_from_slice(&comp);
+            out
+        }
+
+        // File inode: 2 full blocks (uncompressed, bit24 set),
+        // fragment INVALID. block_log 16 => 64 KiB blocks (the
+        // validator requires 16..=22). Blocks: "A"*65536 + "B"*65536.
+        let mut inodes = Vec::new();
+        // Root dir inode (type 1) at 0.
+        inodes.extend_from_slice(&1u16.to_le_bytes());
+        inodes.extend_from_slice(&0o040755u16.to_le_bytes());
+        inodes.extend_from_slice(&0u16.to_le_bytes());
+        inodes.extend_from_slice(&0u16.to_le_bytes());
+        inodes.extend_from_slice(&0u32.to_le_bytes());
+        inodes.extend_from_slice(&1u32.to_le_bytes());
+        inodes.extend_from_slice(&0u32.to_le_bytes()); // start_block
+        inodes.extend_from_slice(&2u32.to_le_bytes()); // nlink
+        inodes.extend_from_slice(&29u16.to_le_bytes()); // file_size (dir): 12 hdr + 8 entry + 10 name
+        inodes.extend_from_slice(&0u16.to_le_bytes()); // offset
+        inodes.extend_from_slice(&0u32.to_le_bytes()); // parent
+                                                       // File inode (type 2) at 32.
+        inodes.extend_from_slice(&2u16.to_le_bytes());
+        inodes.extend_from_slice(&0o100644u16.to_le_bytes());
+        inodes.extend_from_slice(&0u16.to_le_bytes());
+        inodes.extend_from_slice(&0u16.to_le_bytes());
+        inodes.extend_from_slice(&0u32.to_le_bytes()); // mtime
+        inodes.extend_from_slice(&2u32.to_le_bytes()); // inode number
+        inodes.extend_from_slice(&0u32.to_le_bytes()); // start_block 0
+        inodes.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // fragment: none
+        inodes.extend_from_slice(&0u32.to_le_bytes()); // frag offset
+        inodes.extend_from_slice(&(2 * 65536u32).to_le_bytes()); // file_size
+                                                                 // Block list: two uncompressed 65536-byte blocks.
+        inodes.extend_from_slice(&(65536u32 | (1 << 24)).to_le_bytes());
+        inodes.extend_from_slice(&(65536u32 | (1 << 24)).to_le_bytes());
+        let inode_meta = meta_block(&inodes);
+
+        // Directory table: root lists "MULTI.BIN".
+        let mut dirs = Vec::new();
+        dirs.extend_from_slice(&0u32.to_le_bytes());
+        dirs.extend_from_slice(&0u32.to_le_bytes());
+        dirs.extend_from_slice(&0u32.to_le_bytes());
+        dirs.extend_from_slice(&32u16.to_le_bytes());
+        dirs.extend_from_slice(&0i16.to_le_bytes());
+        dirs.extend_from_slice(&2u16.to_le_bytes());
+        dirs.extend_from_slice(&8u16.to_le_bytes()); // name size - 1
+        dirs.extend_from_slice(b"MULTI.BIN");
+        let dir_meta = meta_block(&dirs);
+
+        let data_start = 96u64;
+        // Data: block A at 0, block B at 65536 (contiguous).
+        let mut data = vec![b'A'; 65536];
+        data.extend_from_slice(&vec![b'B'; 65536]);
+        let inode_table_abs = data_start + data.len() as u64;
+        let dir_table_abs = inode_table_abs + inode_meta.len() as u64;
+        let bytes_used = dir_table_abs + dir_meta.len() as u64;
+
+        let mut sb = [0u8; 96];
+        sb[0..4].copy_from_slice(b"hsqs");
+        sb[4..8].copy_from_slice(&2u32.to_le_bytes());
+        sb[8..12].copy_from_slice(&0u32.to_le_bytes());
+        sb[12..16].copy_from_slice(&65536u32.to_le_bytes()); // block_size
+        sb[16..20].copy_from_slice(&0u32.to_le_bytes());
+        sb[20..22].copy_from_slice(&1u16.to_le_bytes());
+        sb[22..24].copy_from_slice(&16u16.to_le_bytes()); // block_log
+        sb[24..26].copy_from_slice(&0u16.to_le_bytes());
+        sb[26..28].copy_from_slice(&1u16.to_le_bytes());
+        sb[28..30].copy_from_slice(&4u16.to_le_bytes());
+        sb[30..32].copy_from_slice(&0u16.to_le_bytes());
+        sb[32..40].copy_from_slice(&0u64.to_le_bytes());
+        sb[40..48].copy_from_slice(&bytes_used.to_le_bytes());
+        sb[48..56].copy_from_slice(&u64::MAX.to_le_bytes());
+        sb[56..64].copy_from_slice(&inode_table_abs.to_le_bytes());
+        sb[64..72].copy_from_slice(&u64::MAX.to_le_bytes());
+        sb[72..80].copy_from_slice(&dir_table_abs.to_le_bytes());
+        sb[80..88].copy_from_slice(&u64::MAX.to_le_bytes());
+        sb[88..96].copy_from_slice(&u64::MAX.to_le_bytes());
+
+        let mut img = sb.to_vec();
+        img.extend_from_slice(&data);
+        img.extend_from_slice(&inode_meta);
+        img.extend_from_slice(&dir_meta);
+
+        let src = ByteSource::from_vec(img);
+        let out = validate_at(&SquashfsHandler, &src, 0).expect("squashfs validates");
+        let art = &out.artifacts[0];
+        let f = art
+            .children
+            .iter()
+            .find(|c| c.label.contains("MULTI.BIN"))
+            .expect("file child");
+        match &f.content {
+            ChildContent::Owned(d) => {
+                assert_eq!(d.len(), 131072, "two full blocks reassembled");
+                assert!(d[..65536].iter().all(|&x| x == b'A'), "block A first");
+                assert!(
+                    d[65536..].iter().all(|&x| x == b'B'),
+                    "block B second — not a repeat of A"
+                );
+            }
+            _ => panic!("owned reassembled content expected"),
+        }
     }
 
     #[test]
