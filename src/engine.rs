@@ -49,6 +49,11 @@ pub struct EngineLimits {
     pub max_string_candidates: usize,
     /// M3/A2: maximum filesystem entries per filesystem.
     pub max_fs_entries: usize,
+    /// #7: password candidates for encrypted containers (7z/RAR/ZIP).
+    /// Users supply them via CLI `--password` (repeatable); handlers
+    /// try each candidate against password-protected entries and
+    /// surface the working one as artifact metadata.
+    pub passwords: Vec<String>,
 }
 
 impl Default for EngineLimits {
@@ -68,6 +73,7 @@ impl Default for EngineLimits {
             max_registry_cells: 1_000_000,
             max_string_candidates: 4_096,
             max_fs_entries: 65_536,
+            passwords: Vec::new(),
         }
     }
 }
@@ -211,6 +217,7 @@ pub fn builtin_handlers() -> Vec<Box<dyn Handler>> {
         Box::new(handlers::compression::Bzip2Handler),
         Box::new(handlers::compression::ZstdHandler),
         Box::new(handlers::compression::Lz4Handler),
+        Box::new(handlers::compression::LzmaAloneHandler),
         Box::new(handlers::archives::ArHandler),
         Box::new(handlers::archives::DebHandler),
         Box::new(handlers::archives::CabHandler),

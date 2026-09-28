@@ -11,11 +11,12 @@
 //! - 7z: native decode via `sevenz-rust2` (pure Rust). Header parsed
 //!   for version/CRC; entries list validated; encrypted-entry flag
 //!   surfaced when the folder has a coder with a password input.
-//! - RAR: DETECT + metadata only (RAR 4.x `Rar!` / RAR5 with
-//!   0x526172211A07 record). No extraction — the only viable decode
-//!   paths are C-binding based (unrar) or patent-encumbered, so this
-//!   milestone honestly marks RAR Partial: detect, archive-version,
-//!   header-boundary best effort, no entry extraction.
+//! - RAR: full decode via the pure-Rust `rars` crate (RAR 1.3-7
+//!   families, no C bindings). Members are decoded per-entry; the
+//!   engine's password candidates (`--password`) are tried against
+//!   encrypted members and the working one is surfaced as metadata.
+//!   Without a working candidate the archive stays Partial with an
+//!   honest warning.
 
 use crate::artifact::{Confidence, Evidence, RelationKind};
 use crate::bytesource::ByteSource;
@@ -531,13 +532,46 @@ impl Handler for SevenZHandler {
         let mut children = Vec::new();
         let mut warnings = Vec::new();
         let mut encrypted = false;
+        let mut working_password: Option<String> = None;
 
         if base == 0 {
             // Native decode from a whole-file source via ArchiveReader.
+            // Try the empty password first, then each CLI candidate; the
+            // working password is surfaced as provenance metadata.
             let data = src.read_all()?;
-            let cursor = std::io::Cursor::new(&data[..]);
-            match sevenz_rust2::ArchiveReader::new(cursor, sevenz_rust2::Password::empty()) {
-                Ok(mut reader) => {
+            let mut opened: Option<(sevenz_rust2::ArchiveReader<_>, Option<String>)> = None;
+            let mut last_err = None;
+            let mut candidates: Vec<sevenz_rust2::Password> = vec![sevenz_rust2::Password::empty()];
+            candidates.extend(
+                limits
+                    .passwords
+                    .iter()
+                    .map(|p| sevenz_rust2::Password::new(p)),
+            );
+            for candidate in candidates {
+                let cursor = std::io::Cursor::new(&data[..]);
+                match sevenz_rust2::ArchiveReader::new(cursor, candidate.clone()) {
+                    Ok(reader) => {
+                        let used = if candidate.is_empty() {
+                            None
+                        } else {
+                            limits
+                                .passwords
+                                .iter()
+                                .find(|p| sevenz_rust2::Password::new(p.as_str()) == candidate)
+                                .cloned()
+                        };
+                        opened = Some((reader, used));
+                        break;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            match opened {
+                Some((mut reader, pw)) => {
+                    if let Some(p) = pw {
+                        working_password = Some(p);
+                    }
                     // Encrypted-entries detection: coders whose method id
                     // is AES-256-SHA256 (0x06F10701) per the 7z spec.
                     encrypted = reader.archive().blocks.iter().any(|b| {
@@ -587,7 +621,11 @@ impl Handler for SevenZHandler {
                         warnings.push(format!("entry walk: {e}"));
                     }
                 }
-                Err(e) => warnings.push(format!("archive open: {e}")),
+                None => {
+                    if let Some(e) = last_err {
+                        warnings.push(format!("archive open: {e}"));
+                    }
+                }
             }
         } else {
             warnings.push("embedded 7z: metadata only (native decode requires offset 0)".into());
@@ -595,6 +633,9 @@ impl Handler for SevenZHandler {
 
         let mut metadata = BTreeMap::new();
         metadata.insert("next_header_size".to_string(), nh_size.to_string());
+        if let Some(p) = &working_password {
+            metadata.insert("password".to_string(), p.clone());
+        }
         if encrypted {
             metadata.insert("encrypted_entries".to_string(), "yes".to_string());
         }
@@ -635,6 +676,44 @@ pub struct RarHandler;
 const RAR4_MAGIC: &[u8] = b"Rar!\x1a\x07\x00";
 const RAR5_MAGIC: &[u8] = b"Rar!\x1a\x07\x01\x00";
 
+/// One decoded member plus the password that worked (None = not
+/// encrypted).
+struct RarMember {
+    data: Vec<u8>,
+    password: Option<String>,
+}
+
+impl RarHandler {
+    /// Decode one member trying each password candidate (empty first).
+    fn decode_member(
+        archive: &rars::Archive,
+        index: usize,
+        limits: &crate::engine::EngineLimits,
+    ) -> Result<Option<RarMember>> {
+        let mut candidates: Vec<Option<String>> = vec![None];
+        candidates.extend(limits.passwords.iter().cloned().map(Some));
+        for candidate in candidates {
+            match archive.read_member_at(index, candidate.as_deref().map(str::as_bytes)) {
+                Ok(Some(data)) => {
+                    if data.len() as u64 > limits.max_child_size {
+                        return Err(Error::Validation {
+                            format: "rar",
+                            reason: format!("member exceeds max_child_size ({})", data.len()),
+                        });
+                    }
+                    return Ok(Some(RarMember {
+                        data,
+                        password: candidate,
+                    }));
+                }
+                Ok(None) => return Ok(None), // directory / no payload
+                Err(_) => continue,          // wrong password or decode error
+            }
+        }
+        Ok(None)
+    }
+}
+
 impl Handler for RarHandler {
     fn format(&self) -> &'static str {
         "rar"
@@ -660,66 +739,127 @@ impl Handler for RarHandler {
         src: &ByteSource,
         candidate: Candidate,
         limits: &crate::engine::EngineLimits,
-        _budget: &mut Budget,
+        budget: &mut Budget,
     ) -> Result<HandlerOutput> {
         let base = candidate.offset;
         let mut magic = [0u8; 8];
         src.read_at(base, &mut magic)?;
         let is_rar5 = magic == RAR5_MAGIC;
-        let version = if is_rar5 { "5" } else { "4" };
+        let version = if is_rar5 { "5" } else { "4.x" };
 
-        // Walk top-level headers as far as they are structurally sane.
-        // RAR5: header CRC(4) size(4) type(1) ...; RAR4: CRC(2) type(1)
-        // flags(2) size(2). Best-effort bounded walk for a size estimate.
-        let mut off = base + if is_rar5 { 8 } else { 7 };
-        let mut headers = 0usize;
-        while off + 7 <= src.len() && headers < limits.max_archive_entries {
-            headers += 1;
-            // Without a full RAR parser, estimate: RAR5 headers declare
-            // size; RAR4 headers have a 2-byte size at +3.
-            let mut probe = [0u8; 8];
-            if src.read_at(off, &mut probe).is_err() {
-                break;
+        // rars decodes from in-memory slices (its SFX scan is bounded
+        // internally). Embedded archives are sliced from the source.
+        let data = if base == 0 {
+            src.read_all()?
+        } else {
+            let len = src.len() - base;
+            let mut buf = vec![0u8; len as usize];
+            src.read_at(base, &mut buf)?;
+            buf
+        };
+
+        let mut children = Vec::new();
+        let mut warnings = Vec::new();
+        let mut working_password: Option<String> = None;
+        let mut encrypted_hits = false;
+        let mut member_count = 0usize;
+
+        match rars::ArchiveReader::read_with_options(&data, rars::ArchiveReadOptions::default()) {
+            Ok(archive) => {
+                for (index, member) in archive.members().enumerate() {
+                    if member_count >= limits.max_archive_entries {
+                        warnings
+                            .push("max_archive_entries reached; entry list truncated".to_string());
+                        break;
+                    }
+                    if member.meta.is_directory {
+                        continue;
+                    }
+                    member_count += 1;
+                    let name = member.meta.name_lossy();
+                    let declared = member.meta.unpacked_size;
+                    match Self::decode_member(&archive, index, limits)? {
+                        Some(member_bytes) => {
+                            if let Some(p) = member_bytes.password {
+                                encrypted_hits = true;
+                                if working_password.is_none() {
+                                    working_password = Some(p);
+                                }
+                            }
+                            if !budget.charge(limits, member_bytes.data.len() as u64) {
+                                return Err(Error::LimitExceeded {
+                                    limit: "max-total-expanded-bytes",
+                                    detail: "rar member".into(),
+                                });
+                            }
+                            children.push(ChildDraft {
+                                relation: RelationKind::Contains,
+                                label: format!(
+                                    "RAR member {name} ({} bytes)",
+                                    member_bytes.data.len()
+                                ),
+                                format_hint: "raw",
+                                content: ChildContent::Owned(member_bytes.data),
+                                size: declared,
+                                metadata: BTreeMap::new(),
+                                warnings: Vec::new(),
+                                entry_name: Some(name),
+                            });
+                        }
+                        None => {
+                            if declared > 0 {
+                                warnings.push(format!(
+                                    "member {name}: decode failed (encrypted without a \
+                                     working password candidate?)"
+                                ));
+                            }
+                        }
+                    }
+                }
             }
-            let step = if is_rar5 {
-                let size = u32::from_le_bytes([probe[0], probe[1], probe[2], probe[3]]);
-                // RAR5: header size field excludes CRC(4)+size(4).
-                u64::from(size).saturating_add(8)
-            } else {
-                let size = u16::from_le_bytes([probe[3], probe[4]]);
-                u64::from(size).max(7)
-            };
-            if step == 0 {
-                break;
-            }
-            off += step;
+            Err(e) => warnings.push(format!("RAR decode failed: {e}")),
         }
 
         let mut metadata: BTreeMap<String, String> = BTreeMap::new();
         metadata.insert("version".to_string(), version.to_string());
-        metadata.insert("headers_walked".to_string(), headers.to_string());
-        metadata.insert("extraction".to_string(), "not-implemented".to_string());
+        metadata.insert("entries_extracted".to_string(), children.len().to_string());
+        if encrypted_hits {
+            metadata.insert("encrypted_entries".to_string(), "yes".to_string());
+        }
+        if let Some(p) = &working_password {
+            metadata.insert("password".to_string(), p.clone());
+        }
 
         Ok(HandlerOutput {
             artifacts: vec![ArtifactDraft {
                 format: "rar".to_string(),
-                label: format!("RAR {version} archive (partial: detect/metadata only)"),
+                label: format!(
+                    "RAR {version} archive ({} members extracted){}",
+                    children.len(),
+                    if encrypted_hits { " [encrypted]" } else { "" }
+                ),
                 offset: base,
-                size: off.saturating_sub(base).max(if is_rar5 { 8 } else { 7 }),
-                confidence: Confidence::Partial,
+                size: data.len() as u64,
+                confidence: if children.is_empty() {
+                    Confidence::Partial
+                } else {
+                    Confidence::Validated
+                },
                 evidence: Evidence::facts([
                     format!("RAR {version} magic validated"),
-                    "top-level headers walked best-effort".to_string(),
-                    "entry extraction intentionally not implemented \
-                     (no viable pure-Rust decoder)"
-                        .to_string(),
+                    format!(
+                        "{} members decoded via rars (pure Rust, no C bindings)",
+                        children.len()
+                    ),
+                    match &working_password {
+                        Some(p) => format!("decrypted with a supplied password candidate ({p})"),
+                        None => "no password needed for decoded members".to_string(),
+                    },
                 ]),
                 metadata,
-                warnings: vec!["RAR extraction is out of scope for this milestone; \
-                     archive is detected and outlined but entries are not decoded"
-                    .to_string()],
+                warnings,
                 errors: Vec::new(),
-                children: Vec::new(),
+                children,
             }],
         })
     }
@@ -817,20 +957,99 @@ mod tests {
         assert!(validate_at(&ArHandler, &src, 0).is_err());
     }
 
+    /// A real RAR5 archive is produced by the rars test suite; here we
+    /// assert the stored-member decode path with a hand-built RAR5
+    /// using rars itself is covered there. For this unit test we check
+    /// that a truncated/corrupt archive degrades to honest Partial
+    /// with a warning rather than a hard error.
     #[test]
-    fn rar5_detected_as_partial() {
+    fn rar_corrupt_degrades_to_partial() {
         let mut blob = RAR5_MAGIC.to_vec();
-        // A plausible RAR5 main-archive header: crc(4) size(4)=13 type(1)=1
-        blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 13, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+        blob.extend_from_slice(&[0xFF; 64]); // garbage instead of headers
         let src = ByteSource::from_vec(blob);
-        let out = validate_at(&RarHandler, &src, 0).expect("rar5 validates (partial)");
+        let out = validate_at(&RarHandler, &src, 0).expect("rar validates");
         let art = &out.artifacts[0];
         assert_eq!(art.confidence, Confidence::Partial);
         assert_eq!(art.metadata.get("version").map(String::as_str), Some("5"));
+        assert!(art.children.is_empty(), "no members from a corrupt archive");
+        assert!(!art.warnings.is_empty(), "decode failure surfaced");
+    }
+    /// End-to-end: build a real stored RAR5 archive via the rars
+    /// writer, then assert the handler decodes the member.
+    #[test]
+    fn rar5_stored_member_extracted() {
+        let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50).store(true);
+        builder
+            .add_bytes(
+                b"flag.txt".to_vec(),
+                b"RAR5_FLAG_CONTENT".to_vec(),
+                None,
+                None,
+            )
+            .expect("add member");
+        let archive_bytes = builder.to_bytes().expect("build rar5");
+        let src = ByteSource::from_vec(archive_bytes);
+        let out = validate_at(&RarHandler, &src, 0).expect("rar validates");
+        let art = &out.artifacts[0];
+        assert_eq!(art.confidence, Confidence::Validated);
+        assert_eq!(art.metadata.get("version").map(String::as_str), Some("5"));
+        assert_eq!(art.children.len(), 1);
+        assert_eq!(art.children[0].entry_name.as_deref(), Some("flag.txt"));
         assert_eq!(
-            art.metadata.get("extraction").map(String::as_str),
-            Some("not-implemented")
+            art.children[0].content.to_bytes().unwrap(),
+            b"RAR5_FLAG_CONTENT".to_vec()
         );
-        assert!(art.children.is_empty(), "no extraction for RAR");
+    }
+
+    /// Password-protected member: without a candidate the archive
+    /// stays Partial with a warning; with the right candidate the
+    /// member decodes and the password is surfaced as metadata.
+    #[test]
+    fn rar5_password_candidate_propagation() {
+        let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50)
+            .store(true)
+            .password(Some(b"hunter2".to_vec()));
+        builder
+            .add_bytes(b"secret.txt".to_vec(), b"RAR5_SECRET".to_vec(), None, None)
+            .expect("add member");
+        let archive_bytes = builder.to_bytes().expect("build rar5");
+
+        // Without a candidate: no decode, honest Partial.
+        let src = ByteSource::from_vec(archive_bytes.clone());
+        let out = validate_at(&RarHandler, &src, 0).expect("rar validates");
+        let art = &out.artifacts[0];
+        assert_eq!(art.confidence, Confidence::Partial);
+        assert!(art.children.is_empty());
+
+        // With the right candidate: decoded + provenance surfaced.
+        let limits = crate::engine::EngineLimits {
+            passwords: vec!["wrong".to_string(), "hunter2".to_string()],
+            ..crate::engine::EngineLimits::default()
+        };
+        let mut budget = Budget::default();
+        let out = RarHandler
+            .validate(
+                &ByteSource::from_vec(archive_bytes),
+                Candidate { offset: 0 },
+                &limits,
+                &mut budget,
+            )
+            .expect("rar validates");
+        let art = &out.artifacts[0];
+        assert_eq!(art.confidence, Confidence::Validated);
+        assert_eq!(art.children.len(), 1);
+        assert_eq!(
+            art.children[0].content.to_bytes().unwrap(),
+            b"RAR5_SECRET".to_vec()
+        );
+        assert_eq!(
+            art.metadata.get("password").map(String::as_str),
+            Some("hunter2"),
+            "working password candidate surfaced in metadata"
+        );
+        assert_eq!(
+            art.metadata.get("encrypted_entries").map(String::as_str),
+            Some("yes")
+        );
     }
 }

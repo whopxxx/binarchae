@@ -52,6 +52,10 @@ struct Cli {
     /// Optional TOML file with user-defined carving rules.
     #[arg(long)]
     carving_rules: Option<PathBuf>,
+
+    /// Password candidate for encrypted containers (7z/RAR). Repeatable.
+    #[arg(long = "password")]
+    passwords: Vec<String>,
 }
 
 fn main() {
@@ -73,6 +77,7 @@ fn run(cli: &Cli) -> i32 {
         max_depth: cli.max_depth,
         max_artifacts: cli.max_artifacts,
         max_total_expanded_bytes: cli.max_expanded_bytes,
+        passwords: cli.passwords.clone(),
         ..EngineLimits::default()
     };
 
