@@ -578,6 +578,12 @@ impl NtfsHandler {
             }
         }
 
+        // #7 §8: a record whose in-use flag is cleared is a DELETED
+        // file/dir. Its attributes (and for small files the resident
+        // $DATA payload) usually survive until the clusters are
+        // reused, so we still surface it — flagged honestly as
+        // deleted content, never as a validated live file.
+        let deleted = !in_use;
         let display = child_path
             .or_else(|| fname.clone())
             .unwrap_or_else(|| format!("$MFT record {rec_n}"));
@@ -590,6 +596,7 @@ impl NtfsHandler {
             warnings.push(format!("record {rec_n} ({display}): no $DATA attribute"));
         }
         if !is_dir {
+            let before = out.len();
             for a in data_attrs.drain(..) {
                 let stream_label = if a.name.is_some() {
                     format!(":{}", a.name.clone().unwrap_or_default())
@@ -609,6 +616,14 @@ impl NtfsHandler {
                     warnings,
                     out,
                 )?;
+            }
+            if deleted {
+                // §8: mark everything the deleted record produced.
+                for c in &mut out[before..] {
+                    c.metadata.insert("deleted".to_string(), "true".to_string());
+                    c.warnings
+                        .push("deleted MFT record: clusters may be reused; content is best-effort recovery".to_string());
+                }
             }
         } else {
             // Directory: walk INDEX_ROOT (small dirs) as metadata child.
@@ -669,23 +684,27 @@ impl NtfsHandler {
                     }
                 }
             }
+            let mut dmeta = BTreeMap::new();
+            dmeta.insert("mft_record".to_string(), rec_n.to_string());
+            dmeta.insert("type".to_string(), "directory".to_string());
+            let mut dwarn = Vec::new();
+            if deleted {
+                dmeta.insert("deleted".to_string(), "true".to_string());
+                dwarn.push(
+                    "deleted MFT record: directory content is best-effort recovery".to_string(),
+                );
+            }
             out.push(ChildDraft {
                 relation: RelationKind::FilesystemEntry,
                 label: format!("NTFS directory {display}"),
                 format_hint: "metadata",
                 content: ChildContent::Owned(Vec::new()),
                 size: 0,
-                metadata: {
-                    let mut m = BTreeMap::new();
-                    m.insert("mft_record".to_string(), rec_n.to_string());
-                    m.insert("type".to_string(), "directory".to_string());
-                    m
-                },
-                warnings: Vec::new(),
+                metadata: dmeta,
+                warnings: dwarn,
                 entry_name: fname,
             });
         }
-        let _ = in_use;
         Ok(())
     }
 }
@@ -922,8 +941,39 @@ mod tests {
             img[data_off..data_off + 12].copy_from_slice(b"NONRES_DATA!");
         }
 
+        // Record 18: DELETED file (in_use = 0) with resident data —
+        // #7 §8: content survives until clusters are reused.
+        {
+            let r = mft_off + 18 * REC_SIZE as usize;
+            let rec = &mut img[r..r + REC_SIZE as usize];
+            rec[0..4].copy_from_slice(b"FILE");
+            rec[4..6].copy_from_slice(&0x1Eu16.to_le_bytes());
+            rec[6..8].copy_from_slice(&3u16.to_le_bytes());
+            rec[510..512].copy_from_slice(&1u16.to_le_bytes());
+            rec[1022..1024].copy_from_slice(&1u16.to_le_bytes());
+            rec[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+            rec[0x14..0x16].copy_from_slice(&0x30u16.to_le_bytes());
+            rec[0x16..0x18].copy_from_slice(&0u16.to_le_bytes()); // NOT in use
+            rec[0x18..0x1C].copy_from_slice(&0x80u32.to_le_bytes());
+            rec[0x1C..0x20].copy_from_slice(&(REC_SIZE as u32).to_le_bytes());
+            let a = 0x30usize;
+            rec[a..a + 4].copy_from_slice(&ATTR_DATA.to_le_bytes());
+            let data = b"DELETED payload";
+            let attr_size = 0x18 + data.len();
+            rec[a + 4..a + 8].copy_from_slice(&(attr_size as u32).to_le_bytes());
+            rec[a + 8] = 0; // resident
+            rec[a + 9] = 0;
+            rec[a + 0x10..a + 0x14].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            rec[a + 0x14..a + 0x16].copy_from_slice(&0x18u16.to_le_bytes());
+            rec[a + 0x18..a + 0x18 + data.len()].copy_from_slice(data);
+            rec[a + attr_size..a + attr_size + 4].copy_from_slice(&ATTR_END.to_le_bytes());
+            rec[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+            rec[0x20..0x22].copy_from_slice(&1u16.to_le_bytes());
+            rec[0x22..0x24].copy_from_slice(&1u16.to_le_bytes());
+        }
+
         // Fixup seal for both records (markers already at stride ends).
-        for n in [16usize, 17usize] {
+        for n in [16usize, 17usize, 18usize] {
             let r = mft_off + n * REC_SIZE as usize;
             let rec = &mut img[r..r + REC_SIZE as usize];
             seal_fixups(rec, 0x1E, 3);
@@ -958,6 +1008,36 @@ mod tests {
             ChildContent::Owned(d) => assert_eq!(*d, b"NONRES_DATA!".to_vec()),
             _ => panic!("non-resident data"),
         }
+    }
+
+    /// #7 §8: a deleted (not-in-use) MFT record still yields its
+    /// resident content, flagged deleted=true with an honest warning.
+    #[test]
+    fn ntfs_deleted_record_content_surfaced() {
+        let src = ByteSource::from_vec(ntfs_image());
+        let out = validate_at(&src, 0).expect("ntfs validates");
+        let art = &out.artifacts[0];
+        let del = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("mft_record").map(String::as_str) == Some("18"))
+            .expect("deleted record still surfaced");
+        assert_eq!(
+            del.metadata.get("deleted").map(String::as_str),
+            Some("true"),
+            "record must be flagged deleted"
+        );
+        match &del.content {
+            ChildContent::Owned(d) => assert_eq!(*d, b"DELETED payload".to_vec()),
+            _ => panic!("resident deleted data expected"),
+        }
+        // Live records are NOT flagged.
+        assert!(art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("mft_record").map(String::as_str) == Some("16"))
+            .map(|c| !c.metadata.contains_key("deleted"))
+            .unwrap_or(true));
     }
 
     #[test]

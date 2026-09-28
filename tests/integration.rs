@@ -374,6 +374,84 @@ fn tar_child_extraction() {
     assert!(children.iter().any(|(_, a)| a.label.contains("hello.txt")));
 }
 
+/// (#7 §8) TAR salvage: a truncated final entry yields the bytes that
+/// exist, flagged truncated, with the earlier entries intact.
+#[test]
+fn tar_truncated_entry_salvage() {
+    // Built by hand: make_tar's 1024 end-of-archive zero blocks would
+    // sit between the entries and end the walk before "cut".
+    let mut tar = Vec::new();
+    let mut good = [0u8; 512];
+    good[..9].copy_from_slice(b"good.txt ");
+    good[124..136].copy_from_slice(b"00000000010 "); // octal 8
+    good[156] = b'0';
+    good[257..262].copy_from_slice(b"ustar");
+    tar.extend_from_slice(&good);
+    tar.extend_from_slice(b"GOODDATA");
+    tar.resize(tar.len() + 504, 0); // data pad to 512
+                                    // A second entry header whose declared size runs past the source
+                                    // end: header + only 4 of 10 data bytes.
+    let mut header = [0u8; 512];
+    header[..4].copy_from_slice(b"cut ");
+    header[124..136].copy_from_slice(b"00000000012 "); // octal 10
+    header[156] = b'0';
+    header[257..262].copy_from_slice(b"ustar");
+    tar.extend_from_slice(&header);
+    tar.extend_from_slice(b"CUT1"); // 4 of 10 bytes present
+    let src = ByteSource::from_vec(tar);
+    let mut e = engine();
+    let g = e.analyze(&src, true);
+    let tar_art = g
+        .artifacts
+        .iter()
+        .find(|a| a.format == "tar")
+        .expect("tar artifact");
+    let cut = g
+        .children(tar_art.id)
+        .into_iter()
+        .find(|(_, a)| a.label.contains("cut"))
+        .map(|(_, a)| a.clone())
+        .expect("truncated entry salvaged");
+    assert_eq!(
+        cut.metadata.get("truncated").map(String::as_str),
+        Some("true")
+    );
+    let bytes = e.cached_bytes(&cut.hash).expect("salvaged bytes cached");
+    assert_eq!(bytes, b"CUT1", "only the present bytes");
+    // The earlier complete entry survived too.
+    assert!(g
+        .children(tar_art.id)
+        .iter()
+        .any(|(_, a)| a.label.contains("good.txt")));
+}
+
+/// (#7 §8) TAR salvage: complete entries BEFORE a corrupt header still
+/// surface (the old tar-crate walk rejected the whole archive).
+#[test]
+fn tar_salvage_before_corrupt_header() {
+    let mut tar = make_tar(&[("first.txt", b"FIRST")]);
+    // A corrupt header: no ustar magic, garbage size field.
+    let mut bad = [0u8; 512];
+    bad[..7].copy_from_slice(b"garbage");
+    bad[124..136].copy_from_slice(b"zzzzzzzzzzz\0");
+    tar.extend_from_slice(&bad);
+    // A readable entry AFTER the corruption must NOT be lost either —
+    // but our salvage stops at the first implausible header (honest
+    // boundary), so assert only the pre-corruption entry.
+    let src = ByteSource::from_vec(tar);
+    let mut e = engine();
+    let g = e.analyze(&src, true);
+    let tar_art = g
+        .artifacts
+        .iter()
+        .find(|a| a.format == "tar")
+        .expect("tar artifact");
+    assert!(g
+        .children(tar_art.id)
+        .iter()
+        .any(|(_, a)| a.label.contains("first.txt")));
+}
+
 /// (8) Duplicate-content dedup without losing parent provenance.
 /// B8/B2 regression: hashes must be of the ACTUAL gzip regions (not the
 /// empty-bytes hash all region-backed artifacts used to share), and the

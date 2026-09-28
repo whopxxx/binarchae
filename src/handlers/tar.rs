@@ -1,5 +1,7 @@
-//! TAR handler: structural validation + native entry extraction via the
-//! `tar` crate. Safe-path rules enforced at the extraction layer.
+//! TAR handler: manual 512-byte header walk with salvage (#7 §8) —
+//! complete entries before a corruption point or truncation are still
+//! exposed; truncated final entries yield the bytes that exist
+//! (flagged truncated). Safe-path rules enforced at the extraction layer.
 
 use crate::artifact::{Confidence, Evidence, RelationKind};
 use crate::bytesource::ByteSource;
@@ -8,7 +10,6 @@ use crate::engine::{
 };
 use crate::error::{Error, Result};
 use std::collections::BTreeMap;
-use std::io::Cursor;
 
 pub struct TarHandler;
 
@@ -51,68 +52,157 @@ impl Handler for TarHandler {
             });
         }
 
-        let data = src.read_all()?;
-        let mut archive = tar::Archive::new(Cursor::new(&data[..]));
-        archive.set_preserve_permissions(false);
-        archive.set_unpack_xattrs(false);
-        archive.set_preserve_mtime(false);
-
-        let entries = archive
-            .entries()
-            .map_err(|e| Error::Validation {
-                format: "tar",
-                reason: format!("header chain invalid: {e}"),
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| Error::Validation {
-                format: "tar",
-                reason: format!("corrupt entry: {e}"),
-            })?;
-
-        if entries.len() > limits.max_archive_entries {
-            return Err(Error::LimitExceeded {
-                limit: "max-archive-entries",
-                detail: format!("{} entries", entries.len()),
-            });
-        }
-
+        // #7 §8: manual header walk so complete entries BEFORE a
+        // corruption point / truncation are still salvaged. The `tar`
+        // crate aborts on the first bad header; a CTF image often has
+        // one mangled entry followed by readable ones.
         let mut children: Vec<ChildDraft> = Vec::new();
         let mut names: Vec<String> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
-        for mut entry in entries {
-            let name = entry
-                .path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "<unnamed>".to_string());
-            names.push(name.clone());
-            let header_size = entry.size();
-            if header_size > limits.max_child_size {
-                warnings.push(format!("entry {name:?} exceeds max child size; skipped"));
-                continue;
+        let mut off: u64 = 0;
+        let mut complete_entries = 0usize;
+        let mut corrupt = false;
+        while off + 512 <= src.len() && complete_entries < limits.max_archive_entries {
+            let mut hdr = [0u8; 512];
+            if src.read_at(off, &mut hdr).is_err() {
+                break;
             }
-            let mut buf = Vec::new();
-            if std::io::Read::read_to_end(&mut entry, &mut buf).is_err() {
-                warnings.push(format!("entry {name:?} failed to read"));
-                continue;
+            // Name: first 100 bytes, NUL-terminated.
+            let name_end = hdr[..100].iter().position(|&b| b == 0).unwrap_or(100);
+            if name_end == 0 {
+                // Zero block region (end-of-archive padding) — stop.
+                break;
             }
-            if !budget.charge(limits, buf.len() as u64) {
-                return Err(Error::LimitExceeded {
-                    limit: "max-total-expanded-bytes",
-                    detail: format!("tar entry {name:?} +{} bytes", buf.len()),
+            let name = String::from_utf8_lossy(&hdr[..name_end]).into_owned();
+            // Numeric fields: octal, space/NUL-terminated.
+            let oct = |f: &[u8]| -> Option<u64> {
+                let t: Vec<u8> = f
+                    .iter()
+                    .copied()
+                    .take_while(|&b| b.is_ascii_digit())
+                    .collect();
+                if t.is_empty() {
+                    return None;
+                }
+                u64::from_str_radix(&String::from_utf8_lossy(&t), 8).ok()
+            };
+            let size_field = oct(&hdr[124..136]);
+            let typeflag = hdr[156];
+            let ustar = &hdr[257..262] == b"ustar";
+            let Some(size) = size_field else {
+                corrupt = true;
+                warnings.push(format!(
+                    "entry {}: unreadable size field; salvage stops here",
+                    name
+                ));
+                break;
+            };
+            if !ustar && typeflag != b'0' && typeflag != 0 {
+                // Not a plausible header at all.
+                corrupt = true;
+                warnings.push(format!(
+                    "entry {}: no ustar magic; salvage stops here",
+                    name
+                ));
+                break;
+            }
+            let data_start = off + 512;
+            let data_blocks = size.div_ceil(512);
+            let data_end = data_start
+                .checked_add(data_blocks * 512)
+                .ok_or(Error::Validation {
+                    format: "tar",
+                    reason: "size overflow".into(),
+                })?;
+            if data_end > src.len() {
+                // Truncated final entry: salvage the bytes that exist.
+                let have = src.len() - data_start;
+                let mut buf = vec![0u8; have as usize];
+                src.read_at(data_start, &mut buf)?;
+                if !budget.charge(limits, have) {
+                    return Err(Error::LimitExceeded {
+                        limit: "max-total-expanded-bytes",
+                        detail: format!("tar salvage {name:?} +{have} bytes"),
+                    });
+                }
+                let _ = typeflag;
+                names.push(name.clone());
+                children.push(ChildDraft {
+                    relation: RelationKind::Contains,
+                    label: format!("tar entry {name} (truncated: {} of {} bytes)", have, size),
+                    format_hint: "raw",
+                    content: ChildContent::Owned(buf),
+                    size: have,
+                    metadata: {
+                        let mut m = BTreeMap::new();
+                        m.insert("truncated".to_string(), "true".to_string());
+                        m.insert("declared_size".to_string(), size.to_string());
+                        m
+                    },
+                    warnings: vec![format!(
+                        "entry truncated at source end ({} of {} bytes present)",
+                        have, size
+                    )],
+                    entry_name: Some(name),
                 });
+                complete_entries += 1;
+                corrupt = true;
+                break;
             }
-            let buf_size = buf.len() as u64;
-            children.push(ChildDraft {
-                relation: RelationKind::Contains,
-                label: format!("tar entry {name}"),
-                format_hint: "raw",
-                content: ChildContent::Owned(buf),
-                size: buf_size,
-                metadata: BTreeMap::new(),
-                warnings: Vec::new(),
-                entry_name: Some(name),
+            // Complete entry: expose its full content.
+            let is_file = typeflag == b'0' || typeflag == 0;
+            if is_file && size > 0 {
+                if size > limits.max_child_size {
+                    warnings.push(format!("entry {name:?} exceeds max child size; skipped"));
+                } else {
+                    let region = src.slice(data_start, size)?;
+                    if !budget.charge(limits, size) {
+                        return Err(Error::LimitExceeded {
+                            limit: "max-total-expanded-bytes",
+                            detail: format!("tar entry {name:?} +{size} bytes"),
+                        });
+                    }
+                    names.push(name.clone());
+                    complete_entries += 1;
+                    children.push(ChildDraft {
+                        relation: RelationKind::Contains,
+                        label: format!("tar entry {name}"),
+                        format_hint: "raw",
+                        content: ChildContent::Source(region),
+                        size,
+                        metadata: BTreeMap::new(),
+                        warnings: Vec::new(),
+                        entry_name: Some(name),
+                    });
+                }
+            } else if !is_file {
+                // Directories / links: metadata only.
+                names.push(name.clone());
+                complete_entries += 1;
+                children.push(ChildDraft {
+                    relation: RelationKind::Contains,
+                    label: format!("tar entry {name} (type {typeflag})"),
+                    format_hint: "metadata",
+                    content: ChildContent::Owned(Vec::new()),
+                    size: 0,
+                    metadata: BTreeMap::new(),
+                    warnings: Vec::new(),
+                    entry_name: None,
+                });
+            } else {
+                names.push(name.clone());
+                complete_entries += 1;
+            }
+            off = data_end;
+        }
+
+        if complete_entries == 0 {
+            return Err(Error::Validation {
+                format: "tar",
+                reason: "no parseable entry headers".into(),
             });
         }
+        let _ = corrupt;
 
         let mut metadata = BTreeMap::new();
         metadata.insert("entries".to_string(), names.len().to_string());
