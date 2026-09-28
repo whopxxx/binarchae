@@ -237,6 +237,7 @@ pub fn builtin_handlers() -> Vec<Box<dyn Handler>> {
         Box::new(handlers::filesystems::Iso9660Handler),
         Box::new(handlers::ext::ExtHandler),
         Box::new(handlers::filesystems::ExtHandler),
+        Box::new(handlers::ntfs::NtfsHandler),
         Box::new(handlers::filesystems::NtfsHandler),
         Box::new(handlers::filesystems::UbiHandler),
         Box::new(handlers::romfs::RomfsHandler),

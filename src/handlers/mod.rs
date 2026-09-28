@@ -16,6 +16,7 @@ pub mod forensics;
 pub mod gzip;
 pub mod jpeg;
 pub mod media;
+pub mod ntfs;
 pub mod pdf;
 pub mod png;
 pub mod recovery;
