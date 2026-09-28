@@ -26,6 +26,8 @@ pub enum RelationKind {
     TrailingData,
     /// Unexplained data before the first validated structure.
     LeadingData,
+    /// #7 §9: unexplained bytes BETWEEN two validated structures.
+    InteriorGap,
     /// Coexists with another artifact over the same bytes.
     Overlap,
     /// M3: child is one partition of a disk/container (MBR/GPT slice).
@@ -50,6 +52,7 @@ impl fmt::Display for RelationKind {
             RelationKind::DecompressedFrom => "decompressed-from",
             RelationKind::TrailingData => "trailing-data",
             RelationKind::LeadingData => "leading-data",
+            RelationKind::InteriorGap => "interior-gap",
             RelationKind::Overlap => "overlap",
             RelationKind::PartitionOf => "partition-of",
             RelationKind::FilesystemEntry => "filesystem-entry",

@@ -70,6 +70,83 @@ pub fn compact_line(blocks: &[EntropyBlock]) -> String {
         .join(" ")
 }
 
+/// #7 §10: classified, grouped entropy region. Consecutive blocks with
+/// the same classification merge into one region so output stays
+/// compact regardless of source size.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EntropyRegion {
+    pub offset: u64,
+    pub size: u64,
+    /// Mean entropy over the constituent blocks (2 decimals).
+    pub entropy: f64,
+    /// sparse (< 3.0), mixed (3.0..6.5), high (> 6.5) bits/byte.
+    pub class: EntropyClass,
+}
+
+/// Sparse/low-entropy vs high-entropy classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EntropyClass {
+    /// Sparse/low: plaintext, padding, zeros, indices.
+    Sparse,
+    /// Mixed: structured data with some compressed fragments.
+    Mixed,
+    /// High: compressed/encrypted/uniform-random content.
+    High,
+}
+
+fn classify(bits: f64) -> EntropyClass {
+    if bits < 3.0 {
+        EntropyClass::Sparse
+    } else if bits > 6.5 {
+        EntropyClass::High
+    } else {
+        EntropyClass::Mixed
+    }
+}
+
+/// Group bounded entropy blocks into classified regions at
+/// classification transitions. Output is bounded by the transitions
+/// actually present (never one region per block).
+pub fn group_regions(blocks: &[EntropyBlock]) -> Vec<EntropyRegion> {
+    let mut out: Vec<EntropyRegion> = Vec::new();
+    for b in blocks {
+        let class = classify(b.entropy);
+        match out.last_mut() {
+            Some(r) if r.class == class => {
+                let merged_entropy = (r.entropy * r.size as f64 + b.entropy * b.size as f64)
+                    / (r.size + b.size) as f64;
+                r.entropy = (merged_entropy * 100.0).round() / 100.0;
+                r.size += b.size;
+            }
+            _ => out.push(EntropyRegion {
+                offset: b.offset,
+                size: b.size,
+                entropy: b.entropy,
+                class,
+            }),
+        }
+    }
+    out
+}
+
+/// Compact one-line rendering of the classified regions, e.g.
+/// `regions: 0x0-0x10000 high(7.98) | 0x10000-0x11000 sparse(2.31)`
+pub fn regions_line(regions: &[EntropyRegion]) -> String {
+    regions
+        .iter()
+        .map(|r| {
+            let name = match r.class {
+                EntropyClass::Sparse => "sparse",
+                EntropyClass::Mixed => "mixed",
+                EntropyClass::High => "high",
+            };
+            format!("{:#x}+{:#x} {}({:.2})", r.offset, r.size, name, r.entropy)
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +156,38 @@ mod tests {
         assert_eq!(shannon(&[0x41; 1000]), 0.0);
         let rising: Vec<u8> = (0..=255u8).collect();
         assert_eq!(shannon(&rising), 8.0);
+    }
+
+    /// #7 §10: blocks group at classification transitions only.
+    #[test]
+    fn region_grouping_merges_same_class() {
+        let blocks = vec![
+            EntropyBlock {
+                offset: 0,
+                size: 4096,
+                entropy: 7.9,
+            },
+            EntropyBlock {
+                offset: 4096,
+                size: 4096,
+                entropy: 7.8,
+            },
+            EntropyBlock {
+                offset: 8192,
+                size: 4096,
+                entropy: 1.2,
+            },
+            EntropyBlock {
+                offset: 12288,
+                size: 4096,
+                entropy: 4.0,
+            },
+        ];
+        let regions = group_regions(&blocks);
+        assert_eq!(regions.len(), 3, "two adjacent high blocks merge");
+        assert_eq!(regions[0].class, EntropyClass::High);
+        assert_eq!(regions[0].size, 8192, "merged size");
+        assert_eq!(regions[1].class, EntropyClass::Sparse);
+        assert_eq!(regions[2].class, EntropyClass::Mixed);
     }
 }

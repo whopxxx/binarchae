@@ -338,7 +338,7 @@ impl RecursiveEngine {
         let mut graph = ArtifactGraph::new();
         let mut budget = Budget::default();
         let root_id = self.register_root_stub(&mut graph, src);
-        self.scan_region(src, root_id, 0, recurse, &mut graph, &mut budget);
+        self.scan_region(src, root_id, 0, recurse, &mut graph, &mut budget, 0);
         graph
     }
 
@@ -370,6 +370,7 @@ impl RecursiveEngine {
     /// Scan one region of the source with all handlers, register results,
     /// and recurse into children. Never panics on malformed candidates:
     /// every handler call is error-isolated.
+    #[allow(clippy::too_many_arguments)]
     fn scan_region(
         &mut self,
         src: &ByteSource,
@@ -378,6 +379,9 @@ impl RecursiveEngine {
         recurse: bool,
         graph: &mut ArtifactGraph,
         budget: &mut Budget,
+        // `region_start`: absolute offset of this region within the
+        // ROOT source (0 at root; > 0 for nested region scans).
+        region_start: u64,
     ) {
         if depth > self.limits.max_depth {
             if let Some(p) = graph.get_mut(parent_id) {
@@ -487,15 +491,24 @@ impl RecursiveEngine {
         // which keeps provenance hierarchical (PNG -> trailing -> ZIP).
         drafts.sort_by_key(|d| (d.offset, u64::MAX - d.size));
 
-        // Leading data before the first structure.
+        // Leading data before the first structure. At the root level
+        // (region_start == 0) this is genuine leading data; inside a
+        // nested region (trailing data scan etc.) unexplained bytes
+        // before the first structure sit BETWEEN earlier structures and
+        // this one — an INTERIOR GAP (#7 §9), labeled as such.
         if let Some(first) = drafts.first() {
             if recurse && first.offset > 0 && depth < self.limits.max_depth {
+                let relation = if region_start == 0 {
+                    RelationKind::LeadingData
+                } else {
+                    RelationKind::InteriorGap
+                };
                 self.register_unexplained(
                     src,
                     parent_id,
                     0,
                     first.offset,
-                    RelationKind::LeadingData,
+                    relation,
                     depth,
                     recurse,
                     graph,
@@ -506,6 +519,9 @@ impl RecursiveEngine {
 
         let mut first_end: Option<u64> = None;
         let mut first_artifact: Option<ArtifactId> = None;
+        // #7 §9: registered validated structures this level, for overlap
+        // edge emission (distinct VALIDATED drafts sharing bytes).
+        let mut placed: Vec<(u64, u64, ArtifactId)> = Vec::new();
 
         for draft in drafts {
             if graph.len() >= self.limits.max_artifacts {
@@ -519,6 +535,26 @@ impl RecursiveEngine {
             if let Some(end) = first_end {
                 if draft.offset >= end {
                     break;
+                }
+            }
+
+            // #7 §9: unexplained INTERIOR gap between the end of the
+            // previous validated structure and this one becomes a
+            // first-class artifact (parented to the region owner) when
+            // meaningful (> 0 bytes; tiny alignment gaps are noise).
+            if let (Some(prev_end), Some(prev_id)) = (first_end, first_artifact) {
+                if draft.offset > prev_end && recurse && depth < self.limits.max_depth {
+                    self.register_unexplained(
+                        src,
+                        prev_id,
+                        prev_end,
+                        draft.offset,
+                        RelationKind::InteriorGap,
+                        depth,
+                        recurse,
+                        graph,
+                        budget,
+                    );
                 }
             }
 
@@ -558,6 +594,27 @@ impl RecursiveEngine {
             let child_id = graph.push_child(parent_id, RelationKind::Contains, artifact);
 
             let end = draft.offset + draft.size;
+            // §9: an overlapping VALIDATED artifact coexists via an
+            // Overlap edge to the structure it overlaps (polyglots:
+            // PNG+ZIP hybrid whose ZIP starts inside the PNG chunk
+            // stream). Distinct drafts only — the dedup contract
+            // already suppresses byte-identical re-registrations.
+            if draft.confidence == Confidence::Validated {
+                for (po, pend, pid) in &placed {
+                    let overlap = draft.offset.max(*po) < end.min(*pend);
+                    if overlap {
+                        if graph.len() < self.limits.max_artifacts {
+                            graph.edges.push(crate::artifact::GraphEdge {
+                                parent: child_id,
+                                child: *pid,
+                                relation: RelationKind::Overlap,
+                            });
+                        }
+                        break;
+                    }
+                }
+                placed.push((draft.offset, end, child_id));
+            }
             first_end = Some(match first_end {
                 Some(e) => e.max(end),
                 None => end,
@@ -648,11 +705,12 @@ impl RecursiveEngine {
                     // in-memory source.
                     match child.content {
                         ChildContent::Source(src) => {
-                            self.scan_region(&src, cid, depth + 1, recurse, graph, budget);
+                            let cs = src.root_offset();
+                            self.scan_region(&src, cid, depth + 1, recurse, graph, budget, cs);
                         }
                         ChildContent::Owned(bytes) => {
                             let region = ByteSource::from_vec(bytes);
-                            self.scan_region(&region, cid, depth + 1, recurse, graph, budget);
+                            self.scan_region(&region, cid, depth + 1, recurse, graph, budget, 0);
                         }
                     }
                 }
@@ -666,7 +724,8 @@ impl RecursiveEngine {
             // nested artifacts layer after layer.
             if recurse && !duplicate && depth < self.limits.max_depth {
                 if let Ok(r) = region {
-                    self.scan_region(&r, child_id, depth + 1, recurse, graph, budget);
+                    let cs = r.root_offset();
+                    self.scan_region(&r, child_id, depth + 1, recurse, graph, budget, cs);
                 }
             }
         }
@@ -727,6 +786,7 @@ impl RecursiveEngine {
                 match relation {
                     RelationKind::TrailingData => "trailing data",
                     RelationKind::LeadingData => "leading data",
+                    RelationKind::InteriorGap => "interior gap",
                     _ => "unexplained",
                 },
                 end - start,
@@ -746,7 +806,7 @@ impl RecursiveEngine {
         };
         let id = graph.push_child(parent_id, relation, artifact);
         if depth < self.limits.max_depth {
-            self.scan_region(&region, id, depth + 1, recurse, graph, budget);
+            self.scan_region(&region, id, depth + 1, recurse, graph, budget, start);
         }
     }
 }
