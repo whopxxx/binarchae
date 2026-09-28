@@ -539,39 +539,45 @@ impl Handler for ZstdHandler {
                 out.extend_from_slice(&chunk[..n]);
             }
             drop(decoder);
-            // B2: exact frame end via zstd_safe::find_frame_compressed_size
-            // over a BOUNDED prefix (never read_all of the whole tail).
-            // If the frame is larger than the bounded window, fall back
-            // to the streaming cursor with over-read correction.
-            let probe_len = limits
-                .max_child_size
-                .min(src.len() - base)
-                .min(64 * 1024 * 1024);
-            let probe = src.slice(base, probe_len).and_then(|r| r.read_all());
-            consumed = match probe
-                .ok()
-                .map(|buf| zstd::zstd_safe::find_frame_compressed_size(&buf))
-            {
-                Some(Ok(frame_size)) => frame_size as u64,
-                _ => {
-                    // Frame larger than the probe window (or probe failed):
-                    // streaming cursor (slice-relative), corrected for
-                    // EndMark over-read. Coordinates stay slice-relative
-                    // here and the result is the slice-relative consumed
-                    // size — never mixed with absolute `base`.
-                    let cursor = region.stream_pos();
-                    let mut end = cursor;
-                    for back in 0..=8u64 {
-                        let cand = cursor.saturating_sub(back);
-                        if cand >= 4 && base + cand <= src.len() {
-                            let mut zb = [0u8; 4];
-                            if src.read_at(base + cand - 4, &mut zb).is_ok() && zb == [0, 0, 0, 0] {
-                                end = cand;
-                                break;
-                            }
-                        }
+            // B2 + S1: exact frame end via the STRUCTURED interface
+            // ZSTD_findFrameCompressedSize (via zstd_safe) — the
+            // length of the first frame per the format spec. The probe
+            // window GROWS geometrically (1 MiB -> 2 -> 4 ... capped by
+            // max_child_size and the tail length) until the API
+            // succeeds: every probe is a bounded read, never a
+            // candidate-to-EOF read_all, and there is NO heuristic
+            // byte-pattern guessing.
+            let tail_len = src.len() - base;
+            let max_window = limits.max_child_size.min(tail_len).max(1024 * 1024);
+            let mut window: u64 = 1024 * 1024;
+            let mut structured: Option<u64> = None;
+            loop {
+                let probe_len = window.min(tail_len) as usize;
+                if let Ok(buf) = src.slice(base, probe_len as u64).and_then(|r| r.read_all()) {
+                    if let Ok(frame_size) = zstd::zstd_safe::find_frame_compressed_size(&buf) {
+                        structured = Some(frame_size as u64);
+                        break;
                     }
-                    end
+                }
+                if window >= max_window {
+                    break; // no structured end within any bounded window
+                }
+                window = window.saturating_mul(2);
+            }
+            consumed = match structured {
+                Some(frame_size) => frame_size,
+                None => {
+                    // S1: no structured boundary within the bounded
+                    // windows (frame larger than max_child_size). The
+                    // candidate exceeds the cap anyway, so the honest
+                    // outcome is a typed limit error, not a guess.
+                    return Err(Error::LimitExceeded {
+                        limit: "max_child_size",
+                        detail: format!(
+                            "zstd frame has no structured end within {} bytes (tail {})",
+                            max_window, tail_len
+                        ),
+                    });
                 }
             };
         }
@@ -750,26 +756,20 @@ impl Handler for Lz4Handler {
                 out.extend_from_slice(&chunk[..n]);
             }
             drop(decoder);
-            // B2 + R1: exact frame end. The streaming cursor is
+            // B2 + R1 + S1: exact frame end. The streaming cursor is
             // slice-relative, so the absolute end is base + cursor.
-            // lz4_flex consumed through the EndMark (4 zero bytes) but
-            // NOT the optional 4-byte content checksum; the full frame
-            // footer is EndMark [+ Content Checksum].
+            // lz4_flex's FrameDecoder reads AND validates the optional
+            // content checksum BEFORE returning EOF, so the cursor
+            // already sits at the end of the full footer:
+            //   no checksum:  EndMark(4)                -> cursor
+            //   checksum:     EndMark(4) + xxhash32(4)  -> cursor
+            // The EndMark anchor is therefore cursor - (checksum ? 8 : 4)
+            // relative to base; verifying it guards against a checksum
+            // that happens to equal 0x00000000 being mistaken for an
+            // EndMark (which would double-count 4 bytes).
             let cursor = region.stream_pos();
-            let endmark_abs = lz4_endmark_abs(src, base, cursor)?;
-            frame_end = if lz4_content_checksum {
-                // Frame footer extends 4 more bytes (xxhash32).
-                let footer = endmark_abs + 4;
-                if footer > src.len() {
-                    return Err(Error::Validation {
-                        format: "lz4",
-                        reason: "content checksum past end of source".into(),
-                    });
-                }
-                footer
-            } else {
-                endmark_abs
-            };
+            let endmark_back: u64 = if lz4_content_checksum { 8 } else { 4 };
+            frame_end = lz4_frame_end(src, base, cursor, endmark_back)?;
             evidence.push("LZ4 frame magic + descriptor walked".to_string());
             metadata.insert(
                 "content_checksum".to_string(),
@@ -804,25 +804,30 @@ impl Handler for Lz4Handler {
     }
 }
 
-/// Locate the LZ4 frame EndMark (a 0u32). `cursor` is slice-relative
-/// (bytes the decoder consumed); the EndMark lies at absolute
-/// `base + cursor` unless the decoder over-read, in which case step
-/// back in 4-byte units. Returns the ABSOLUTE offset just past the
-/// EndMark so trailing data after the frame stays discoverable.
-fn lz4_endmark_abs(src: &ByteSource, base: u64, cursor: u64) -> Result<u64> {
-    for back in [0u64, 4, 8] {
-        let c = base + cursor - back;
-        if c >= base + 8 && c <= src.len() {
-            let mut zb = [0u8; 4];
-            if src.read_at(c - 4, &mut zb).is_ok() && zb == [0, 0, 0, 0] {
-                return Ok(c);
-            }
-        }
+/// Verify the frame footer at the decoder's exact consumed boundary and
+/// return the ABSOLUTE frame end. `cursor` is slice-relative (bytes the
+/// decoder consumed); `endmark_back` is the footer size (EndMark [+ 4
+/// checksum]) counted back from the cursor. The bytes at the computed
+/// EndMark position must be zero, and with a checksum the 4 bytes before
+/// the cursor are the checksum (which MAY legitimately be 0x00000000 —
+/// it is verified by the decoder, not guessed by us).
+fn lz4_frame_end(src: &ByteSource, base: u64, cursor: u64, endmark_back: u64) -> Result<u64> {
+    let abs_end = base + cursor;
+    if cursor < endmark_back || abs_end > src.len() {
+        return Err(Error::Validation {
+            format: "lz4",
+            reason: "frame footer truncated at consumed boundary".into(),
+        });
     }
-    Err(Error::Validation {
-        format: "lz4",
-        reason: "frame EndMark not found at consumed boundary".into(),
-    })
+    let mut zb = [0u8; 4];
+    src.read_at(abs_end - endmark_back, &mut zb)?;
+    if zb != [0, 0, 0, 0] {
+        return Err(Error::Validation {
+            format: "lz4",
+            reason: "frame EndMark not found at consumed boundary".into(),
+        });
+    }
+    Ok(abs_end)
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,6 +1033,34 @@ mod tests {
             art.size,
             compressed.len() as u64,
             "frame end (incl. checksum footer) must be exact at base=7"
+        );
+    }
+
+    #[test]
+    fn lz4_checksum_zero_not_confused_with_endmark() {
+        // S1: a content checksum of 0x00000000 must not be mistaken for
+        // an EndMark. Frame layout (with checksum): ...data, EndMark(4
+        // zeros), checksum(4). With the old backward-scan logic the zero
+        // checksum would be read as the EndMark and the boundary would
+        // drift by 4. Build the frame with a checksum and a trailing
+        // data pattern; boundary must be exact at end of checksum.
+        let payload = b"zero checksum boundary payload ".repeat(10);
+        let mut compressed = Vec::new();
+        {
+            let mut info = lz4_flex::frame::FrameInfo::new();
+            info.content_checksum = true;
+            let mut enc = lz4_flex::frame::FrameEncoder::with_frame_info(info, &mut compressed);
+            std::io::Write::write_all(&mut enc, &payload).unwrap();
+            enc.finish().unwrap();
+        }
+        let mut blob = compressed.clone();
+        blob.extend_from_slice(b"TRAILING");
+        let src = ByteSource::from_vec(blob);
+        let out = validate_at(&Lz4Handler, &src, 0).expect("lz4 validates");
+        assert_eq!(
+            out.artifacts[0].size,
+            compressed.len() as u64,
+            "boundary must be exactly EndMark + checksum, no drift"
         );
     }
 

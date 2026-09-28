@@ -524,11 +524,18 @@ fn b7_registry_regbinary_artifact() {
     v[vk as usize..vk as usize + 2].copy_from_slice(b"vk");
     v[vk as usize + 2..vk as usize + 4].copy_from_slice(&0u16.to_le_bytes());
     v[vk as usize + 4..vk as usize + 8].copy_from_slice(&16u32.to_le_bytes()); // data_len
-                                                                               // data_offset relative to hbin data start (0x1000): payload at
-                                                                               // absolute 5216 -> field = 5216 - 0x1000 = 1120.
+                                                                               // S2: data_size = 16, NOT inline (high bit of data_size = inline).
+                                                                               // data_offset points at ANOTHER CELL relative to the hbin data start
+                                                                               // (0x1000): target cell at absolute 5216 -> field = 5216 - 0x1000 =
+                                                                               // 1120. That cell holds a signed size header (-24) then the payload.
     v[vk as usize + 8..vk as usize + 12].copy_from_slice(&1120u32.to_le_bytes());
     v[vk as usize + 12..vk as usize + 16].copy_from_slice(&3u32.to_le_bytes()); // REG_BINARY
-    v[5216..5232].copy_from_slice(&[0xB7u8; 16]);
+    let data_cell: u64 = 5216;
+    let data_cell_size: u64 = 4 + 20;
+    v[data_cell as usize..data_cell as usize + 4]
+        .copy_from_slice(&((-(data_cell_size as i32)).to_le_bytes()));
+    // Payload in the data cell's Cell data (target + 4 = 5220).
+    v[5220..5236].copy_from_slice(&[0xB7u8; 16]);
     let graph = engine().analyze(&ByteSource::from_vec(v), true);
     let reg = graph
         .artifacts

@@ -108,45 +108,65 @@ impl Handler for RegistryHandler {
                         b"nk" => nk_nodes += 1,
                         b"vk" => {
                             vk_values += 1;
-                            // R4: decode the value record per the regf
+                            // S2: decode the value record per the regf
                             // spec. `cell` points at the 4-byte cell-size
                             // prefix; the vk record starts at cell+4.
                             // vk layout (record-relative):
                             //   +0  sig "vk"
                             //   +2  name_len (u16)
-                            //   +4  data_len (u32)
+                            //   +4  data_size (u32; HIGH BIT = data
+                            //       stored INLINE in this field itself)
                             //   +8  data_offset (u32; relative to the
                             //       START OF THE HBIN DATA AREA, i.e. the
-                            //       first hbin at 0x1000; high bit set =
-                            //       data stored inline in this field)
+                            //       first hbin at 0x1000) — points at
+                            //       ANOTHER CELL: the actual bytes live in
+                            //       that cell's Cell data, after ITS
+                            //       4-byte size header.
                             //   +12 data_type (u32)
                             let vk = cell + 4;
-                            let data_len = le32(src, vk + 4).unwrap_or(0) as u64;
+                            let data_size_field = le32(src, vk + 4).unwrap_or(0);
+                            let inline_flag = data_size_field & 0x8000_0000 != 0;
+                            let data_len = u64::from(data_size_field & 0x7FFF_FFFF);
                             let data_off_field = le32(src, vk + 8).unwrap_or(0);
                             let value_type = le32(src, vk + 12).unwrap_or(0);
-                            // REG_BINARY = 3. Data size sanity + cap.
+                            // REG_BINARY = 3. Non-inline only; data size
+                            // sanity + cap.
                             if value_type == 3
                                 && data_len > 0
                                 && data_len <= limits.max_child_size
-                                && (data_off_field & 0x8000_0000) == 0
+                                && !inline_flag
                             {
-                                // R4: the data offset is relative to the
-                                // hive-bin data start (0x1000 after the
-                                // 4096-byte regf header), NOT the file
-                                // start and NOT cell-relative.
-                                let abs_data = base + 0x1000 + data_off_field as u64;
-                                if abs_data + data_len <= src.len() {
-                                    if let Ok(region) = src.slice(abs_data, data_len) {
-                                        children.push(ChildDraft {
-                                            relation: RelationKind::FilesystemEntry,
-                                            label: format!("REG_BINARY value ({} bytes)", data_len),
-                                            format_hint: "raw",
-                                            content: ChildContent::Source(region),
-                                            size: data_len,
-                                            metadata: BTreeMap::new(),
-                                            warnings: Vec::new(),
-                                            entry_name: None,
-                                        });
+                                // S2: the data offset points at ANOTHER
+                                // CELL (relative to the hive-bin data
+                                // start, 0x1000 after the 4096-byte regf
+                                // header). Verify that cell's signed size
+                                // header first, then read the payload
+                                // from its Cell data (target + 4).
+                                let target = base + 0x1000 + data_off_field as u64;
+                                let abs_data = target + 4;
+                                if target + 4 <= src.len() {
+                                    let cell_size_raw = le32(src, target).unwrap_or(0) as i32;
+                                    let cell_size = cell_size_raw.unsigned_abs() as u64;
+                                    let valid_cell = cell_size_raw < 0
+                                        && cell_size >= 4
+                                        && cell_size - 4 >= data_len
+                                        && abs_data + data_len <= src.len();
+                                    if valid_cell {
+                                        if let Ok(region) = src.slice(abs_data, data_len) {
+                                            children.push(ChildDraft {
+                                                relation: RelationKind::FilesystemEntry,
+                                                label: format!(
+                                                    "REG_BINARY value ({} bytes)",
+                                                    data_len
+                                                ),
+                                                format_hint: "raw",
+                                                content: ChildContent::Source(region),
+                                                size: data_len,
+                                                metadata: BTreeMap::new(),
+                                                warnings: Vec::new(),
+                                                entry_name: None,
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -350,16 +370,21 @@ impl Handler for PcapHandler {
                     ethertype = u16::from_be_bytes([vlan[2], vlan[3]]);
                     l3 += 4;
                 }
+                // S3: all L2/L3/L4 reads are bounded by THIS captured
+                // packet (incl_len), never by the whole file. A short
+                // record followed by another PCAP record must not be
+                // read across.
+                let packet_end = frame_start + incl_len;
                 match ethertype {
                     0x0800 => {
                         // IPv4: IHL, protocol, src/dst (4 bytes each).
-                        if l3 + 20 > src.len() {
+                        if l3 + 20 > packet_end {
                             continue;
                         }
                         let mut h = [0u8; 20];
                         src.read_at(l3, &mut h)?;
                         let ihl = u64::from(h[0] & 0x0F) * 4;
-                        if ihl < 20 || l3 + ihl > src.len() {
+                        if ihl < 20 || l3 + ihl > packet_end {
                             continue;
                         }
                         if h[9] != 6 {
@@ -369,10 +394,8 @@ impl Handler for PcapHandler {
                         // Normalize direction: order the (src,port,dst,port)
                         // pair so both directions share one key.
                         let (a, b) = (h[12..16].to_vec(), h[16..20].to_vec());
-                        let src_port = [0u8; 2]; // filled after TCP read
-                        let _ = src_port;
                         // Peek TCP ports at l3+ihl.
-                        if l3 + ihl + 4 > src.len() {
+                        if l3 + ihl + 4 > packet_end {
                             continue;
                         }
                         let mut tp = [0u8; 4];
@@ -395,10 +418,12 @@ impl Handler for PcapHandler {
                         let mut td = [0u8; 20];
                         src.read_at(l3 + ihl, &mut td)?;
                         let data_off = u64::from(td[12] >> 4) * 4;
-                        if data_off < 20 || l3 + ihl + data_off > src.len() {
+                        if data_off < 20 || l3 + ihl + data_off > packet_end {
                             continue;
                         }
-                        let payload_len = incl_len - (l3 + ihl + data_off - frame_start);
+                        // S3: payload length via checked arithmetic against
+                        // the packet end — no unsigned underflow possible.
+                        let payload_len = packet_end.saturating_sub(l3 + ihl + data_off);
                         if payload_len == 0 {
                             continue;
                         }
@@ -454,10 +479,11 @@ impl Handler for PcapHandler {
                         let mut td = [0u8; 20];
                         src.read_at(l3 + 40, &mut td)?;
                         let data_off = u64::from(td[12] >> 4) * 4;
-                        if data_off < 20 || l3 + 40 + data_off > src.len() {
+                        if data_off < 20 || l3 + 40 + data_off > packet_end {
                             continue;
                         }
-                        let payload_len = incl_len - (l3 + 40 + data_off - frame_start);
+                        // S3: checked subtraction against the packet end.
+                        let payload_len = packet_end.saturating_sub(l3 + 40 + data_off);
                         if payload_len == 0
                             || total_reconstructed + payload_len > limits.max_reconstructed_bytes
                         {
@@ -1055,12 +1081,18 @@ mod tests {
         v[vk as usize..vk as usize + 2].copy_from_slice(b"vk");
         v[vk as usize + 2..vk as usize + 4].copy_from_slice(&0u16.to_le_bytes()); // name_len
         v[vk as usize + 4..vk as usize + 8].copy_from_slice(&16u32.to_le_bytes()); // data_len
-                                                                                   // data_offset relative to hbin data start (0x1000): payload at
-                                                                                   // absolute 5200 -> field = 5200 - 0x1000 = 1104.
+                                                                                   // S2: data_size = 16, NOT inline (high bit of data_size = inline flag).
+                                                                                   // data_offset points at ANOTHER CELL relative to the hbin data
+                                                                                   // start (0x1000). Target cell at absolute 5200 -> field = 1104.
+                                                                                   // That cell holds a signed size header (-24) then the payload.
         v[vk as usize + 8..vk as usize + 12].copy_from_slice(&1104u32.to_le_bytes());
         v[vk as usize + 12..vk as usize + 16].copy_from_slice(&3u32.to_le_bytes()); // REG_BINARY
-                                                                                    // Payload at absolute 0x1000 + 1104 = 5200.
-        v[5200..5216].copy_from_slice(&[0xBEu8; 16]);
+        let data_cell: u64 = 5200;
+        let data_cell_size: u64 = 4 + 20;
+        v[data_cell as usize..data_cell as usize + 4]
+            .copy_from_slice(&((-(data_cell_size as i32)).to_le_bytes()));
+        // Payload in the data cell's Cell data (target + 4 = 5204).
+        v[5204..5220].copy_from_slice(&[0xBEu8; 16]);
         let src = ByteSource::from_vec(v);
         let out = validate_at(&RegistryHandler, &src, 0).expect("registry validates");
         let art = &out.artifacts[0];
@@ -1098,6 +1130,45 @@ mod tests {
         let out = validate_at(&PcapHandler, &src, 0).expect("ns pcap validates");
         assert_eq!(out.artifacts[0].confidence, Confidence::Validated);
         assert_eq!(out.artifacts[0].children.len(), 1);
+    }
+
+    #[test]
+    fn pcap_short_packet_does_not_read_across_records() {
+        // S3: a tiny packet (incl_len=1) followed by another record. The
+        // TCP/HTTP parser must bound all reads by THIS packet's captured
+        // bytes. Before the fix, the IPv4 parse would read across the
+        // record boundary and compute incl_len - header_span with
+        // unsigned underflow (panic in debug / bogus length in release).
+        let mut p = Vec::new();
+        p.extend_from_slice(&[0xD4, 0xC3, 0xB2, 0xA1]);
+        p.extend(2u16.to_le_bytes());
+        p.extend(4u16.to_le_bytes());
+        p.extend(0u32.to_le_bytes()); // thiszone
+        p.extend(0u32.to_le_bytes()); // sigfigs
+        p.extend(262144u32.to_le_bytes());
+        p.extend(1u32.to_le_bytes()); // linktype Ethernet
+                                      // Record 0: incl_len = 1 — a 1-byte "frame" that cannot even
+                                      // hold the Ethernet header.
+        p.extend(1u32.to_le_bytes()); // ts_sec
+        p.extend(0u32.to_le_bytes()); // ts_usec
+        p.extend(1u32.to_le_bytes()); // incl_len
+        p.extend(1u32.to_le_bytes()); // orig_len
+        p.extend(b"X");
+        // Record 1: a normal packet with garbage content.
+        p.extend(1u32.to_le_bytes());
+        p.extend(0u32.to_le_bytes());
+        p.extend(20u32.to_le_bytes());
+        p.extend(20u32.to_le_bytes());
+        p.extend([0u8; 20]);
+        let src = ByteSource::from_vec(p);
+        // Must validate cleanly (2 packets, no HTTP), never panic.
+        let out = validate_at(&PcapHandler, &src, 0).expect("pcap validates");
+        let art = &out.artifacts[0];
+        assert_eq!(art.children.len(), 2);
+        assert!(
+            !art.children.iter().any(|c| c.label.contains("HTTP object")),
+            "no HTTP object can come from a 1-byte frame"
+        );
     }
 
     #[test]
