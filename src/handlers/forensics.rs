@@ -34,6 +34,11 @@ fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
 }
 
+fn le16(src: &ByteSource, off: u64) -> Option<u16> {
+    let mut b = [0u8; 2];
+    src.read_at(off, &mut b).ok()?;
+    Some(u16::from_le_bytes(b))
+}
 fn le32(src: &ByteSource, off: u64) -> Option<u32> {
     let mut b = [0u8; 4];
     src.read_at(off, &mut b).ok()?;
@@ -834,9 +839,145 @@ impl Handler for MinidumpHandler {
                         }
                     }
                 }
+                3 => {
+                    // ThreadListStream: u32 count, then
+                    // MINIDUMP_THREAD (48 bytes): ThreadId u32,
+                    // SuspendCount u32, PriorityClass u32, Priority
+                    // u32, Teb u64, Stack {StartOfMemoryRange u64,
+                    // DataSize u32, Rva u32}, Context {Size u32,
+                    // Rva u32}.
+                    if srva + 4 <= src.len() {
+                        let count = le32(src, srva).unwrap_or(0) as usize;
+                        let count = count.min(limits.max_records);
+                        for t in 0..count {
+                            let rec = srva + 4 + 48 * t as u64;
+                            if rec + 48 > src.len() {
+                                break;
+                            }
+                            let tid = le32(src, rec).unwrap_or(0);
+                            let teb = {
+                                let lo = le32(src, rec + 16).unwrap_or(0) as u64;
+                                let hi = le32(src, rec + 20).unwrap_or(0) as u64;
+                                lo | (hi << 32)
+                            };
+                            let stack_start = {
+                                let lo = le32(src, rec + 24).unwrap_or(0) as u64;
+                                let hi = le32(src, rec + 28).unwrap_or(0) as u64;
+                                lo | (hi << 32)
+                            };
+                            let stack_size = le32(src, rec + 32).unwrap_or(0) as u64;
+                            let mut m = BTreeMap::new();
+                            m.insert("stream".to_string(), "ThreadList".to_string());
+                            m.insert("thread_id".to_string(), tid.to_string());
+                            m.insert("teb".to_string(), format!("{teb:#x}"));
+                            m.insert("stack_start".to_string(), format!("{stack_start:#x}"));
+                            children.push(ChildDraft {
+                                relation: RelationKind::MemoryRange,
+                                label: format!(
+                                    "thread {tid} stack ({} bytes, TEB {teb:#x})",
+                                    stack_size
+                                ),
+                                format_hint: "metadata",
+                                content: ChildContent::Owned(Vec::new()),
+                                size: stack_size,
+                                metadata: m,
+                                warnings: Vec::new(),
+                                entry_name: None,
+                            });
+                        }
+                    }
+                }
+                4 => {
+                    // ModuleListStream: u32 count, then
+                    // MINIDUMP_MODULE (108 bytes): BaseOfImage u64,
+                    // SizeOfImage u32, CheckSum u32, TimeDateStamp
+                    // u32, ModuleNameRva u32, then fixed file info,
+                    // CvRecord/MiscRecord and reserved fields. The
+                    // name is a MINIDUMP_STRING at ModuleNameRva:
+                    // u32 byte-length then UTF-16LE.
+                    if srva + 4 <= src.len() {
+                        let count = le32(src, srva).unwrap_or(0) as usize;
+                        let count = count.min(limits.max_records);
+                        for m in 0..count {
+                            let rec = srva + 4 + 108 * m as u64;
+                            if rec + 108 > src.len() {
+                                break;
+                            }
+                            let base_addr = {
+                                let lo = le32(src, rec).unwrap_or(0) as u64;
+                                let hi = le32(src, rec + 4).unwrap_or(0) as u64;
+                                lo | (hi << 32)
+                            };
+                            let size_of_image = le32(src, rec + 8).unwrap_or(0);
+                            let name_rva = base + le32(src, rec + 20).unwrap_or(0) as u64;
+                            let name_len_bytes =
+                                le32(src, name_rva).unwrap_or(0).min(1024) as usize;
+                            let mut raw = vec![0u8; name_len_bytes];
+                            if src.read_at(name_rva + 4, &mut raw).is_ok() {
+                                let units: Vec<u16> = raw
+                                    .chunks_exact(2)
+                                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                                    .collect();
+                                let name = String::from_utf16_lossy(&units);
+                                let mut mm = BTreeMap::new();
+                                mm.insert("stream".to_string(), "ModuleList".to_string());
+                                mm.insert("module_name".to_string(), name.clone());
+                                mm.insert("base_address".to_string(), format!("{base_addr:#x}"));
+                                mm.insert("image_size".to_string(), size_of_image.to_string());
+                                children.push(ChildDraft {
+                                    relation: RelationKind::MemoryRange,
+                                    label: format!(
+                                        "module {name} ({} bytes at {base_addr:#x})",
+                                        size_of_image
+                                    ),
+                                    format_hint: "metadata",
+                                    content: ChildContent::Owned(Vec::new()),
+                                    size: u64::from(size_of_image),
+                                    metadata: mm,
+                                    warnings: Vec::new(),
+                                    entry_name: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                7 => {
+                    // SystemInfoStream: MINIDUMP_SYSTEM_INFO:
+                    // ProcessorArchitecture u16, Level u16, Revision
+                    // u16, NumberOfProcessors u8, ProductType u8,
+                    // SuiteMask u16, Reserved u16, then CPU/OS data.
+                    if srva + 32 <= src.len() {
+                        let arch = le16(src, srva).unwrap_or(0);
+                        let arch_name = match arch {
+                            9 => "x64",
+                            0x014C => "x86",
+                            0x01C4 => "ARM64",
+                            _ => "unknown",
+                        };
+                        // NumberOfProcessors is a u8 at offset 12.
+                        let num_cpus = le16(src, srva + 12)
+                            .map(|v| (v & 0xFF).to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let mut m = BTreeMap::new();
+                        m.insert("stream".to_string(), "SystemInfo".to_string());
+                        m.insert("architecture".to_string(), arch_name.to_string());
+                        m.insert("processors".to_string(), num_cpus.clone());
+                        children.push(ChildDraft {
+                            relation: RelationKind::MemoryRange,
+                            label: format!("system info ({arch_name}, {num_cpus} processors)"),
+                            format_hint: "metadata",
+                            content: ChildContent::Owned(Vec::new()),
+                            size: 0,
+                            metadata: m,
+                            warnings: Vec::new(),
+                            entry_name: None,
+                        });
+                    }
+                }
                 9 => {
                     memory_streams += 1;
                     // B5: Memory64ListStream has its own layout -
+
                     // u64 NumberOfMemoryRanges, u64 BaseRva, then 16-byte
                     // descriptors (u64 start_addr, u64 data_size). The raw
                     // memory is laid out CONTIGUOUSLY starting at BaseRva;
@@ -913,6 +1054,266 @@ impl Handler for MinidumpHandler {
                 ]),
                 metadata,
                 warnings: Vec::new(),
+                errors: Vec::new(),
+                children,
+            }],
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows kernel crash dump (PAGEDU64)
+// ---------------------------------------------------------------------------
+
+/// Windows 64-bit kernel crash dump handler (_DMP_HEADER64). Layout
+/// verified against the Volatility Foundation "Crash Address Space"
+/// documentation and 0vercl0k/kdmp-parser-rs (Header64, PhysmemDesc,
+/// PhysmemRun, full_physmem):
+/// - File starts with "PAGEDU64" (Signature "PAGE" @0, ValidDump
+///   "DU64" @4). The whole header is 0x2000 (8192) bytes.
+/// - MajorVersion@8, MinorVersion@0xC (build), DirectoryTableBase@0x10
+///   (u64), PsLoadedModuleList@0x20 (u64), PsActiveProcessHead@0x28,
+///   MachineImageType@0x30 (u32), NumberProcessors@0x34,
+///   BugCheckCode@0x38, BugCheckParameters@0x40 (4 x u64).
+/// - PhysicalMemoryBlockBuffer@0x88: u32 NumberOfRuns, u32 padding,
+///   u64 NumberOfPages, then NumberOfRuns x 16-byte runs (u64
+///   BasePage, u64 PageCount). Pages are 4096 bytes; the pages of all
+///   runs are stored PACKED in the file starting at file offset
+///   0x2000 (the header end), in run order, holes skipped.
+/// - DumpType@0xF98: 1 full, 5 BMP, 8 kernel, 9 kernel+user, 0xA
+///   complete, 6 live kernel. SystemTime@0xFA8 (FILETIME).
+pub struct Pagedu64Handler;
+
+const DUMP64_HEADER_SIZE: u64 = 0x2000;
+const PAGE_SIZE: u64 = 4096;
+
+/// One physical memory run.
+struct PhysRun {
+    base_page: u64,
+    page_count: u64,
+}
+
+impl Pagedu64Handler {
+    /// Parse the physical memory runs from the header buffer at
+    /// base+0x88.
+    fn parse_runs(
+        src: &ByteSource,
+        base: u64,
+        limits: &crate::engine::EngineLimits,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<PhysRun>> {
+        let blk = base + 0x88;
+        let num_runs = le32(src, blk).unwrap_or(0) as usize;
+        if num_runs == 0 {
+            return Err(Error::Validation {
+                format: "pagedu64",
+                reason: "zero physical memory runs".into(),
+            });
+        }
+        if num_runs > limits.max_records {
+            return Err(Error::Validation {
+                format: "pagedu64",
+                reason: format!("run count {num_runs} exceeds cap"),
+            });
+        }
+        let mut runs = Vec::with_capacity(num_runs);
+        for i in 0..num_runs {
+            // Layout: NumberOfRuns@0, pad@4, NumberOfPages@8 (u64),
+            // Run[0]@16 (each run 16 bytes: BasePage, PageCount).
+            let off = blk + 16 + 16 * i as u64;
+            let lo = le32(src, off).unwrap_or(0) as u64;
+            let hi = le32(src, off + 4).unwrap_or(0) as u64;
+            let base_page = lo | (hi << 32);
+            let lo2 = le32(src, off + 8).unwrap_or(0) as u64;
+            let hi2 = le32(src, off + 12).unwrap_or(0) as u64;
+            let page_count = lo2 | (hi2 << 32);
+            if page_count == 0 {
+                continue;
+            }
+            runs.push(PhysRun {
+                base_page,
+                page_count,
+            });
+            if runs.len() >= limits.max_partitions {
+                warnings.push("run count capped at max_partitions".to_string());
+                break;
+            }
+        }
+        Ok(runs)
+    }
+}
+
+impl Handler for Pagedu64Handler {
+    fn format(&self) -> &'static str {
+        "pagedu64"
+    }
+
+    fn find_candidates(&self, src: &ByteSource) -> Vec<Candidate> {
+        find_all(src, b"PAGEDU64")
+            .into_iter()
+            .map(|offset| Candidate { offset })
+            .collect()
+    }
+
+    fn validate(
+        &self,
+        src: &ByteSource,
+        candidate: Candidate,
+        limits: &crate::engine::EngineLimits,
+        _budget: &mut Budget,
+    ) -> Result<HandlerOutput> {
+        let base = candidate.offset;
+        if base + 0x40 > src.len() {
+            return Err(Error::Validation {
+                format: "pagedu64",
+                reason: "header truncated".into(),
+            });
+        }
+        let major = le32(src, base + 8).unwrap_or(0);
+        let minor = le32(src, base + 0xC).unwrap_or(0);
+        let dir_table_base = {
+            let lo = le32(src, base + 0x10).unwrap_or(0) as u64;
+            let hi = le32(src, base + 0x14).unwrap_or(0) as u64;
+            lo | (hi << 32)
+        };
+        let ps_loaded_module_list = {
+            let lo = le32(src, base + 0x20).unwrap_or(0) as u64;
+            let hi = le32(src, base + 0x24).unwrap_or(0) as u64;
+            lo | (hi << 32)
+        };
+        let machine = le32(src, base + 0x30).unwrap_or(0);
+        let num_processors = le32(src, base + 0x34).unwrap_or(0);
+        let bugcheck = le32(src, base + 0x38).unwrap_or(0);
+        let dump_type = le32(src, base + 0xF98).unwrap_or(0);
+        let type_name = match dump_type {
+            1 => "full",
+            5 => "BMP",
+            8 => "kernel",
+            9 => "kernel+user",
+            10 => "complete",
+            6 => "live kernel",
+            _ => "unknown",
+        };
+        let machine_name = match machine {
+            0x8664 => "x64",
+            0x01C4 => "ARM64",
+            _ => "unknown",
+        };
+
+        let mut warnings = Vec::new();
+        let runs = Self::parse_runs(src, base, limits, &mut warnings)?;
+
+        // Expose each run's packed page data as a source-backed child
+        // (MemoryRange relation). First page of run 0 lives at file
+        // offset 0x2000; runs are packed back to back.
+        let mut children = Vec::new();
+        let mut file_off = base + DUMP64_HEADER_SIZE;
+        let mut total_pages = 0u64;
+        for (idx, run) in runs.iter().enumerate() {
+            let run_bytes = run.page_count * PAGE_SIZE;
+            let start_addr = run.base_page * PAGE_SIZE;
+            if file_off + run_bytes > src.len() {
+                let avail = src.len().saturating_sub(file_off);
+                warnings.push(format!(
+                    "run {idx} truncated at source end ({} of {} bytes present)",
+                    avail, run_bytes
+                ));
+                if avail == 0 {
+                    break;
+                }
+                let take = (avail / PAGE_SIZE) * PAGE_SIZE;
+                if take == 0 {
+                    break;
+                }
+                let region = src.slice(file_off, take)?;
+                let mut meta = BTreeMap::new();
+                meta.insert("run_index".to_string(), idx.to_string());
+                meta.insert("start_addr".to_string(), format!("{start_addr:#x}"));
+                children.push(ChildDraft {
+                    relation: RelationKind::MemoryRange,
+                    label: format!(
+                        "physical run {idx} ({} of {} bytes, at {:#x})",
+                        take, run_bytes, start_addr
+                    ),
+                    format_hint: "raw",
+                    content: ChildContent::Source(region),
+                    size: take,
+                    metadata: meta,
+                    warnings: Vec::new(),
+                    entry_name: Some(format!("phys_run_{idx}.bin")),
+                });
+                total_pages += take / PAGE_SIZE;
+                break;
+            }
+            let region = src.slice(file_off, run_bytes)?;
+            let mut meta = BTreeMap::new();
+            meta.insert("run_index".to_string(), idx.to_string());
+            meta.insert("start_addr".to_string(), format!("{start_addr:#x}"));
+            meta.insert("page_count".to_string(), run.page_count.to_string());
+            children.push(ChildDraft {
+                relation: RelationKind::MemoryRange,
+                label: format!(
+                    "physical run {idx} ({} pages at {:#x})",
+                    run.page_count, start_addr
+                ),
+                format_hint: "raw",
+                content: ChildContent::Source(region),
+                size: run_bytes,
+                metadata: meta,
+                warnings: Vec::new(),
+                entry_name: Some(format!("phys_run_{idx}.bin")),
+            });
+            total_pages += run.page_count;
+            file_off += run_bytes;
+        }
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("dump_type".to_string(), type_name.to_string());
+        metadata.insert("os_major".to_string(), major.to_string());
+        metadata.insert("os_build".to_string(), minor.to_string());
+        metadata.insert("processors".to_string(), num_processors.to_string());
+        metadata.insert(
+            "directory_table_base".to_string(),
+            format!("{dir_table_base:#x}"),
+        );
+        metadata.insert(
+            "ps_loaded_module_list".to_string(),
+            format!("{ps_loaded_module_list:#x}"),
+        );
+        metadata.insert("bugcheck_code".to_string(), format!("{bugcheck:#010x}"));
+        metadata.insert("physical_runs".to_string(), runs.len().to_string());
+        metadata.insert("pages_present".to_string(), total_pages.to_string());
+
+        Ok(HandlerOutput {
+            artifacts: vec![ArtifactDraft {
+                format: "pagedu64".to_string(),
+                label: format!(
+                    "Windows kernel dump ({type_name}, {machine_name}, {} runs, {} pages)",
+                    runs.len(),
+                    total_pages
+                ),
+                offset: base,
+                size: src.len() - base,
+                confidence: if children.is_empty() {
+                    Confidence::Partial
+                } else {
+                    Confidence::Validated
+                },
+                evidence: Evidence::facts([
+                    "PAGEDU64 signature validated".to_string(),
+                    format!("dump type {dump_type} ({type_name}), build {minor}"),
+                    format!(
+                        "physical memory runs parsed: {} runs, {} pages",
+                        runs.len(),
+                        total_pages
+                    ),
+                    format!(
+                        "PsLoadedModuleList at {:#x} (for Volatility-style plugin work)",
+                        ps_loaded_module_list
+                    ),
+                ]),
+                metadata,
+                warnings,
                 errors: Vec::new(),
                 children,
             }],
@@ -1049,6 +1450,237 @@ mod tests {
             &crate::engine::EngineLimits::default(),
             &mut Budget::default(),
         )
+    }
+
+    /// Minidump with ModuleList + ThreadList + SystemInfo streams:
+    /// metadata (module names, thread TEBs, arch) must surface as
+    /// children alongside memory ranges.
+    #[test]
+    fn minidump_metadata_streams() {
+        let mut d = Vec::new();
+        // Header: MDMP, version 42899, 4 streams, dir at 32.
+        d.extend_from_slice(b"MDMP");
+        d.extend(42899u32.to_le_bytes());
+        d.extend(4u32.to_le_bytes()); // stream count
+        d.extend(32u32.to_le_bytes()); // directory rva
+        d.extend(0u32.to_le_bytes()); // checksum
+        d.extend([0u8; 12]); // pad to 32
+                             // Directory entries (type, size, rva).
+                             // Stream 0: SystemInfo (7) at rva 80.
+        d.extend(7u32.to_le_bytes());
+        d.extend(56u32.to_le_bytes());
+        d.extend(80u32.to_le_bytes());
+        // Stream 1: ModuleList (4) at rva 140.
+        d.extend(4u32.to_le_bytes());
+        d.extend(220u32.to_le_bytes());
+        d.extend(140u32.to_le_bytes());
+        // Stream 2: ThreadList (3) at rva 380.
+        d.extend(3u32.to_le_bytes());
+        d.extend(52u32.to_le_bytes());
+        d.extend(380u32.to_le_bytes());
+        // Stream 3: MemoryList (5) at rva 440.
+        d.extend(5u32.to_le_bytes());
+        d.extend(20u32.to_le_bytes());
+        d.extend(440u32.to_le_bytes());
+        // SystemInfo at 80: arch 9 (x64), 8 processors.
+        assert_eq!(d.len(), 80);
+        d.extend(9u16.to_le_bytes());
+        d.extend(0u16.to_le_bytes()); // level
+        d.extend(0u16.to_le_bytes()); // revision
+        d.push(8); // processor count
+        d.push(1); // product type
+        d.extend(0u16.to_le_bytes()); // suite
+        d.extend([0u8; 24]);
+        // Pad to the ModuleList rva (140).
+        while d.len() < 140 {
+            d.push(0);
+        }
+        assert_eq!(d.len(), 140);
+        d.extend(1u32.to_le_bytes());
+        let module_rec = d.len();
+        d.extend(0x7FF00000u32.to_le_bytes()); // BaseOfImage lo
+        d.extend(0u32.to_le_bytes()); // hi
+        d.extend(0x1000u32.to_le_bytes()); // size
+        d.extend(0u32.to_le_bytes()); // checksum
+        d.extend(0u32.to_le_bytes()); // timestamp
+        d.extend(252u32.to_le_bytes()); // name rva (string follows record)
+                                        // Pad record to 108 bytes.
+        while d.len() - module_rec < 108 {
+            d.push(0);
+        }
+        assert_eq!(d.len() - module_rec, 108);
+        // MINIDUMP_STRING at 200: "ntoskrnl.exe" = 24 bytes.
+        d.extend(24u32.to_le_bytes());
+        d.extend("ntoskrnl.exe".encode_utf16().flat_map(u16::to_le_bytes));
+        // Pad to the ThreadList rva (380).
+        while d.len() < 380 {
+            d.push(0);
+        }
+        assert_eq!(d.len(), 380);
+        d.extend(1u32.to_le_bytes());
+        d.extend(4242u32.to_le_bytes()); // tid
+        d.extend(0u32.to_le_bytes()); // suspend
+        d.extend(0u32.to_le_bytes()); // prio class
+        d.extend(0u32.to_le_bytes()); // prio
+        d.extend(0xFFFFF000u32.to_le_bytes()); // TEB lo
+        d.extend(0u32.to_le_bytes()); // TEB hi
+        d.extend(0x1000u32.to_le_bytes()); // stack start lo
+        d.extend(0u32.to_le_bytes()); // hi
+        d.extend(0x2000u32.to_le_bytes()); // stack size
+        d.extend(0u32.to_le_bytes()); // stack rva
+        d.extend(0u32.to_le_bytes()); // ctx size
+        d.extend(0u32.to_le_bytes()); // ctx rva
+                                      // Pad to the MemoryList rva (440).
+        while d.len() < 440 {
+            d.push(0);
+        }
+        assert_eq!(d.len(), 440);
+        // MemoryList at 440: 1 range, 16-byte descriptor.
+        d.extend(1u32.to_le_bytes());
+        d.extend(0x1000u32.to_le_bytes()); // start addr lo
+        d.extend(0u32.to_le_bytes()); // hi
+        d.extend(32u32.to_le_bytes()); // size
+        d.extend(500u32.to_le_bytes()); // rva
+                                        // Pad to the memory rva (500), then memory bytes.
+        while d.len() < 500 {
+            d.push(0);
+        }
+        assert_eq!(d.len(), 500);
+        d.extend(b"MEMORY_RANGE_DATA");
+        d.extend([0u8; 15]);
+        let src = ByteSource::from_vec(d);
+        let out = validate_at(&MinidumpHandler, &src, 0).expect("minidump validates");
+        let art = &out.artifacts[0];
+        let module = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("module_name").map(String::as_str) == Some("ntoskrnl.exe"))
+            .expect("module child");
+        assert_eq!(
+            module.metadata.get("base_address").map(String::as_str),
+            Some("0x7ff00000")
+        );
+        let thread = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("thread_id").map(String::as_str) == Some("4242"))
+            .expect("thread child");
+        assert_eq!(
+            thread.metadata.get("teb").map(String::as_str),
+            Some("0xfffff000")
+        );
+        let sys = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("stream").map(String::as_str) == Some("SystemInfo"))
+            .expect("system info child");
+        assert_eq!(
+            sys.metadata.get("architecture").map(String::as_str),
+            Some("x64")
+        );
+        assert!(
+            art.children
+                .iter()
+                .any(|c| c.metadata.get("stream").map(String::as_str) == Some("MemoryList")),
+            "memory range child still present"
+        );
+    }
+
+    /// PAGEDU64 kernel dump: signature + physical runs exposed as
+    /// source-backed packed page regions.
+    #[test]
+    fn pagedu64_runs_and_provenance() {
+        let mut d = Vec::new();
+        d.extend_from_slice(b"PAGEDU64");
+        d.extend(15u32.to_le_bytes()); // major (free build)
+        d.extend(19045u32.to_le_bytes()); // build
+        d.extend(0x1FF000u32.to_le_bytes()); // DTB lo
+        d.extend(0u32.to_le_bytes()); // DTB hi
+        d.extend(0u32.to_le_bytes()); // PFN lo
+        d.extend(0u32.to_le_bytes()); // PFN hi
+        d.extend(0x888000u32.to_le_bytes()); // PsLoadedModuleList lo
+        d.extend(0xFFFFF800u32.to_le_bytes()); // hi (canonical upper half)
+        d.extend(0u32.to_le_bytes()); // PsActiveProcessHead lo
+        d.extend(0xFFFFF800u32.to_le_bytes()); // hi
+        d.extend(0x8664u32.to_le_bytes()); // machine
+        d.extend(16u32.to_le_bytes()); // processors
+        d.extend(0x139u32.to_le_bytes()); // bugcheck 0x139
+        d.extend([0u8; 32]); // bugcheck params
+                             // PhysicalMemoryBlockBuffer at 0x88: 2 runs.
+        while d.len() < 0x88 {
+            d.push(0);
+        }
+        d.extend(2u32.to_le_bytes()); // NumberOfRuns
+        d.extend(0u32.to_le_bytes()); // padding
+        d.extend(3u64.to_le_bytes()); // NumberOfPages
+        d.extend(1u64.to_le_bytes()); // run 0: base page 1
+        d.extend(2u64.to_le_bytes()); // run 0: 2 pages
+        d.extend(9u64.to_le_bytes()); // run 1: base page 9
+        d.extend(1u64.to_le_bytes()); // run 1: 1 page
+                                      // DumpType at 0xF98 = 1 (full); SystemTime at 0xFA8.
+        while d.len() < 0xF98 {
+            d.push(0);
+        }
+        d.extend(1u32.to_le_bytes());
+        // Pages start at 0x2000: run 0 = 2 pages, run 1 = 1 page.
+        while d.len() < 0x2000 {
+            d.push(0);
+        }
+        d.extend(b"PAGE_RUN0_0"); // 0x2000
+        while d.len() < 0x3000 {
+            d.push(0);
+        }
+        d.extend(b"PAGE_RUN0_1"); // 0x3000
+        while d.len() < 0x4000 {
+            d.push(0);
+        }
+        d.extend(b"PAGE_RUN1_0"); // 0x4000
+        while d.len() < 0x5000 {
+            d.push(0);
+        }
+        let src = ByteSource::from_vec(d);
+        let out = validate_at(&Pagedu64Handler, &src, 0).expect("pagedu64 validates");
+        let art = &out.artifacts[0];
+        assert_eq!(art.confidence, Confidence::Validated);
+        assert_eq!(
+            art.metadata.get("dump_type").map(String::as_str),
+            Some("full")
+        );
+        assert_eq!(
+            art.metadata.get("pages_present").map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(art.children.len(), 2);
+        let run0 = &art.children[0];
+        assert_eq!(
+            run0.metadata.get("start_addr").map(String::as_str),
+            Some("0x1000")
+        );
+        match &run0.content {
+            ChildContent::Source(r) => {
+                let mut b = [0u8; 11];
+                r.read_at(0, &mut b).unwrap();
+                assert_eq!(&b, b"PAGE_RUN0_0");
+                // Second page of run 0 at +0x1000.
+                let mut b2 = [0u8; 11];
+                r.read_at(0x1000, &mut b2).unwrap();
+                assert_eq!(&b2, b"PAGE_RUN0_1");
+            }
+            _ => panic!("run 0 must be source-backed"),
+        }
+        let run1 = &art.children[1];
+        assert_eq!(
+            run1.metadata.get("start_addr").map(String::as_str),
+            Some("0x9000")
+        );
+        match &run1.content {
+            ChildContent::Source(r) => {
+                let mut b = [0u8; 11];
+                r.read_at(0, &mut b).unwrap();
+                assert_eq!(&b, b"PAGE_RUN1_0");
+            }
+            _ => panic!("run 1 must be source-backed"),
+        }
     }
 
     #[test]

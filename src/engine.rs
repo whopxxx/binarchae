@@ -263,6 +263,7 @@ pub fn builtin_handlers() -> Vec<Box<dyn Handler>> {
         Box::new(handlers::forensics::PcapHandler),
         Box::new(handlers::forensics::PcapngHandler),
         Box::new(handlers::forensics::MinidumpHandler),
+        Box::new(handlers::forensics::Pagedu64Handler),
         Box::new(handlers::cpio::CpioHandler),
         Box::new(handlers::tar::TarHandler),
         Box::new(handlers::pdf::PdfHandler),
