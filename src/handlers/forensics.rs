@@ -23,6 +23,10 @@ use crate::error::{Error, Result};
 use crate::handlers::find_all;
 use std::collections::BTreeMap;
 
+fn hex_short_key(key: &[u8; 13]) -> String {
+    key.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
@@ -104,25 +108,33 @@ impl Handler for RegistryHandler {
                         b"nk" => nk_nodes += 1,
                         b"vk" => {
                             vk_values += 1;
-                            // B7: decode the value record. vk layout:
-                            // +0 sig, +2 name_len(u16), +4 data_len(u32),
-                            // +8 data_offset(u32; HBIN-relative; high bit
-                            // = data stored inline in the 4-byte field),
-                            // +20 value_type(u32).
-                            let data_len = le32(src, cell + 8).unwrap_or(0) as u64;
-                            let data_off_field = le32(src, cell + 12).unwrap_or(0);
-                            let value_type = le32(src, cell + 20).unwrap_or(0);
+                            // R4: decode the value record per the regf
+                            // spec. `cell` points at the 4-byte cell-size
+                            // prefix; the vk record starts at cell+4.
+                            // vk layout (record-relative):
+                            //   +0  sig "vk"
+                            //   +2  name_len (u16)
+                            //   +4  data_len (u32)
+                            //   +8  data_offset (u32; relative to the
+                            //       START OF THE HBIN DATA AREA, i.e. the
+                            //       first hbin at 0x1000; high bit set =
+                            //       data stored inline in this field)
+                            //   +12 data_type (u32)
+                            let vk = cell + 4;
+                            let data_len = le32(src, vk + 4).unwrap_or(0) as u64;
+                            let data_off_field = le32(src, vk + 8).unwrap_or(0);
+                            let value_type = le32(src, vk + 12).unwrap_or(0);
                             // REG_BINARY = 3. Data size sanity + cap.
                             if value_type == 3
                                 && data_len > 0
                                 && data_len <= limits.max_child_size
                                 && (data_off_field & 0x8000_0000) == 0
                             {
-                                // HBIN-relative data offset: the vk data
-                                // offset field is relative to the START OF
-                                // THE HIVE FILE in practice (offset 0 = base
-                                // of the regf). Add base and the cell start.
-                                let abs_data = base + data_off_field as u64;
+                                // R4: the data offset is relative to the
+                                // hive-bin data start (0x1000 after the
+                                // 4096-byte regf header), NOT the file
+                                // start and NOT cell-relative.
+                                let abs_data = base + 0x1000 + data_off_field as u64;
                                 if abs_data + data_len <= src.len() {
                                     if let Ok(region) = src.slice(abs_data, data_len) {
                                         children.push(ChildDraft {
@@ -290,98 +302,244 @@ impl Handler for PcapHandler {
         );
         metadata.insert("nanosecond".to_string(), nanosecond.to_string());
 
-        // B7: TCP/HTTP reconstruction. Concatenate the packet payloads
-        // in capture order and carve complete HTTP request/response
-        // messages (header block terminated by CRLFCRLF, body bounded by
-        // Content-Length when present, else header-block-only). Each
-        // recovered object becomes a ReconstructedFrom child carrying
-        // the reassembled bytes.
-        // Gather payloads (bounded).
-        let mut payload: Vec<u8> = Vec::new();
-        let mut seg_meta: Vec<(u64, u64)> = Vec::new(); // (payload_start_abs, len)
-        for p in &packets {
-            // packets store absolute region start via metadata? The
-            // ChildDraft carries content, not offsets; use recorded
-            // sizes to recompute from the record headers instead.
-            let _ = p;
-        }
-        // Re-walk record headers to get payload absolute ranges.
-        let mut off2 = base + 24;
-        let mut idx = 0usize;
-        while off2 + 16 <= src.len() && idx < packets.len() {
-            let incl_len = rd32(off2 + 8)? as u64;
-            if incl_len > snaplen.max(262_144) || off2 + 16 + incl_len > src.len() {
-                break;
+        // R5: real TCP/HTTP reconstruction.
+        //
+        // Ethernet -> IPv4/IPv6 -> TCP payload -> flow grouping (5-tuple
+        // normalized by direction) -> capture-order payload concatenation
+        // -> HTTP object carving. This is NOT a retransmission-aware TCP
+        // stack: within each flow, payloads are concatenated in capture
+        // order (documented limitation). `max_streams` bounds the number
+        // of tracked flows and `max_reconstructed_bytes` bounds the
+        // total reassembled bytes.
+        {
+            // Per-flow ordered payload buffers. Key = normalized 5-tuple
+            // (both directions of one connection share a flow).
+            let mut flows: BTreeMap<[u8; 13], Vec<u8>> = BTreeMap::new();
+            let mut flow_order: Vec<[u8; 13]> = Vec::new();
+            let mut total_reconstructed = 0u64;
+
+            // Re-walk record headers; each record payload starts with the
+            // link-layer frame (linktype from the global header, field at
+            // base+8: 1 = Ethernet).
+            // libpcap global header: magic(4) major(2) minor(2) thiszone(4)
+            // sigfigs(4) snaplen(4) network(4) => linktype at +20.
+            let linktype = rd32(base + 20).unwrap_or(1);
+            let mut off2 = base + 24;
+            let mut seg = 0usize;
+            while off2 + 16 <= src.len() && seg < packets.len() {
+                let incl_len = rd32(off2 + 8)? as u64;
+                if incl_len > snaplen.max(262_144) || off2 + 16 + incl_len > src.len() {
+                    break;
+                }
+                let frame_start = off2 + 16;
+                seg += 1;
+                off2 += 16 + incl_len;
+
+                // Parse Ethernet: dst(6) src(6) ethertype(2). VLAN(0x8100)
+                // skipped once; IPv4 = 0x0800, IPv6 = 0x86DD.
+                if linktype != 1 || frame_start + 14 > src.len() {
+                    continue;
+                }
+                let mut eth = [0u8; 14];
+                src.read_at(frame_start, &mut eth)?;
+                let mut ethertype = u16::from_be_bytes([eth[12], eth[13]]);
+                let mut l3 = frame_start + 14;
+                if ethertype == 0x8100 && l3 + 4 <= src.len() {
+                    let mut vlan = [0u8; 4];
+                    src.read_at(l3, &mut vlan)?;
+                    ethertype = u16::from_be_bytes([vlan[2], vlan[3]]);
+                    l3 += 4;
+                }
+                match ethertype {
+                    0x0800 => {
+                        // IPv4: IHL, protocol, src/dst (4 bytes each).
+                        if l3 + 20 > src.len() {
+                            continue;
+                        }
+                        let mut h = [0u8; 20];
+                        src.read_at(l3, &mut h)?;
+                        let ihl = u64::from(h[0] & 0x0F) * 4;
+                        if ihl < 20 || l3 + ihl > src.len() {
+                            continue;
+                        }
+                        if h[9] != 6 {
+                            continue; // TCP only
+                        }
+                        let mut flow_key = [0u8; 13];
+                        // Normalize direction: order the (src,port,dst,port)
+                        // pair so both directions share one key.
+                        let (a, b) = (h[12..16].to_vec(), h[16..20].to_vec());
+                        let src_port = [0u8; 2]; // filled after TCP read
+                        let _ = src_port;
+                        // Peek TCP ports at l3+ihl.
+                        if l3 + ihl + 4 > src.len() {
+                            continue;
+                        }
+                        let mut tp = [0u8; 4];
+                        src.read_at(l3 + ihl, &mut tp)?;
+                        let (sp, dp) = ([tp[0], tp[1]], [tp[2], tp[3]]);
+                        let dir1 = [a.as_slice(), &sp, b.as_slice(), &dp];
+                        let dir2 = [b.as_slice(), &dp, a.as_slice(), &sp];
+                        if dir1 < dir2 {
+                            flow_key[0..4].copy_from_slice(&a);
+                            flow_key[4..6].copy_from_slice(&sp);
+                            flow_key[6..10].copy_from_slice(&b);
+                            flow_key[10..12].copy_from_slice(&dp);
+                        } else {
+                            flow_key[0..4].copy_from_slice(&b);
+                            flow_key[4..6].copy_from_slice(&dp);
+                            flow_key[6..10].copy_from_slice(&a);
+                            flow_key[10..12].copy_from_slice(&sp);
+                        }
+                        // TCP data offset for payload start.
+                        let mut td = [0u8; 20];
+                        src.read_at(l3 + ihl, &mut td)?;
+                        let data_off = u64::from(td[12] >> 4) * 4;
+                        if data_off < 20 || l3 + ihl + data_off > src.len() {
+                            continue;
+                        }
+                        let payload_len = incl_len - (l3 + ihl + data_off - frame_start);
+                        if payload_len == 0 {
+                            continue;
+                        }
+                        if total_reconstructed + payload_len > limits.max_reconstructed_bytes {
+                            break;
+                        }
+                        if !flows.contains_key(&flow_key) && flows.len() >= limits.max_streams {
+                            break;
+                        }
+                        let entry = flows.entry(flow_key).or_insert_with(|| {
+                            flow_order.push(flow_key);
+                            Vec::new()
+                        });
+                        let mut buf = vec![0u8; payload_len as usize];
+                        if src.read_at(l3 + ihl + data_off, &mut buf).is_ok() {
+                            entry.extend_from_slice(&buf);
+                            total_reconstructed += payload_len;
+                        }
+                    }
+                    0x86DD => {
+                        // IPv6: fixed 40-byte header, next-header at +6.
+                        if l3 + 40 > src.len() {
+                            continue;
+                        }
+                        let mut h = [0u8; 40];
+                        src.read_at(l3, &mut h)?;
+                        if h[6] != 6 {
+                            continue; // TCP only
+                        }
+                        if l3 + 44 > src.len() {
+                            continue;
+                        }
+                        let mut tp = [0u8; 4];
+                        src.read_at(l3 + 40, &mut tp)?;
+                        let (sp, dp) = ([tp[0], tp[1]], [tp[2], tp[3]]);
+                        let a = h[8..24].to_vec();
+                        let b = h[24..40].to_vec();
+                        let mut flow_key = [0u8; 13];
+                        // 13-byte key can't hold two IPv6 addrs; use a hash
+                        // of the ordered tuple instead.
+                        let dir1 = [a.as_slice(), &sp, b.as_slice(), &dp];
+                        let dir2 = [b.as_slice(), &dp, a.as_slice(), &sp];
+                        let forward = dir1 < dir2;
+                        let (x, y) = if forward { (a, b) } else { (b, a) };
+                        let (p1, p2) = if forward { (sp, dp) } else { (dp, sp) };
+                        for (i, byte) in x.iter().chain(y.iter()).enumerate() {
+                            flow_key[i % 8] ^= byte.wrapping_add(i as u8);
+                        }
+                        flow_key[8..10].copy_from_slice(&p1);
+                        flow_key[10..12].copy_from_slice(&p2);
+                        flow_key[12] = 0xEE; // IPv6 marker
+
+                        let mut td = [0u8; 20];
+                        src.read_at(l3 + 40, &mut td)?;
+                        let data_off = u64::from(td[12] >> 4) * 4;
+                        if data_off < 20 || l3 + 40 + data_off > src.len() {
+                            continue;
+                        }
+                        let payload_len = incl_len - (l3 + 40 + data_off - frame_start);
+                        if payload_len == 0
+                            || total_reconstructed + payload_len > limits.max_reconstructed_bytes
+                        {
+                            continue;
+                        }
+                        if !flows.contains_key(&flow_key) && flows.len() >= limits.max_streams {
+                            break;
+                        }
+                        let entry = flows.entry(flow_key).or_insert_with(|| {
+                            flow_order.push(flow_key);
+                            Vec::new()
+                        });
+                        let mut buf = vec![0u8; payload_len as usize];
+                        if src.read_at(l3 + 40 + data_off, &mut buf).is_ok() {
+                            entry.extend_from_slice(&buf);
+                            total_reconstructed += payload_len;
+                        }
+                    }
+                    _ => {}
+                }
             }
-            seg_meta.push((off2 + 16, incl_len));
-            off2 += 16 + incl_len;
-            idx += 1;
-        }
-        for (pstart, plen) in seg_meta {
-            if payload.len() > 4 * 1024 * 1024 {
-                break;
+
+            // Carve HTTP messages per flow, in flow-discovery order.
+            'flows: for key in &flow_order {
+                let stream = &flows[key];
+                let mut pos = 0usize;
+                while pos + 16 < stream.len() && http_objects < limits.max_records {
+                    let window = &stream[pos..];
+                    let header_end = match find_subslice(window, b"\r\n\r\n") {
+                        Some(h) => h + 4,
+                        None => break,
+                    };
+                    let head = String::from_utf8_lossy(&window[..header_end]).to_string();
+                    let first = head.lines().next().unwrap_or("");
+                    let is_http = first.starts_with("HTTP/")
+                        || first.starts_with("GET ")
+                        || first.starts_with("POST ")
+                        || first.starts_with("PUT ")
+                        || first.starts_with("DELETE ")
+                        || first.starts_with("HEAD ");
+                    if !is_http {
+                        pos += header_end;
+                        continue;
+                    }
+                    let content_length = head
+                        .lines()
+                        .find_map(|l| {
+                            let lower = l.to_ascii_lowercase();
+                            lower
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let body_end = (header_end + content_length).min(window.len());
+                    let complete = body_end == header_end + content_length;
+                    let total = body_end;
+                    if total == 0 {
+                        continue 'flows;
+                    }
+                    let bytes = window[..total].to_vec();
+                    let mut meta = BTreeMap::new();
+                    meta.insert("http_object_index".to_string(), http_objects.to_string());
+                    meta.insert("complete".to_string(), complete.to_string());
+                    meta.insert("method_or_status".to_string(), first.to_string());
+                    meta.insert("flow_key".to_string(), hex_short_key(key));
+                    packets.push(ChildDraft {
+                        relation: RelationKind::ReconstructedFrom,
+                        label: format!(
+                            "HTTP object {http_objects} ({total} bytes{})",
+                            if complete { "" } else { ", incomplete" }
+                        ),
+                        format_hint: "http",
+                        content: ChildContent::Owned(bytes),
+                        size: total as u64,
+                        metadata: meta,
+                        warnings: Vec::new(),
+                        entry_name: None,
+                    });
+                    http_objects += 1;
+                    pos += total;
+                }
             }
-            let mut buf = vec![0u8; plen as usize];
-            if src.read_at(pstart, &mut buf).is_ok() {
-                payload.extend_from_slice(&buf);
-            }
-        }
-        // Carve HTTP messages from the concatenated payload.
-        let mut pos = 0usize;
-        while pos + 16 < payload.len() && http_objects < limits.max_records {
-            let window = &payload[pos..];
-            let header_end = match find_subslice(window, b"\r\n\r\n") {
-                Some(h) => h + 4,
-                None => break,
-            };
-            let head = String::from_utf8_lossy(&window[..header_end]).to_string();
-            let first = head.lines().next().unwrap_or("");
-            let is_http = first.starts_with("HTTP/")
-                || first.starts_with("GET ")
-                || first.starts_with("POST ")
-                || first.starts_with("PUT ")
-                || first.starts_with("DELETE ")
-                || first.starts_with("HEAD ");
-            if !is_http {
-                // Skip past this false header candidate.
-                pos += header_end;
-                continue;
-            }
-            let content_length = head
-                .lines()
-                .find_map(|l| {
-                    let lower = l.to_ascii_lowercase();
-                    lower
-                        .strip_prefix("content-length:")
-                        .and_then(|v| v.trim().parse::<usize>().ok())
-                })
-                .unwrap_or(0);
-            let body_end = (header_end + content_length).min(window.len());
-            let complete = body_end == header_end + content_length;
-            let total = body_end;
-            if total == 0 {
-                break;
-            }
-            let bytes = window[..total].to_vec();
-            let mut meta = BTreeMap::new();
-            meta.insert("http_object_index".to_string(), http_objects.to_string());
-            meta.insert("complete".to_string(), complete.to_string());
-            meta.insert("method_or_status".to_string(), first.to_string());
-            packets.push(ChildDraft {
-                relation: RelationKind::ReconstructedFrom,
-                label: format!(
-                    "HTTP object {http_objects} ({total} bytes{})",
-                    if complete { "" } else { ", incomplete" }
-                ),
-                format_hint: "http",
-                content: ChildContent::Owned(bytes),
-                size: total as u64,
-                metadata: meta,
-                warnings: Vec::new(),
-                entry_name: None,
-            });
-            http_objects += 1;
-            pos += total;
         }
 
         // B4: a capture cut off mid-record is NOT fully validated — the
@@ -890,16 +1048,19 @@ mod tests {
         // Cell at 4128: negative size (allocated), vk record.
         // vk: sig(2) name_len(2)=0 data_len(4)=16 data_offset(4) type(4)=3
         let cell: u64 = 4128;
-        let cell_size: u64 = 4 + 2 + 2 + 4 + 4 + 4 + 4 + 12; // sig..type + slack
+        // Cell: 4-byte size prefix, then the 20-byte vk record.
+        let cell_size: u64 = 4 + 20;
         v[cell as usize..cell as usize + 4].copy_from_slice(&((-(cell_size as i32)).to_le_bytes()));
-        v[cell as usize + 4..cell as usize + 6].copy_from_slice(b"vk");
-        v[cell as usize + 6..cell as usize + 8].copy_from_slice(&0u16.to_le_bytes());
-        v[cell as usize + 8..cell as usize + 12].copy_from_slice(&16u32.to_le_bytes());
-        v[cell as usize + 12..cell as usize + 16].copy_from_slice(&4192u32.to_le_bytes());
-        v[cell as usize + 16..cell as usize + 20].copy_from_slice(&0u32.to_le_bytes());
-        v[cell as usize + 20..cell as usize + 24].copy_from_slice(&3u32.to_le_bytes()); // REG_BINARY
-                                                                                        // Payload at 4192.
-        v[4192..4208].copy_from_slice(0xBEEFu32.to_le_bytes().repeat(4).as_slice());
+        let vk = cell + 4; // record start (R4: fields are vk-relative)
+        v[vk as usize..vk as usize + 2].copy_from_slice(b"vk");
+        v[vk as usize + 2..vk as usize + 4].copy_from_slice(&0u16.to_le_bytes()); // name_len
+        v[vk as usize + 4..vk as usize + 8].copy_from_slice(&16u32.to_le_bytes()); // data_len
+                                                                                   // data_offset relative to hbin data start (0x1000): payload at
+                                                                                   // absolute 5200 -> field = 5200 - 0x1000 = 1104.
+        v[vk as usize + 8..vk as usize + 12].copy_from_slice(&1104u32.to_le_bytes());
+        v[vk as usize + 12..vk as usize + 16].copy_from_slice(&3u32.to_le_bytes()); // REG_BINARY
+                                                                                    // Payload at absolute 0x1000 + 1104 = 5200.
+        v[5200..5216].copy_from_slice(&[0xBEu8; 16]);
         let src = ByteSource::from_vec(v);
         let out = validate_at(&RegistryHandler, &src, 0).expect("registry validates");
         let art = &out.artifacts[0];

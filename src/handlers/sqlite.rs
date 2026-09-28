@@ -422,13 +422,18 @@ fn walk_table_page(
                     let local = if k <= x { k } else { m };
                     let mut data = read_bytes(src, payload_start, local)?;
                     let next = be32(src, payload_start + local)? as u64;
+                    let mut ctx = OverflowCtx {
+                        page_size,
+                        reserved,
+                        limits,
+                        page_work: pages_visited,
+                    };
                     follow_overflow(
                         src,
                         db_base,
                         next,
                         payload_len - local,
-                        page_size,
-                        limits,
+                        &mut ctx,
                         &mut data,
                     )?;
                     data
@@ -464,40 +469,54 @@ fn walk_table_page(
     Ok(rows)
 }
 
+/// Shared context for overflow-chain walking (R2: geometry + caps).
+struct OverflowCtx<'a> {
+    page_size: u64,
+    reserved: u8,
+    limits: &'a crate::engine::EngineLimits,
+    /// Database-level page-work budget shared with the b-tree walk.
+    page_work: &'a mut usize,
+}
+
 fn follow_overflow(
     src: &ByteSource,
     db_base: u64,
     mut page: u64,
     mut remaining: u64,
-    usable_page_size: u64,
-    limits: &crate::engine::EngineLimits,
+    geo: &mut OverflowCtx,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    let page_size = geo.page_size;
+    // R2: usable interior = page_size - reserved; each overflow page
+    // carries a 4-byte next pointer followed by usable-4 payload bytes.
+    let usable = page_size - u64::from(geo.reserved);
     let mut visited = std::collections::HashSet::new();
     while remaining > 0 && page > 0 {
-        if !visited.insert(page) || visited.len() > 4096 {
+        if !visited.insert(page) {
             return Err(Error::Validation {
                 format: "sqlite",
                 reason: "overflow chain cycle".into(),
             });
         }
-        // B3: overflow chain pages are charged against the page cap.
-        if visited.len() > limits.max_sqlite_pages {
+        // R2: overflow pages share the database-level page-work budget
+        // with the b-tree walk.
+        *geo.page_work += 1;
+        if *geo.page_work > geo.limits.max_sqlite_pages {
             return Err(Error::LimitExceeded {
                 limit: "max_sqlite_pages",
-                detail: "overflow chain exceeded page cap".into(),
+                detail: "page-work (b-tree + overflow) exceeded cap".into(),
             });
         }
         // B3: pages always start at multiples of the FULL page_size;
         // reserved bytes only shrink the page's usable interior.
-        let off = db_base + (page - 1) * usable_page_size;
+        let off = db_base + (page - 1) * page_size;
         let next = be32(src, off)? as u64;
-        let chunk = (usable_page_size - 4).min(remaining);
+        let chunk = (usable - 4).min(remaining);
         let data = read_bytes(src, off + 4, chunk)?;
         out.extend_from_slice(&data);
         remaining -= chunk;
         page = next;
-        if out.len() as u64 > limits.max_child_size {
+        if out.len() as u64 > geo.limits.max_child_size {
             return Err(Error::LimitExceeded {
                 limit: "max_child_size",
                 detail: "overflow payload exceeded cap".into(),
@@ -796,6 +815,72 @@ mod tests {
         assert!(
             decoded.label.contains(&"A".repeat(48)),
             "text payload fully reassembled: {}",
+            decoded.label
+        );
+    }
+
+    #[test]
+    fn sqlite_overflow_with_reserved_bytes_decoded() {
+        // R2: with reserved bytes per page, overflow payload chunks are
+        // page_size - reserved - 4 and pages still sit at full page_size
+        // stride. reserved=32 must not corrupt the reassembled payload.
+        let page_size: u64 = 4096;
+        let reserved: u8 = 32;
+        let usable = page_size - u64::from(reserved);
+        let x = usable - 35;
+        let m = ((usable - 12) * 32 / 255) - 23;
+        let data_len: u64 = 2000;
+        let payload_len_total = 3u64 + data_len; // hdr len byte + serial varint(2)? keep simple below
+        let k = m + (payload_len_total - m) % (usable - 4);
+        let local = if k <= x { k } else { m } as usize;
+
+        // Record: header(3: len byte + serial varint for text) + text.
+        let serial = 13u64 + 2 * data_len;
+        let mut hdr = vec![0u8];
+        hdr.extend(write_varint(serial));
+        hdr[0] = hdr.len() as u8;
+        let mut record = hdr;
+        record.extend(vec![b'R'; data_len as usize]);
+        let payload_len_total = record.len() as u64;
+
+        let mut db = vec![0u8; 3 * page_size as usize];
+        db[0..16].copy_from_slice(SQLITE_MAGIC);
+        db[16..18].copy_from_slice(&(page_size as u16).to_be_bytes());
+        db[20] = reserved;
+        db[56..60].copy_from_slice(&1u32.to_be_bytes());
+        db[100] = 0x0D;
+        db[103..105].copy_from_slice(&1u16.to_be_bytes());
+        let mut cell = write_varint(payload_len_total);
+        cell.extend(write_varint(1));
+        cell.extend_from_slice(&record[..local]);
+        cell.extend_from_slice(&2u32.to_be_bytes());
+        let cell_off = page_size as usize - cell.len();
+        db[108..110].copy_from_slice(&(cell_off as u16).to_be_bytes());
+        db[cell_off..cell_off + cell.len()].copy_from_slice(&cell);
+        // Overflow page 2: next=0, payload chunk of usable-4.
+        let remaining = payload_len_total as usize - local;
+        let first_chunk = (usable as usize - 4).min(remaining);
+        db[page_size as usize..page_size as usize + 4].copy_from_slice(&0u32.to_be_bytes());
+        db[page_size as usize + 4..page_size as usize + 4 + first_chunk]
+            .copy_from_slice(&record[local..local + first_chunk]);
+
+        let src = ByteSource::from_vec(db);
+        let out = validate_at(&src).expect("reserved-bytes overflow must validate");
+        let art = &out.artifacts[0];
+        assert_eq!(art.confidence, Confidence::Validated);
+        let decoded = art
+            .children
+            .iter()
+            .find(|c| c.label.contains("sqlite_schema[1]"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "row decoded; children: {:?}",
+                    art.children.iter().map(|c| &c.label).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            decoded.label.contains(&"R".repeat(48)),
+            "payload reassembled with reserved-byte geometry: {}",
             decoded.label
         );
     }

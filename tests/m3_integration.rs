@@ -313,11 +313,49 @@ fn s6_uimage_gzip_kernel_provenance() {
 
 // ---------- B7 required chains ----------
 
-// PCAP -> TCP/HTTP reconstruction -> artifact
+// PCAP -> Ethernet -> IPv4 -> TCP -> flow -> HTTP object
 #[test]
 fn b7_pcap_http_reconstruction() {
-    let http_req = b"GET /flag.txt HTTP/1.1\r\nHost: ctf.local\r\n\r\n";
-    let http_resp = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nCTF{pcap77}";
+    // Helper: wrap a TCP payload in an Ethernet+IPv4+TCP frame.
+    let frame = |seq: u32, payload: &[u8]| -> Vec<u8> {
+        let mut f = Vec::new();
+        // Ethernet: dst(6) src(6) ethertype 0x0800.
+        f.extend([0x02u8; 6]);
+        f.extend([0x01u8; 6]);
+        f.extend(0x0800u16.to_be_bytes());
+        // IPv4 header (20 bytes).
+        let total_len = (20 + 20 + payload.len()) as u16;
+        f.extend(0x45u8.to_be_bytes());
+        f.extend(0u8.to_be_bytes()); // tos
+        f.extend(total_len.to_be_bytes());
+        f.extend(1u16.to_be_bytes()); // id
+        f.extend(0x4000u16.to_be_bytes()); // don't fragment
+        f.extend(64u8.to_be_bytes()); // ttl
+        f.extend(6u8.to_be_bytes()); // proto TCP
+        f.extend(0u16.to_be_bytes()); // checksum (not verified here)
+        f.extend([10u8, 0, 0, 1]); // src
+        f.extend([10u8, 0, 0, 2]); // dst
+                                   // TCP header (20 bytes).
+        f.extend(443u16.to_be_bytes());
+        f.extend(55555u16.to_be_bytes());
+        f.extend(seq.to_be_bytes());
+        f.extend(1u32.to_be_bytes()); // ack
+        f.extend(0x5008u16.to_be_bytes()); // data_off=5, PSH|ACK
+        f.extend(0xFFFFu16.to_be_bytes()); // window
+        f.extend(0u16.to_be_bytes()); // checksum
+        f.extend(0u16.to_be_bytes()); // urgent
+        f.extend_from_slice(payload);
+        f
+    };
+
+    // One HTTP response split across two TCP segments.
+    let body = b"CTF{pcap77}";
+    let mut part1 = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n".to_vec();
+    part1.extend_from_slice(&body[..6]);
+    let part2 = &body[6..];
+    let seg1 = frame(1, &part1);
+    let seg2 = frame(1 + part1.len() as u32, part2);
+
     let mut p = Vec::new();
     p.extend_from_slice(&[0xD4, 0xC3, 0xB2, 0xA1]);
     p.extend(2u16.to_le_bytes());
@@ -325,15 +363,15 @@ fn b7_pcap_http_reconstruction() {
     p.extend(0u32.to_le_bytes());
     p.extend(0u32.to_le_bytes());
     p.extend(262144u32.to_le_bytes());
-    p.extend(1u32.to_le_bytes());
-    // Two packets: request and response.
-    for pkt in [http_req.as_slice(), http_resp.as_slice()] {
+    p.extend(1u32.to_le_bytes()); // linktype = Ethernet
+    for pkt in [&seg1, &seg2] {
         p.extend(1u32.to_le_bytes());
         p.extend(0u32.to_le_bytes());
         p.extend((pkt.len() as u32).to_le_bytes());
         p.extend((pkt.len() as u32).to_le_bytes());
         p.extend_from_slice(pkt);
     }
+    let part1_len = part1.len() - 6; // header bytes before the body
     let graph = engine().analyze(&ByteSource::from_vec(p), true);
 
     let pcap_id = graph
@@ -344,11 +382,26 @@ fn b7_pcap_http_reconstruction() {
     assert!(pcap_id.is_some(), "pcap validated");
     let mut found = false;
     for (r, c) in graph.children(pcap_id.unwrap()) {
-        if c.label.contains("HTTP object") && r == RelationKind::ReconstructedFrom {
-            found = true;
+        if c.label.contains("HTTP object")
+            && r == RelationKind::ReconstructedFrom
+            && c.metadata.get("complete").map(String::as_str) == Some("true")
+        {
+            // Body must have been reassembled from the two segments:
+            // Body must be reassembled from the two segments.
+            if c.size == (part1_len + 11) as u64 {
+                found = true;
+            }
         }
     }
-    assert!(found, "HTTP object reconstructed under pcap");
+    assert!(
+        found,
+        "HTTP object reassembled from split TCP segments; children: {:?}",
+        graph
+            .children(pcap_id.unwrap())
+            .iter()
+            .map(|(_, c)| (&c.label, c.size))
+            .collect::<Vec<_>>()
+    );
 }
 
 // GPT -> partition -> FAT -> nested file
@@ -465,15 +518,17 @@ fn b7_registry_regbinary_artifact() {
     v[4096..4100].copy_from_slice(b"hbin");
     v[4104..4108].copy_from_slice(&4096u32.to_le_bytes());
     let cell: u64 = 4128;
-    let cell_size: u64 = 4 + 2 + 2 + 4 + 4 + 4 + 4 + 12;
+    let cell_size: u64 = 4 + 20;
     v[cell as usize..cell as usize + 4].copy_from_slice(&((-(cell_size as i32)).to_le_bytes()));
-    v[cell as usize + 4..cell as usize + 6].copy_from_slice(b"vk");
-    v[cell as usize + 6..cell as usize + 8].copy_from_slice(&0u16.to_le_bytes());
-    v[cell as usize + 8..cell as usize + 12].copy_from_slice(&16u32.to_le_bytes());
-    v[cell as usize + 12..cell as usize + 16].copy_from_slice(&4192u32.to_le_bytes());
-    v[cell as usize + 16..cell as usize + 20].copy_from_slice(&0u32.to_le_bytes());
-    v[cell as usize + 20..cell as usize + 24].copy_from_slice(&3u32.to_le_bytes()); // REG_BINARY
-    v[4192..4208].copy_from_slice(&[0xB7u8; 16]);
+    let vk = cell + 4; // R4: vk record starts after the size prefix
+    v[vk as usize..vk as usize + 2].copy_from_slice(b"vk");
+    v[vk as usize + 2..vk as usize + 4].copy_from_slice(&0u16.to_le_bytes());
+    v[vk as usize + 4..vk as usize + 8].copy_from_slice(&16u32.to_le_bytes()); // data_len
+                                                                               // data_offset relative to hbin data start (0x1000): payload at
+                                                                               // absolute 5216 -> field = 5216 - 0x1000 = 1120.
+    v[vk as usize + 8..vk as usize + 12].copy_from_slice(&1120u32.to_le_bytes());
+    v[vk as usize + 12..vk as usize + 16].copy_from_slice(&3u32.to_le_bytes()); // REG_BINARY
+    v[5216..5232].copy_from_slice(&[0xB7u8; 16]);
     let graph = engine().analyze(&ByteSource::from_vec(v), true);
     let reg = graph
         .artifacts

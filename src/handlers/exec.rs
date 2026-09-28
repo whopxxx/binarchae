@@ -68,6 +68,19 @@ impl Handler for ElfHandler {
 
         let e_type = u16_at(src, base + 16).unwrap_or(0);
         let e_machine = u16_at(src, base + 18).unwrap_or(0);
+        let (phoff, phentsize, phnum) = if is64 {
+            (
+                u64_at(src, base + 32).unwrap_or(0),
+                u64::from(u16_at(src, base + 54).unwrap_or(0)),
+                u64::from(u16_at(src, base + 56).unwrap_or(0)),
+            )
+        } else {
+            (
+                u64::from(u32_at(src, base + 28).unwrap_or(0)),
+                u64::from(u16_at(src, base + 42).unwrap_or(0)),
+                u64::from(u16_at(src, base + 44).unwrap_or(0)),
+            )
+        };
         let (shoff, shentsize, shnum) = if is64 {
             (
                 u64_at(src, base + 40).unwrap_or(0),
@@ -123,12 +136,44 @@ impl Handler for ElfHandler {
             _ => "unknown",
         };
 
-        // B6: prove the structural end. The section table end is the
-        // strongest provable boundary; walk section headers for
-        // sh_offset+sh_size as well (last section can extend beyond the
-        // table). Without a provable end the artifact is Partial.
-        let mut struct_end = shoff + shnum.checked_mul(shentsize).unwrap_or(0);
+        // B6 + R3: prove the structural end from ALL file-backed parts:
+        // the ELF header itself, the program-header table, file-backed
+        // program segments (p_offset + p_filesz), and the section table /
+        // sections. A stripped ELF (shoff=0, shnum=0) still gets a real
+        // boundary from header + phdr table + segments. PT_LOAD = 1,
+        // PT_INTERP = 3 carry file bytes; PT_NULL(0)/PT_NOTE(4) mostly
+        // do — include every program header's file range conservatively
+        // except PT_TLS-ish types with no file backing (p_filesz=0 is
+        // naturally excluded).
+        let elf_header_end: u64 = if is64 { 64 } else { 52 };
+        let mut struct_end = elf_header_end;
+        let mut parts = 0usize;
+        // Program-header table + segment file ranges.
+        if phentsize > 0 && phnum > 0 && phnum as usize <= limits.max_records {
+            parts += 1;
+            struct_end = struct_end.max(phoff + phnum * phentsize);
+            for i in 0..phnum {
+                let ph = base + phoff + i * phentsize;
+                let (p_offset, p_filesz) = if is64 {
+                    (
+                        u64_at(src, ph + 8).unwrap_or(0),
+                        u64_at(src, ph + 32).unwrap_or(0),
+                    )
+                } else {
+                    (
+                        u64::from(u32_at(src, ph + 4).unwrap_or(0)),
+                        u64::from(u32_at(src, ph + 16).unwrap_or(0)),
+                    )
+                };
+                if p_filesz > 0 {
+                    struct_end = struct_end.max(p_offset + p_filesz);
+                }
+            }
+        }
+        // Section table + section file ranges.
         if shentsize > 0 && shnum > 0 && shnum as usize <= limits.max_records {
+            parts += 1;
+            struct_end = struct_end.max(shoff + shnum * shentsize);
             for i in 0..shnum {
                 let sh = base + shoff + i * shentsize;
                 // SHT_NOBITS (8) occupies no file bytes.
@@ -149,6 +194,7 @@ impl Handler for ElfHandler {
                 }
             }
         }
+        let _ = parts;
         let proven_end = base + struct_end <= src.len();
         let elf_size = if proven_end {
             struct_end
@@ -911,6 +957,51 @@ mod exec_tests {
         let out = validate_at(&ElfHandler, &src, 0).expect("elf validates");
         let art = &out.artifacts[0];
         assert_eq!(art.size, 256, "ELF size must be the structural end");
+        assert_eq!(art.confidence, Confidence::Validated);
+    }
+
+    #[test]
+    fn elf_stripped_boundary_from_program_headers() {
+        // R3: a stripped ELF (shoff=0, shnum=0) must NOT get size=0.
+        // Its boundary comes from header + phdr table + PT_LOAD file
+        // range, so appended trailing data stays discoverable.
+        let mut e = b"ELF ".to_vec();
+        e.extend([0u8; 8]);
+        e.extend(2u16.to_le_bytes()); // type: executable
+        e.extend(62u16.to_le_bytes()); // machine: x86-64
+        e.extend(1u32.to_le_bytes()); // version
+        e.extend(0u64.to_le_bytes()); // entry
+        e.extend(64u64.to_le_bytes()); // phoff = 64
+        e.extend(0u64.to_le_bytes()); // shoff = 0 (stripped)
+        e.extend(0u32.to_le_bytes()); // flags
+        e.extend(64u16.to_le_bytes()); // ehsize
+        e.extend(56u16.to_le_bytes()); // phentsize
+        e.extend(2u16.to_le_bytes()); // phnum = 2
+        e.extend(0u16.to_le_bytes()); // shentsize
+        e.extend(0u16.to_le_bytes()); // shnum = 0
+        e.extend(0u16.to_le_bytes()); // shstrndx
+                                      // Two program headers: PT_LOAD #1 file range 120..170, PT_LOAD
+                                      // #2 file range 100..160. The phdr table itself ends at 176,
+                                      // which is the furthest byte — the proven boundary.
+        for (off, filesz) in [(120u64, 50u64), (100u64, 60u64)] {
+            e.extend(1u32.to_le_bytes()); // p_type = PT_LOAD
+            e.extend(5u32.to_le_bytes()); // p_flags
+            e.extend(off.to_le_bytes()); // p_offset
+            e.extend(0u64.to_le_bytes()); // p_vaddr
+            e.extend(0u64.to_le_bytes()); // p_paddr
+            e.extend(filesz.to_le_bytes()); // p_filesz
+            e.extend(filesz.to_le_bytes()); // p_memsz
+            e.extend(0u64.to_le_bytes()); // p_align
+        }
+        assert_eq!(e.len(), 176);
+        e.extend_from_slice(b"APPENDED");
+        let src = ByteSource::from_vec(e);
+        let out = validate_at(&ElfHandler, &src, 0).expect("stripped elf validates");
+        let art = &out.artifacts[0];
+        assert_eq!(
+            art.size, 176,
+            "boundary = furthest of phdr-table end (176) / segment ends, not 0 and not src.len()"
+        );
         assert_eq!(art.confidence, Confidence::Validated);
     }
 

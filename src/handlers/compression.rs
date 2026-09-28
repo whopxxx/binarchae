@@ -555,20 +555,23 @@ impl Handler for ZstdHandler {
                 Some(Ok(frame_size)) => frame_size as u64,
                 _ => {
                     // Frame larger than the probe window (or probe failed):
-                    // streaming cursor, corrected for EndMark over-read.
+                    // streaming cursor (slice-relative), corrected for
+                    // EndMark over-read. Coordinates stay slice-relative
+                    // here and the result is the slice-relative consumed
+                    // size — never mixed with absolute `base`.
                     let cursor = region.stream_pos();
                     let mut end = cursor;
                     for back in 0..=8u64 {
                         let cand = cursor.saturating_sub(back);
-                        if cand >= base + 4 && cand <= src.len() {
+                        if cand >= 4 && base + cand <= src.len() {
                             let mut zb = [0u8; 4];
-                            if src.read_at(cand - 4, &mut zb).is_ok() && zb == [0, 0, 0, 0] {
+                            if src.read_at(base + cand - 4, &mut zb).is_ok() && zb == [0, 0, 0, 0] {
                                 end = cand;
                                 break;
                             }
                         }
                     }
-                    end - base
+                    end
                 }
             };
         }
@@ -654,6 +657,12 @@ impl Handler for Lz4Handler {
         let mut metadata = BTreeMap::new();
         let frame_end: u64;
 
+        // R1: FLG byte (after magic): bit 2 = content checksum present
+        // (4-byte xxhash32 AFTER the EndMark in the frame footer).
+        let mut flg = [0u8; 1];
+        src.read_at(base + 4, &mut flg)?;
+        let lz4_content_checksum = flg[0] & 0x04 != 0;
+
         if magic == LZ4_LEGACY_MAGIC {
             // Legacy frame: sequence of 8MB blocks with 4-byte LE sizes,
             // terminated by size 0. lz4_flex has no legacy reader; walk
@@ -710,6 +719,8 @@ impl Handler for Lz4Handler {
                 off += bsize;
             }
             // B2: exact frame end = after the 0 terminator.
+            // (slice-relative, like the modern path's base-relative
+            // result after the artifact-size conversion below)
             frame_end = off + 4;
             evidence.push("LZ4 legacy frame walked block-by-block".to_string());
             metadata.insert("frame".to_string(), "legacy".to_string());
@@ -739,12 +750,36 @@ impl Handler for Lz4Handler {
                 out.extend_from_slice(&chunk[..n]);
             }
             drop(decoder);
-            // B2: exact frame end. lz4_flex consumed through the
-            // trailing EndMark (4 zero bytes); the streaming cursor is
-            // the end of the frame. Verify the EndMark to anchor it.
+            // B2 + R1: exact frame end. The streaming cursor is
+            // slice-relative, so the absolute end is base + cursor.
+            // lz4_flex consumed through the EndMark (4 zero bytes) but
+            // NOT the optional 4-byte content checksum; the full frame
+            // footer is EndMark [+ Content Checksum].
             let cursor = region.stream_pos();
-            frame_end = lz4_endmark_end(src, base, cursor)?;
+            let endmark_abs = lz4_endmark_abs(src, base, cursor)?;
+            frame_end = if lz4_content_checksum {
+                // Frame footer extends 4 more bytes (xxhash32).
+                let footer = endmark_abs + 4;
+                if footer > src.len() {
+                    return Err(Error::Validation {
+                        format: "lz4",
+                        reason: "content checksum past end of source".into(),
+                    });
+                }
+                footer
+            } else {
+                endmark_abs
+            };
             evidence.push("LZ4 frame magic + descriptor walked".to_string());
+            metadata.insert(
+                "content_checksum".to_string(),
+                if lz4_content_checksum {
+                    "present"
+                } else {
+                    "absent"
+                }
+                .to_string(),
+            );
             metadata.insert("frame".to_string(), "modern".to_string());
         }
         if out.is_empty() {
@@ -758,7 +793,7 @@ impl Handler for Lz4Handler {
             "lz4",
             "LZ4 frame",
             base,
-            frame_end, // B2: exact frame end; trailing data stays discoverable
+            frame_end - base, // B2/R1: exact relative frame size; trailing data stays discoverable
             vec![
                 evidence.join("; "),
                 "decoded natively via lz4_flex".to_string(),
@@ -769,12 +804,14 @@ impl Handler for Lz4Handler {
     }
 }
 
-/// Locate the LZ4 frame EndMark (a 0u32) and return the frame end
-/// offset (absolute). The streaming cursor after a clean frame decode
-/// includes the EndMark lz4_flex read; verify it and anchor the exact
-/// boundary so trailing data after the frame stays discoverable.
-fn lz4_endmark_end(src: &ByteSource, base: u64, cursor: u64) -> Result<u64> {
-    for c in [cursor, cursor.saturating_sub(4)] {
+/// Locate the LZ4 frame EndMark (a 0u32). `cursor` is slice-relative
+/// (bytes the decoder consumed); the EndMark lies at absolute
+/// `base + cursor` unless the decoder over-read, in which case step
+/// back in 4-byte units. Returns the ABSOLUTE offset just past the
+/// EndMark so trailing data after the frame stays discoverable.
+fn lz4_endmark_abs(src: &ByteSource, base: u64, cursor: u64) -> Result<u64> {
+    for back in [0u64, 4, 8] {
+        let c = base + cursor - back;
         if c >= base + 8 && c <= src.len() {
             let mut zb = [0u8; 4];
             if src.read_at(c - 4, &mut zb).is_ok() && zb == [0, 0, 0, 0] {
@@ -961,6 +998,37 @@ mod tests {
         let src = ByteSource::from_vec(blob);
         let out = validate_at(&ZstdHandler, &src, 0).expect("zstd validates");
         assert_eq!(out.artifacts[0].size, compressed.len() as u64);
+    }
+
+    #[test]
+    fn lz4_embedded_frame_with_checksum_exact_boundary() {
+        // R1: embedded frame (base > 0) + content checksum. The artifact
+        // must end exactly after EndMark + 4-byte checksum, and trailing
+        // bytes after it stay outside the artifact.
+        let payload = b"lz4 embedded checksum payload ".repeat(20);
+        let mut compressed = Vec::new();
+        {
+            let mut info = lz4_flex::frame::FrameInfo::new();
+            info.content_checksum = true;
+            let mut enc = lz4_flex::frame::FrameEncoder::with_frame_info(info, &mut compressed);
+            std::io::Write::write_all(&mut enc, &payload).unwrap();
+            enc.finish().unwrap();
+        }
+        assert!(
+            compressed.len() > 5 && compressed[4] & 0x04 != 0,
+            "fixture must carry the content-checksum flag"
+        );
+        let mut blob = vec![0x00u8; 7]; // embedded at base=7
+        blob.extend_from_slice(&compressed);
+        blob.extend_from_slice(b"TRAILING");
+        let src = ByteSource::from_vec(blob);
+        let out = validate_at(&Lz4Handler, &src, 7).expect("embedded lz4 validates");
+        let art = &out.artifacts[0];
+        assert_eq!(
+            art.size,
+            compressed.len() as u64,
+            "frame end (incl. checksum footer) must be exact at base=7"
+        );
     }
 
     #[test]
