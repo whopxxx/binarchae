@@ -32,6 +32,23 @@ pub struct EngineLimits {
     pub max_archive_entries: usize,
     /// Maximum decompressed/compressed expansion ratio.
     pub max_expansion_ratio: u64,
+    /// M3/A2: maximum parser records (MFT entries, SQLite rows, PCAP
+    /// packets, FAT dir entries...) per artifact.
+    pub max_records: usize,
+    /// M3/A2: maximum partitions per disk image.
+    pub max_partitions: usize,
+    /// M3/A2: maximum network streams per capture.
+    pub max_streams: usize,
+    /// M3/A2: maximum reconstructed stream bytes per run.
+    pub max_reconstructed_bytes: u64,
+    /// M3/A2: maximum SQLite pages walked per database.
+    pub max_sqlite_pages: usize,
+    /// M3/A2: maximum registry cells visited per hive.
+    pub max_registry_cells: usize,
+    /// M3/A2: maximum string/candidate hints reported per region.
+    pub max_string_candidates: usize,
+    /// M3/A2: maximum filesystem entries per filesystem.
+    pub max_fs_entries: usize,
 }
 
 impl Default for EngineLimits {
@@ -43,6 +60,14 @@ impl Default for EngineLimits {
             max_child_size: 64 * 1024 * 1024,
             max_archive_entries: 4_096,
             max_expansion_ratio: 200,
+            max_records: 100_000,
+            max_partitions: 128,
+            max_streams: 1_024,
+            max_reconstructed_bytes: 64 * 1024 * 1024,
+            max_sqlite_pages: 65_536,
+            max_registry_cells: 1_000_000,
+            max_string_candidates: 4_096,
+            max_fs_entries: 65_536,
         }
     }
 }
@@ -182,9 +207,51 @@ pub fn builtin_handlers() -> Vec<Box<dyn Handler>> {
         Box::new(handlers::zip::ZipHandler),
         Box::new(handlers::gzip::GzipHandler),
         Box::new(handlers::xz::XzHandler),
+        Box::new(handlers::compression::ZlibHandler),
+        Box::new(handlers::compression::Bzip2Handler),
+        Box::new(handlers::compression::ZstdHandler),
+        Box::new(handlers::compression::Lz4Handler),
+        Box::new(handlers::archives::ArHandler),
+        Box::new(handlers::archives::DebHandler),
+        Box::new(handlers::archives::CabHandler),
+        Box::new(handlers::archives::SevenZHandler),
+        Box::new(handlers::archives::RarHandler),
+        Box::new(handlers::media::GifHandler),
+        Box::new(handlers::media::BmpHandler),
+        Box::new(handlers::media::TiffHandler),
+        Box::new(handlers::media::WebPHandler),
+        Box::new(handlers::media::RiffHandler),
+        Box::new(handlers::media::Mp3Handler),
+        Box::new(handlers::media::FlacHandler),
+        Box::new(handlers::exec::ElfHandler),
+        Box::new(handlers::exec::PeHandler),
+        Box::new(handlers::exec::MachOHandler),
+        Box::new(handlers::exec::WasmHandler),
+        Box::new(handlers::exec::OleHandler),
+        Box::new(handlers::exec::RtfHandler),
+        Box::new(handlers::disk::GptHandler),
+        Box::new(handlers::disk::MbrHandler),
+        Box::new(handlers::fat::FatHandler),
+        Box::new(handlers::filesystems::SquashfsHandler),
+        Box::new(handlers::filesystems::Iso9660Handler),
+        Box::new(handlers::filesystems::ExtHandler),
+        Box::new(handlers::filesystems::NtfsHandler),
+        Box::new(handlers::filesystems::UbiHandler),
+        Box::new(handlers::firmware::DtbHandler),
+        Box::new(handlers::firmware::AndroidBootHandler),
+        Box::new(handlers::firmware::TrxHandler),
+        Box::new(handlers::firmware::UefiFvHandler),
+        Box::new(handlers::sqlite::SqliteHandler),
+        Box::new(handlers::forensics::RegistryHandler),
+        Box::new(handlers::forensics::PcapHandler),
+        Box::new(handlers::forensics::PcapngHandler),
+        Box::new(handlers::forensics::MinidumpHandler),
         Box::new(handlers::cpio::CpioHandler),
         Box::new(handlers::tar::TarHandler),
         Box::new(handlers::pdf::PdfHandler),
+        // Recovery handlers run last: they stand down whenever a primary
+        // handler validated the region and only fire on damaged input.
+        Box::new(handlers::recovery::ZipSalvageHandler),
     ]
 }
 

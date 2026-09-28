@@ -28,6 +28,17 @@ pub enum RelationKind {
     LeadingData,
     /// Coexists with another artifact over the same bytes.
     Overlap,
+    /// M3: child is one partition of a disk/container (MBR/GPT slice).
+    PartitionOf,
+    /// M3: child is a filesystem entry (file/dir node under its fs).
+    FilesystemEntry,
+    /// M3: child was reconstructed from parent structure (TCP stream
+    /// reassembly, FAT cluster chains, SQLite overflow chains...).
+    ReconstructedFrom,
+    /// M3: child is a memory range out of a dump/capture.
+    MemoryRange,
+    /// M3: child is a database record or BLOB value.
+    DatabaseRecord,
 }
 
 impl fmt::Display for RelationKind {
@@ -40,6 +51,11 @@ impl fmt::Display for RelationKind {
             RelationKind::TrailingData => "trailing-data",
             RelationKind::LeadingData => "leading-data",
             RelationKind::Overlap => "overlap",
+            RelationKind::PartitionOf => "partition-of",
+            RelationKind::FilesystemEntry => "filesystem-entry",
+            RelationKind::ReconstructedFrom => "reconstructed-from",
+            RelationKind::MemoryRange => "memory-range",
+            RelationKind::DatabaseRecord => "database-record",
         };
         f.write_str(s)
     }

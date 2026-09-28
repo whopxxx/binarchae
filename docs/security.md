@@ -51,6 +51,12 @@ decompression (not after):
 - `max_archive_entries` bounds entry-count inflation.
 - `max_depth` and `max_artifacts` bound graph growth from nested
   recursion (zip → gzip → zip → ...).
+- M3 additions bound format-specific walks: `max_records` (PCAP
+  packets, minidump streams, SQLite rows), `max_partitions` (GPT/MBR),
+  `max_streams`, `max_reconstructed_bytes` (fragmented FAT chains),
+  `max_sqlite_pages`, `max_registry_cells`, `max_string_candidates`,
+  and `max_fs_entries` (directory-entry walks). A hostile filesystem
+  image or database cannot spin a walker past the cap.
 
 Work is additionally deduplicated by content hash (BLAKE3): identical
 bytes are recursively processed once, which also bounds self-referential
@@ -99,6 +105,61 @@ hardening:
   or size of embedded files. They are not charged as decompression
   expansion; owned children (decompression output) continue to use the
   run-wide expansion budget.
+
+## Forensics & recovery handlers (M3)
+
+The forensics and recovery additions follow the same contract:
+
+- **SQLite**: page sizes must be powers of two in [512, 65536] (or the
+  1→65536 encoding); text encoding must be one of the three defined
+  values. B-tree walking is depth-capped (12) and page-bounded
+  (`max_sqlite_pages`); overflow chains are followed with cycle
+  detection and a hard visited-set cap, so a cyclic chain terminates
+  with a typed validation error rather than a hang.
+- **PCAP/PCAPNG**: record/block lengths are bounds-checked against the
+  source before any slice; a record claiming more bytes than remain
+  ends the walk with the complete packets still reported (honest
+  truncation, not a crash). PCAPNG block chains reject lengths < 12
+  that would loop.
+- **Minidump**: stream counts are capped before the directory walk;
+  memory-range descriptors are bounds-checked before slicing.
+- **Registry**: hive-bin sizes are bounds-checked; cell sizes are
+  signed per the format and a cell that overruns its bin ends the bin
+  walk; the cell count is capped by `max_registry_cells`.
+- **ZIP salvage (recovery)**: runs *last* and stands down whenever an
+  intact EOCD exists — recovery never masks honest validation of
+  undamaged archives. Inflate output is hard-capped and charged to the
+  run-wide budget mid-stream; a corrupt stream keeps partial output and
+  reports the truncation rather than failing the whole salvage.
+- **Strings/hints**: output is always `Confidence::Heuristic` and
+  bounded by `max_string_candidates`; string hints are metadata, never
+  validated artifacts, and never materialized as files.
+
+## M3 hardening (round 2)
+
+- **FAT**: BPB layout arithmetic is fully checked — reserved + FAT
+  sectors + root-directory sectors must fit `total_sectors`; a hostile
+  BPB is rejected instead of wrapping into a huge cluster count.
+- **Compression**: zlib/bzip2/Zstd/LZ4 stream chunk-by-chunk through the
+  source (no candidate-to-EOF `read_all()` before limits apply); frame
+  ends are exact (zlib ADLER, zstd `findFrameCompressedSize`, LZ4
+  EndMark), so trailing data after a frame stays discoverable.
+- **SQLite**: overflow pages use full `page_size` stride; the per-spec
+  X/M/K local-payload rule is implemented; `max_sqlite_pages` bounds the
+  b-tree walk and overflow chains.
+- **Minidump**: RVAs resolve relative to the dump start; Memory64List
+  uses its real layout (u64 count, u64 BaseRva, contiguous memory).
+- **ELF/PE/Mach-O**: artifact size is the provable structural end
+  (section table / section raw data / load commands + segment files),
+  never "rest of input" — trailing-data provenance stays correct.
+
+## Fuzzing
+
+`fuzz/` contains three cargo-fuzz targets exercising the engine, every
+handler's `validate()` on arbitrary (offset, bytes), and the user TOML
+carving-rule parser. The invariant under fuzz: arbitrary input may be
+rejected or analyzed, but must never panic, read out of bounds, or
+hang. Run on a nightly toolchain with `cargo fuzz run <target>`.
 
 ## Out of scope for the analysis process
 

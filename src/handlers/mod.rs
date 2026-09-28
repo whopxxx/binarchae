@@ -1,11 +1,22 @@
 //! Format handlers. Each owns its candidate discovery, structural
 //! validation, boundary determination, and child production.
 
+pub mod archives;
+pub mod compression;
 pub mod cpio;
+pub mod disk;
+pub mod exec;
+pub mod fat;
+pub mod filesystems;
+pub mod firmware;
+pub mod forensics;
 pub mod gzip;
 pub mod jpeg;
+pub mod media;
 pub mod pdf;
 pub mod png;
+pub mod recovery;
+pub mod sqlite;
 pub mod tar;
 pub mod uimage;
 pub mod xz;
@@ -35,4 +46,25 @@ pub(crate) fn find_all(src: &crate::bytesource::ByteSource, needle: &[u8]) -> Ve
         }
     }
     hits
+}
+
+/// u16 LE read used by exec/document handlers (kept here for sharing).
+pub(crate) fn media_read_u16_le(src: &crate::bytesource::ByteSource, off: u64) -> Option<u16> {
+    let mut b = [0u8; 2];
+    src.read_at(off, &mut b).ok()?;
+    Some(u16::from_le_bytes(b))
+}
+
+/// u32 LE read used by exec/document handlers.
+pub(crate) fn media_read_u32_le(src: &crate::bytesource::ByteSource, off: u64) -> Option<u32> {
+    let mut b = [0u8; 4];
+    src.read_at(off, &mut b).ok()?;
+    Some(u32::from_le_bytes(b))
+}
+
+/// u32 BE read used by exec/document handlers.
+pub(crate) fn media_read_u32_be(src: &crate::bytesource::ByteSource, off: u64) -> Option<u32> {
+    let mut b = [0u8; 4];
+    src.read_at(off, &mut b).ok()?;
+    Some(u32::from_be_bytes(b))
 }

@@ -1,61 +1,125 @@
 # Capabilities
 
-Current state through milestone M2 (firmware/initramfs slice). Nothing on
-this page claims support that is not implemented.
+Current state through milestone M3 (core roadmap completion). Nothing on
+this page claims support that is not implemented. Formats marked
+**Partial** are structurally parsed but do not yet reconstruct full
+internal structure; the limits are stated explicitly.
 
 ## Format matrix
 
-| Format | Detect | Validate | Size | Extract | Recurse | Salvage | Metadata |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| PNG | yes | yes | yes (IEND-proven) | chunks/metadata | yes | no | yes (dimensions, chunk types) |
-| JPEG | yes | yes | yes (EOI-proven) | metadata | yes | no | yes (dimensions, segments) |
-| PDF | yes | partial | partial (%%EOF-based; heuristic when absent) | metadata | yes | no | yes (version) |
-| ZIP | yes | yes (central directory) | yes | yes | yes | limited | yes (entries, encryption flag) |
-| gzip | yes | yes (CRC32/ISIZE trailer) | yes | yes | yes | no | yes (sizes) |
-| XZ | yes | yes (container walk + LZMA2) | yes (footer-anchored) | yes | yes | no | yes (sizes, blocks) |
-| TAR | yes | yes (ustar headers) | yes | yes | yes | limited | yes (entry names) |
-| uImage (legacy) | yes | yes (header CRC + data CRC) | yes (`64 + ih_size`) | payload | yes (validated only) | no | yes (os/arch/type/comp, load/ep, name, CRC states) |
-| CPIO newc/crc | yes | yes (TRAILER!!! walk; crc variant checksum) | yes (trailer-anchored) | yes (regular files) | yes | no | yes (pathname, mode, uid/gid, mtime, inode, nlink) |
-| GIF | carved | footer-bounded | yes | bytes only | no | yes | no |
-| RAR | carved | no | bounded | no (recovery only) | no | yes | no |
-| 7z | carved | no | bounded | no (recovery only) | no | yes | no |
+### Images / documents (M1)
 
-## uImage specifics
+| Format | Detect | Validate | Size | Extract | Recurse | Metadata |
+|---|---:|---:|---:|---:|---:|---|
+| PNG | yes | yes | yes (IEND-proven) | chunks/metadata | yes | dimensions, chunk types |
+| JPEG | yes | yes | yes (EOI-proven) | metadata | yes | dimensions, segments |
+| PDF | yes | partial | partial (%%EOF-based) | metadata | yes | version |
+| GIF | yes | yes (block walk, trailer) | yes | yes | yes | dimensions, frames |
+| BMP | yes | yes (header fields, data size) | yes | yes | yes | dimensions, depth |
+| TIFF | yes | yes (IFD walk, endian) | yes | yes | yes | dimensions, IFD entries |
+| WebP | yes | yes (RIFF/VP8 container walk) | yes | yes | yes | dimensions, chunk list |
 
-- Legacy 64-byte header only (`IH_MAGIC 0x27051956`); all fields parsed
-  big-endian. FIT, DTB images, and U-Boot v2016+ `fit` images are **not**
-  supported.
-- Header CRC verified with the CRC field zeroed; data CRC verified over
-  exactly the declared payload. Header-CRC failure rejects the candidate;
-  data-CRC failure yields an honestly-marked `Damaged` artifact whose
-  payload is not recursed.
-- Exact boundary `64 + ih_size` with checked arithmetic; trailing bytes
-  remain available to trailing-data discovery.
-- `IH_TYPE_MULTI` images: BE u32 length table (zero-terminated), each
-  component a separate source-backed child with index/declared size.
-- Unknown OS/arch/type/compression enum values are represented numerically
-  (`unknown(N)`), never a parser failure.
+### Compression / archives (M1+M3)
 
-## CPIO specifics
+| Format | Detect | Validate | Size | Extract | Recurse | Notes |
+|---|---:|---:|---:|---:|---:|---|
+| ZIP | yes | yes (central directory) | yes | yes | yes | encrypted entries flagged |
+| gzip | yes | yes (CRC32/ISIZE) | yes | yes | yes | |
+| XZ | yes | yes (container + LZMA2) | yes | yes | yes | |
+| zlib/deflate | yes / no-sig | yes | yes | yes | yes | raw deflate is no-signature (explicit opt-in via nesting) |
+| bzip2 | yes | yes (CRC) | yes | yes | yes | |
+| Zstd | yes | yes (frame walk) | yes | yes | yes | skippable frames handled |
+| LZ4 | yes | yes (frame walk) | yes | yes | yes | |
+| Brotli | no-sig | yes | yes | yes | yes | no signature exists; discovered via nesting only |
+| TAR | yes | yes (ustar) | yes | yes | yes | |
+| CPIO newc/crc | yes | yes (TRAILER!!!/checksum) | yes | yes | yes | busybox-verified fixtures |
+| AR | yes | yes (member walk) | yes | yes | yes | source-backed members |
+| DEB | yes | yes (ar + control/data) | yes | member-level | yes | |
+| CAB | yes | yes (CFHEADER + entries) | yes | yes | yes | |
+| 7z | yes | yes (via sevenz-rust2) | yes | yes | yes | encrypted archives detected |
+| RAR | carved | no | bounded | no | no | honest recovery-only |
 
-- `newc` (`070701`) and `crc` (`070702`) only. Old binary and `odc`
-  formats are **not** claimed or detected as supported.
-- Full 110-byte ASCII-hex header parsed with checked hex decoding;
-  malformed digits/overflow reject the entry.
-- Name/data alignment follows the real GNU/Linux initramfs layout — the
-  stream position after `110-byte header + filename + NUL` is aligned to
-  4, then `filesize + pad` for data. Verified against a frozen fixture
-  generated by an independent standard implementation (busybox `cpio -H
-  newc`); parsers must match real archives, not self-consistent fixtures.
-- `TRAILER!!!` structurally anchors the archive end (after the trailer's
-  aligned name area); bytes after remain trailing data.
-- Regular files are source-backed children recursed like any other
-  artifact; `crc`-variant checksum mismatches are flagged honestly and
-  mark the archive `Damaged`, never silently accepted.
-- Directories/symlinks/devices/FIFOs/sockets are recognized and keep their
-  metadata; **none** of them create host filesystem effects. Extraction
-  goes through the safe-path layer (traversal, absolute, drive-letter,
-  UNC all contained; duplicate names deterministically disambiguated).
+### Media (M3)
+
+| Format | Detect | Validate | Size | Extract | Recurse | Notes |
+|---|---:|---:|---:|---:|---:|---|
+| RIFF (WAV/AVI) | yes | yes (chunk walk) | yes | chunks | yes | |
+| MP3 | yes | yes (strict frame sync + chaining) | yes | yes | yes | MPEG1 field validation prevents compressed-data false positives |
+| FLAC | yes | yes (STREAMINFO + metadata) | yes | yes | yes | |
+| OLE (CFB) | yes | yes (header + FAT) | partial | metadata | yes | Partial: full stream tree not reconstructed |
+| RTF | yes | yes (brace balance) | partial | metadata | yes | |
+
+### Executables / binaries (M3)
+
+| Format | Detect | Validate | Size | Extract | Recurse | Notes |
+|---|---:|---:|---:|---:|---:|---|
+| ELF | yes | yes (header + sections) | yes (section-table-proven) | sections | yes | section/program headers |
+| PE | yes | yes (DOS+NT headers + section raw data) | yes (proven boundary) | metadata | yes | sections not carved individually |
+| Mach-O | yes | yes (header + load commands + segments) | yes (proven boundary) | metadata | yes | |
+| WASM | yes | yes (magic + section walk) | yes | sections | yes | |
+
+### Disk / filesystems (M3)
+
+| Format | Detect | Validate | Size | Extract | Recurse | Notes |
+|---|---:|---:|---:|---:|---:|---|
+| MBR | yes | yes (sig + partition entries + EBR chain) | n/a | partitions | yes | PartitionOf relation |
+| GPT | yes | yes (header CRC + entry CRC) | n/a | partitions | yes | CRC-verified |
+| FAT12/16/32 | yes | yes (BPB + FAT + dirs) | n/a | files | yes | LFN; fragmented files via ReconstructedFrom |
+| exFAT | no | no | no | no | no | not implemented |
+| NTFS | yes | partial (boot sector) | no | no | no | Partial (documented) |
+| ext2/3/4 | yes | partial (superblock) | no | no | no | Partial (documented) |
+| SquashFS | yes | partial (superblock) | partial | no | no | Partial (documented) |
+| ISO9660 | yes | yes (PVD + root extent) | yes | root listing | yes | |
+| UBI/UBIFS | yes | partial (EC headers) | no | no | no | Partial (documented) |
+| JFFS2/cramfs/ROMFS | no | no | no | no | no | not implemented |
+
+### Firmware (M3)
+
+| Format | Detect | Validate | Size | Extract | Recurse | Notes |
+|---|---:|---:|---:|---:|---:|---|
+| uImage (legacy) | yes | yes (header+data CRC) | yes | payload | yes | MULTI type supported |
+| FIT/DTB | yes | yes (structure token walk) | yes | nodes | yes | DTB properties |
+| Android boot | yes | yes (magic + page layout) | yes | slots | yes | source-backed kernel/ramdisk |
+| Android sparse | yes | yes (chunk walk) | partial | no | no | Partial |
+| TRX | yes | yes (header + offsets) | yes | partitions | yes | |
+| UEFI firmware volume | yes | partial (FV header + GUID) | partial | no | no | Partial |
+| U-Boot FIT images (itb) | via DTB | yes | yes | yes | yes | |
+
+### Databases / forensics (M3)
+
+| Format | Detect | Validate | Size | Extract | Recurse | Notes |
+|---|---:|---:|---:|---:|---:|---|
+| SQLite | yes | yes (header + b-tree walk) | yes | records + BLOBs | yes | schema + table rows as DatabaseRecord children; BLOB values recurse (nested artifacts); overflow chains per X/M/K rule |
+| Registry (regf) | yes | partial (hbin/cell walk) | n/a | REG_BINARY values | no | Partial: nk/vk cell counting; REG_BINARY values surface as source-backed children |
+| PCAP | yes | yes (record walk) | yes | packets + HTTP | yes | all 4 magic endianness variants (us/ns); truncated captures → Partial; TCP/HTTP object reconstruction (ReconstructedFrom children) |
+| PCAPNG | yes | yes (block chain) | yes | packets | yes | SHB/EPB walk |
+| Minidump | yes | yes (stream directory) | yes | memory ranges | yes | MemoryList/Memory64List → MemoryRange children |
+| Strings/URL/flag hints | yes | heuristic | n/a | n/a | no | Heuristic confidence — never claims validation |
+
+## Required cross-domain chains (Issue #5, verified in tests/m3_integration.rs)
+
+| Chain | Status |
+|---|---|
+| PNG → trailing data → ZIP → member | yes (per-hop provenance asserted) |
+| gzip → SQLite → DatabaseRecord rows | yes |
+| PCAP → TCP/HTTP reconstruction → HTTP object artifact | yes |
+| GPT → PartitionOf → filesystem (FAT) → nested file | yes |
+| SQLite → DatabaseRecord BLOB → nested artifact (e.g. PNG) | yes |
+| Registry → REG_BINARY value → artifact | yes |
+| Minidump → MemoryRange → artifact | yes |
+| MBR → partition → FAT → file | yes |
+| uImage → gzip kernel → payload | yes |
+| Truncated ZIP → salvage → Recovered entries | yes |
+
+## Recovery (M3)
+
+| Capability | Status |
+|---|---|
+| Truncated ZIP salvage (local-entry structural salvage) | yes — `Confidence::Recovered`, never masks intact archives |
+| Partial deflate output on corrupt streams | yes (partial bytes kept with warning) |
+| Encrypted/streaming-entry handling in salvage | yes (skipped with warnings) |
+| CPIO/tar damaged-archive honesty | Damaged/Partial confidence in primary handlers |
+| Generic carving (header/footer/next-header/max) | yes (builtin + user TOML rules) |
 
 ## Owned vs source-backed child content
 
@@ -66,12 +130,11 @@ Handler-produced children are one of:
   run-wide expansion budget.
 - **Source-backed** — a bounded `ByteSource` region referencing bytes
   already present in the parent input (uImage payloads, CPIO file
-  contents, ZIP/TAR members kept in place). Zero-copy: slices over one
-  memory input share the original backing allocation, and BLAKE3 identity,
-  dedup, recursion, limits, and materialization behave identically to
-  owned children. Registration stores a region **handle**, not bytes —
-  copying happens only when extraction materializes the artifact (lazily,
-  through the handle). Analysis never requires a temp file.
+  contents, ZIP/TAR members, PCAP packets, minidump memory ranges,
+  Android boot slots). Zero-copy: slices over one memory input share
+  the original backing allocation. Registration stores a region
+  **handle**, not bytes — copying happens only when extraction
+  materializes the artifact.
 
 Source-backed children are not falsely billed as decompression expansion —
 they represent bytes that already existed in the input.
@@ -81,20 +144,29 @@ they represent bytes that already existed in the input.
 | Capability | Status |
 |---|---|
 | Trailing-data detection after validated structures | yes (recursive) |
-| Leading-data before first structure | basic (via region scanning) |
-| Generic carving (header/footer/next-header/max-size) | yes (builtin + user TOML rules) |
-| Bounded entropy analysis | yes (16 sampled blocks, compact output) |
+| Leading-data before first structure | yes |
+| Generic carving (builtin + user TOML rules) | yes |
+| Bounded entropy analysis | yes |
 | Content dedup (BLAKE3) with provenance preservation | yes |
-| Resource limits (depth/artifacts/bytes/entries/ratio) | yes, configurable (incl. CPIO entry cap) |
+| Resource limits (depth/artifacts/bytes/entries/ratio/records/fs-entries) | yes, configurable |
 | Safe extraction (traversal/UNC/drive/symlink/dup-name) | yes |
 | Human compact tree output | yes |
 | Stable JSON output (serde round-trip) | yes |
+| Fuzzing harness (cargo-fuzz, 3 targets) | yes |
+| Benchmarks (criterion, 4 scenarios) | yes |
 | External executables required | **none** |
 
-## Explicitly not yet supported
+## Explicitly not yet supported / known limits
 
-RAR/7z extraction, filesystems (FAT/NTFS/ext/SquashFS/UBI/UBIFS/JFFS2),
-U-Boot FIT and device-tree images, Android boot images, UEFI, old CPIO
-variants (binary/odc), Registry/MFT/SQLite deep parsing, PCAP
-reconstruction, minidumps, GUI/web UI, MCP, plugin ecosystem. These are
-follow-up work on top of this foundation.
+- RAR/7z *recovery-record* parsing; RAR extraction (recovery-only).
+- exFAT, JFFS2, cramfs, ROMFS filesystems.
+- NTFS/ext/SquashFS/UBI full-entry extraction (superblock-level only).
+- Registry key-tree reconstruction (REG_BINARY value extraction works;
+  full key hierarchy and REG_SZ/REG_MULTI_SZ decoding remain).
+- Per-flow TCP stream reassembly (sequence-number based, multi-packet
+  retransmission handling); HTTP carving over capture-order payload
+  concatenation works today.
+- GUI/web UI, MCP, plugin ecosystem.
+
+Each "not yet" above is a deliberate scoping decision documented here;
+none of the shipped formats degrade to magic-only detection.

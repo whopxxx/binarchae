@@ -18,6 +18,9 @@ pub struct ByteSource {
     /// root (0 for root sources).
     root_offset: u64,
     len: u64,
+    /// Cursor for the `std::io::Read` streaming impl. Random-access
+    /// `read_at` is unaffected; clones start at position 0.
+    stream_pos: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +42,7 @@ impl ByteSource {
             },
             root_offset: 0,
             len,
+            stream_pos: 0,
         }
     }
 
@@ -53,6 +57,7 @@ impl ByteSource {
             },
             root_offset: 0,
             len,
+            stream_pos: 0,
         })
     }
 
@@ -80,6 +85,7 @@ impl ByteSource {
             backing,
             root_offset: self.root_offset + offset,
             len,
+            stream_pos: 0,
         })
     }
 
@@ -148,6 +154,17 @@ impl ByteSource {
         Ok(out)
     }
 
+    /// Current streaming-read cursor (bytes consumed by the `Read` impl
+    /// so far). Decompressors use this to compute exact frame ends.
+    pub fn stream_pos(&self) -> u64 {
+        self.stream_pos
+    }
+
+    /// Reset the streaming-read cursor to 0.
+    pub fn rewind(&mut self) {
+        self.stream_pos = 0;
+    }
+
     /// Hash the entire region with BLAKE3 (streaming; works for any size).
     pub fn hash_all(&self) -> String {
         use blake3::Hasher;
@@ -169,6 +186,31 @@ impl ByteSource {
             }
         }
         hasher.finalize().to_hex().to_string()
+    }
+}
+
+/// Streaming reads over the region. This is the bounded-memory path for
+/// decompressors: they pull chunk-by-chunk through `read_at` instead of
+/// forcing a whole-region `read_all()` before any limit check.
+impl std::io::Read for ByteSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.stream_pos >= self.len {
+            return Ok(0); // EOF
+        }
+        // Cap the chunk: file-backed `read_at` re-opens the file per
+        // call, so a huge single read would be both unbounded work and a
+        // giant read_exact. 64 KiB matches the decoder chunk sizes.
+        const MAX_CHUNK: u64 = 64 * 1024;
+        let want = (buf.len() as u64)
+            .min(MAX_CHUNK)
+            .min(self.len - self.stream_pos) as usize;
+        if want == 0 {
+            return Ok(0);
+        }
+        self.read_at(self.stream_pos, &mut buf[..want])
+            .map_err(std::io::Error::other)?;
+        self.stream_pos += want as u64;
+        Ok(want)
     }
 }
 
