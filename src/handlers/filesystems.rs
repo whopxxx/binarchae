@@ -250,7 +250,7 @@ impl Handler for Iso9660Handler {
         let root_len = u32::from(root_record[10]) as u64;
 
         let volume_id = String::from_utf8_lossy(&pvd[40..72])
-            .trim_end_matches([' ', ' '])
+            .trim_end_matches([' ', '\0'])
             .to_string();
 
         let total_bytes = size_le * logical_block;
