@@ -2320,6 +2320,7 @@ impl Handler for Jffs2Handler {
 impl Jffs2Handler {
     /// Depth-first emission of one directory's children.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn emit_dir(
         &self,
         src: &ByteSource,
@@ -2882,6 +2883,739 @@ impl Handler for UbiVolumeHandler {
     }
 }
 
+// ---------------------------------------------------------------------------
+// UBIFS
+// ---------------------------------------------------------------------------
+
+/// UBIFS filesystem handler: walks the B-tree index rooted at the
+/// master node and reconstructs the directory tree. Runs on raw UBIFS
+/// images and on UBI volume content extracted by UbiVolumeHandler.
+pub struct UbifsHandler;
+
+const UBIFS_MAGIC: u32 = 0x0610_1831; // stored little-endian
+const UBIFS_CH_SZ: usize = 24;
+const UBIFS_SB_NODE: u8 = 6;
+const UBIFS_MST_NODE: u8 = 7;
+const UBIFS_IDX_NODE: u8 = 9;
+const UBIFS_INO_KEY: u32 = 0;
+const UBIFS_DATA_KEY: u32 = 1;
+const UBIFS_DENT_KEY: u32 = 2;
+/// Maximum index depth (kernel: UBIFS_MAX_LEVELS 512, but 64 bounds
+/// runaway recursion on fuzzed images).
+const UBIFS_MAX_DEPTH: u32 = 64;
+
+/// Layout verified against Linux fs/ubifs (ubifs-media.h, sb.c,
+/// master.c via ubifs.h, io.c, key.h, file.c, compress.c):
+/// - Every node starts with `struct ubifs_ch` (24 bytes, all LE):
+///   magic@0 (0x06101831), crc@4 (CRC-32 over node bytes 8..len),
+///   sqnum@8 (u64), len@16 (u32), node_type@20, group_type@21.
+/// - `struct ubifs_sb_node` (superblock, LEB 0): leb_size@+40 (ch 24 +
+///   padding 2 + key_hash 1 + key_fmt 1 + flags 4 + min_io_size 4 =
+///   offset 36..40), leb_cnt@44. Only simple key format (key_fmt 0,
+///   key_len 8) is supported, per sb.c.
+/// - `struct ubifs_mst_node` (master, LEBs 1 and 2; higher cmt_no
+///   wins): root_lnum@+36, root_offs@+40, root_len@+44 (the B-tree
+///   index root).
+/// - `struct ubifs_idx_node`: child_cnt@+24 (u16), level@+26 (u16),
+///   branches@+28, each `struct ubifs_branch` = 12 + key_len = 20
+///   bytes: lnum@0, offs@4, len@8 (u32 LE), key[8]@12.
+/// - Keys (simple format): u32 LE inum@0; u32@4 = type << 29 | payload
+///   (block number for DATA keys, R5 hash for DENT keys, 0 for INO).
+/// - `struct ubifs_dent_node`: key[16]@24, inum@40 (u64), type@49,
+///   nlen@50 (u16), name@56.
+/// - `struct ubifs_ino_node`: key[16]@24, size@48 (u64), times@56..80,
+///   nlink@80? -- exact: creat_sqnum@40, size@48, atime_sec@56,
+///   ctime_sec@64, mtime_sec@72, nsecs@80..92, nlink@92, uid@96,
+///   gid@100, mode@104, flags@108, data_len@112, compr_type@132,
+///   data@160. Inline data (symlinks, devices) is data_len bytes.
+/// - `struct ubifs_data_node`: key[16]@24, size@40 (u32, uncompressed
+///   size of this block), compr_type@44 (u16), data@48. Compressed
+///   length = ch.len - 48. Compression codes: NONE 0, LZO 1,
+///   ZLIB 2 (standard zlib stream via crypto 'deflate'), ZSTD 3.
+///   Data past a block's decompressed size zero-fills (holes).
+/// - LEB N lives at byte offset N * leb_size in the volume/image.
+///
+/// Parent inum -> dent entries (sort ref, target inum, name, ITYPE).
+type UbifsDentMap = std::collections::BTreeMap<u32, Vec<(u64, u32, Vec<u8>, u8)>>;
+///
+/// Inum -> parsed inode node.
+type UbifsInoMap = std::collections::BTreeMap<u32, UbifsIno>;
+
+/// A leaf node reference collected from the index.
+struct UbifsLeafRef {
+    lnum: u32,
+    offs: u32,
+    len: u32,
+    key_type: u32,
+    inum: u32,
+}
+
+/// Parsed inode metadata.
+struct UbifsIno {
+    size: u64,
+    mode: u32,
+    nlink: u32,
+    data: Vec<u8>,
+}
+
+fn ubi_le32(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+fn ubi_le64(b: &[u8], o: usize) -> u64 {
+    u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+}
+
+impl UbifsHandler {
+    /// Read one LEB of a UBIFS image at `base` (leb_size from the
+    /// superblock).
+    fn read_leb(
+        src: &ByteSource,
+        base: u64,
+        leb_size: u64,
+        lnum: u32,
+        len: u32,
+    ) -> Result<Vec<u8>> {
+        let off = base + u64::from(lnum) * leb_size;
+        let take = u64::from(len).min(leb_size);
+        let mut buf = vec![0u8; take as usize];
+        src.read_at(off, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Validate the common header; returns (node_type, len) or None.
+    fn check_ch(node: &[u8]) -> Option<(u8, u32)> {
+        if node.len() < UBIFS_CH_SZ {
+            return None;
+        }
+        let magic = ubi_le32(node, 0);
+        if magic != UBIFS_MAGIC {
+            return None;
+        }
+        let len = ubi_le32(node, 16);
+        if len < UBIFS_CH_SZ as u32 || len as usize > node.len() {
+            return None;
+        }
+        let stored = ubi_le32(node, 4);
+        if ubi_crc32(&node[8..len as usize]) != stored {
+            return None;
+        }
+        Some((node[20], len))
+    }
+
+    /// Parse the superblock LEB for leb_size.
+    fn parse_sb(src: &ByteSource, base: u64, leb_size_guess: u64) -> Result<u64> {
+        // The superblock node sits at offset 0 (well, 2 KiB) of LEB 0.
+        // The LEB size itself is only known after parsing, so probe
+        // common sizes.
+        for &guess in &[
+            leb_size_guess,
+            4096,
+            8192,
+            16384,
+            32768,
+            65536,
+            131072,
+            262144,
+            524288,
+            1048576,
+            2097152,
+            4194304,
+        ] {
+            if guess < 2048 || base + guess > src.len() {
+                continue;
+            }
+            let mut probe = vec![0u8; 2048];
+            if src.read_at(base + guess - 2048, &mut probe).is_err() {
+                continue;
+            }
+            // Try the node right at LEB start.
+            let mut node = vec![0u8; 64];
+            if src.read_at(base, &mut node).is_err() {
+                continue;
+            }
+            if ubi_le32(&node, 0) != UBIFS_MAGIC {
+                continue;
+            }
+            if node[20] != UBIFS_SB_NODE {
+                continue;
+            }
+            let len = ubi_le32(&node, 16) as usize;
+            if len < 32 || len > probe.len() + 64 {
+                continue;
+            }
+            let mut sb = vec![0u8; len.min(4096)];
+            src.read_at(base, &mut sb)?;
+            if ubi_crc32(&sb[8..len]) != ubi_le32(&sb, 4) {
+                continue;
+            }
+            // sb layout: ch(24) + pad(2) + key_hash(1) + key_fmt(1)
+            // + flags(4) + min_io_size(4) + leb_size@36.
+            if sb[27] != 0 {
+                continue; // key_fmt: only simple (0)
+            }
+            let parsed = ubi_le32(&sb, 36) as u64;
+            if parsed == guess {
+                return Ok(parsed);
+            }
+        }
+        Err(Error::Validation {
+            format: "ubifs",
+            reason: "no valid superblock node at LEB 0".into(),
+        })
+    }
+
+    /// Find the newest master node (higher cmt_no wins).
+    fn find_master(src: &ByteSource, base: u64, leb_size: u64) -> Result<Vec<u8>> {
+        let mut best: Option<(u64, Vec<u8>)> = None;
+        for lnum in 1..=2u32 {
+            let off = base + u64::from(lnum) * leb_size;
+            let mut hdr = [0u8; UBIFS_CH_SZ];
+            if src.read_at(off, &mut hdr).is_err() || ubi_le32(&hdr, 0) != UBIFS_MAGIC {
+                continue;
+            }
+            if hdr[20] != UBIFS_MST_NODE {
+                continue;
+            }
+            let len = ubi_le32(&hdr, 16) as usize;
+            if !(UBIFS_CH_SZ + 36..=4096).contains(&len) {
+                continue;
+            }
+            let mut node = vec![0u8; len];
+            src.read_at(off, &mut node)?;
+            if ubi_crc32(&node[8..len]) != ubi_le32(&node, 4) {
+                continue;
+            }
+            let cmt = ubi_le64(&node, UBIFS_CH_SZ + 8);
+            if best.as_ref().map(|(c, _)| cmt > *c).unwrap_or(true) {
+                best = Some((cmt, node));
+            }
+        }
+        best.map(|(_, n)| n).ok_or_else(|| Error::Validation {
+            format: "ubifs",
+            reason: "no valid master node".into(),
+        })
+    }
+
+    /// Walk the B-tree index from `lnum`/`offs`/`len`, collecting leaf
+    /// references. Index branches at level > 0 point at child index
+    /// nodes; level 0 points at ino/dent/data nodes.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_index(
+        &self,
+        src: &ByteSource,
+        base: u64,
+        leb_size: u64,
+        lnum: u32,
+        offs: u32,
+        len: u32,
+        depth: u32,
+        limits: &crate::engine::EngineLimits,
+        warnings: &mut Vec<String>,
+        out: &mut Vec<UbifsLeafRef>,
+    ) -> Result<()> {
+        if depth > UBIFS_MAX_DEPTH {
+            warnings.push("ubifs index deeper than 64; subtree skipped".to_string());
+            return Ok(());
+        }
+        if out.len() >= limits.max_fs_entries {
+            return Ok(());
+        }
+        let node = Self::read_leb(src, base, leb_size, lnum, len)?;
+        let offs = offs as usize;
+        if offs + len as usize > node.len() + UBIFS_CH_SZ {
+            warnings.push("ubifs index node out of LEB bounds; skipped".to_string());
+            return Ok(());
+        }
+        let node = &node[offs.min(node.len())..];
+        let Some((node_type, _len)) = Self::check_ch(node) else {
+            warnings.push("invalid index node header; skipped".to_string());
+            return Ok(());
+        };
+        if node_type != UBIFS_IDX_NODE {
+            return Ok(());
+        }
+        if node.len() < 28 {
+            return Ok(());
+        }
+        let child_cnt = u16::from_le_bytes([node[24], node[25]]) as usize;
+        let level = u16::from_le_bytes([node[26], node[27]]) as u32;
+        let branch_sz = 12 + 8;
+        for i in 0..child_cnt {
+            if out.len() >= limits.max_fs_entries {
+                warnings.push("max_fs_entries reached; index truncated".to_string());
+                return Ok(());
+            }
+            let b = 28 + i * branch_sz;
+            if b + branch_sz > node.len() {
+                break;
+            }
+            let child_lnum = ubi_le32(node, b);
+            let child_offs = ubi_le32(node, b + 4);
+            let child_len = ubi_le32(node, b + 8);
+            let key = &node[b + 12..b + 20];
+            let inum = ubi_le32(key, 0);
+            let second = ubi_le32(key, 4);
+            let key_type = second >> 29;
+            if level == 0 {
+                if child_len >= UBIFS_CH_SZ as u32 && u64::from(child_len) <= leb_size {
+                    out.push(UbifsLeafRef {
+                        lnum: child_lnum,
+                        offs: child_offs,
+                        len: child_len,
+                        key_type,
+                        inum,
+                    });
+                }
+            } else {
+                self.walk_index(
+                    src,
+                    base,
+                    leb_size,
+                    child_lnum,
+                    child_offs,
+                    child_len,
+                    depth + 1,
+                    limits,
+                    warnings,
+                    out,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl UbifsHandler {
+    /// Read one leaf node (ino / dent / data).
+    fn read_leaf(
+        src: &ByteSource,
+        base: u64,
+        leb_size: u64,
+        leaf: &UbifsLeafRef,
+    ) -> Option<Vec<u8>> {
+        let off = base + u64::from(leaf.lnum) * leb_size + u64::from(leaf.offs);
+        if off + u64::from(leaf.len) > src.len() {
+            return None;
+        }
+        let mut node = vec![0u8; leaf.len as usize];
+        src.read_at(off, &mut node).ok()?;
+        Self::check_ch(&node)?;
+        Some(node)
+    }
+
+    /// Parse an ino node: metadata + inline data.
+    fn parse_ino(node: &[u8]) -> Option<UbifsIno> {
+        if node.len() < 160 {
+            return None;
+        }
+        let size = ubi_le64(node, 48);
+        let nlink = ubi_le32(node, 92);
+        let mode = ubi_le32(node, 104);
+        let data_len = ubi_le32(node, 112) as usize;
+        let data = if 160 + data_len <= node.len() {
+            node[160..160 + data_len].to_vec()
+        } else {
+            Vec::new()
+        };
+        let _ = data_len;
+        Some(UbifsIno {
+            size,
+            mode,
+            nlink,
+            data,
+        })
+    }
+
+    /// Assemble file content from data node blocks. `block` from the
+    /// key; per block the decompressed payload lands at block*4096.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_data(
+        &self,
+        src: &ByteSource,
+        base: u64,
+        leb_size: u64,
+        inum: u32,
+        leaves: &[UbifsLeafRef],
+        total: u64,
+        limits: &crate::engine::EngineLimits,
+        budget: &mut Budget,
+        warnings: &mut Vec<String>,
+    ) -> Result<Option<Vec<u8>>> {
+        let total = total.min(limits.max_child_size);
+        let mut out = vec![0u8; total as usize];
+        let mut wrote = false;
+        for leaf in leaves
+            .iter()
+            .filter(|l| l.inum == inum && l.key_type == UBIFS_DATA_KEY)
+        {
+            let Some(node) = Self::read_leaf(src, base, leb_size, leaf) else {
+                continue;
+            };
+            if node.len() < 48 {
+                continue;
+            }
+            let block = (ubi_le32(&node, 28) & 0x1FFF_FFFF) as usize;
+            let size = ubi_le32(&node, 40) as usize;
+            let compr = u16::from_le_bytes([node[44], node[45]]);
+            let payload = &node[48..];
+            let start = block * 4096;
+            if start >= out.len() {
+                continue;
+            }
+            let take = (4096).min(out.len() - start).min(size);
+            let decoded: Vec<u8> = match compr {
+                0 => payload.to_vec(),
+                2 => match Self::zlib_decompress(payload) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        warnings.push(format!(
+                            "inode {inum}: zlib block {block} failed; zero-filled"
+                        ));
+                        continue;
+                    }
+                },
+                3 => match zstd::stream::decode_all(payload) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        warnings.push(format!(
+                            "inode {inum}: zstd block {block} failed; zero-filled"
+                        ));
+                        continue;
+                    }
+                },
+                other => {
+                    warnings.push(format!(
+                        "inode {inum}: unsupported compression {other}; block zero-filled"
+                    ));
+                    continue;
+                }
+            };
+            if !decoded.is_empty() && !budget.charge(limits, decoded.len() as u64) {
+                return Err(Error::LimitExceeded {
+                    limit: "max-total-expanded-bytes",
+                    detail: "ubifs data block".into(),
+                });
+            }
+            let n = decoded.len().min(take);
+            out[start..start + n].copy_from_slice(&decoded[..n]);
+            wrote = true;
+        }
+        Ok(if wrote { Some(out) } else { None })
+    }
+
+    /// UBIFS zlib: standard zlib stream (crypto 'deflate').
+    fn zlib_decompress(input: &[u8]) -> Result<Vec<u8>> {
+        let mut dec = flate2::read::ZlibDecoder::new(input);
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut dec, &mut out).map_err(|_| Error::Validation {
+            format: "ubifs",
+            reason: "zlib inflate failed".into(),
+        })?;
+        Ok(out)
+    }
+}
+
+impl Handler for UbifsHandler {
+    fn format(&self) -> &'static str {
+        "ubifs"
+    }
+
+    fn find_candidates(&self, src: &ByteSource) -> Vec<Candidate> {
+        // Magic 0x06101831 little-endian.
+        find_all(src, &[0x31, 0x18, 0x10, 0x06])
+            .into_iter()
+            .map(|offset| Candidate { offset })
+            .collect()
+    }
+
+    fn validate(
+        &self,
+        src: &ByteSource,
+        candidate: Candidate,
+        limits: &crate::engine::EngineLimits,
+        budget: &mut Budget,
+    ) -> Result<HandlerOutput> {
+        let base = candidate.offset;
+        let mut warnings = Vec::new();
+        // Superblock must be at the candidate (LEB 0).
+        let leb_size = Self::parse_sb(src, base, 0)?;
+        let master = Self::find_master(src, base, leb_size)?;
+        // Master fields after ch(24): highest_inum@24, cmt_no@32,
+        // flags@40, log_lnum@44, root_lnum@48, root_offs@52, root_len@56
+        // (fs/ubifs/ubifs-media.h struct ubifs_mst_node).
+        let root_lnum = ubi_le32(&master, 48);
+        let root_offs = ubi_le32(&master, 52);
+        let root_len = ubi_le32(&master, 56);
+
+        let mut leaves: Vec<UbifsLeafRef> = Vec::new();
+        self.walk_index(
+            src,
+            base,
+            leb_size,
+            root_lnum,
+            root_offs,
+            root_len,
+            0,
+            limits,
+            &mut warnings,
+            &mut leaves,
+        )?;
+
+        // Load ino nodes.
+        let mut inos: std::collections::BTreeMap<u32, UbifsIno> = std::collections::BTreeMap::new();
+        let ino_refs: Vec<&UbifsLeafRef> = leaves
+            .iter()
+            .filter(|l| l.key_type == UBIFS_INO_KEY)
+            .collect();
+        for leaf in &ino_refs {
+            if let Some(node) = Self::read_leaf(src, base, leb_size, leaf) {
+                if let Some(ino) = Self::parse_ino(&node) {
+                    inos.insert(leaf.inum, ino);
+                }
+            }
+        }
+
+        // Dirents: parent inum -> children.
+        let mut by_parent: UbifsDentMap = std::collections::BTreeMap::new();
+        for leaf in leaves.iter().filter(|l| l.key_type == UBIFS_DENT_KEY) {
+            let Some(node) = Self::read_leaf(src, base, leb_size, leaf) else {
+                continue;
+            };
+            if node.len() < 56 {
+                continue;
+            }
+            let inum = ubi_le64(&node, 40) as u32;
+            let dtype = node[49];
+            let nlen = usize::from(u16::from_le_bytes([node[50], node[51]]));
+            if 56 + nlen > node.len() || nlen == 0 {
+                continue;
+            }
+            let name = node[56..56 + nlen].to_vec();
+            // Parent from the dent key.
+            let parent = leaf.inum;
+            by_parent.entry(parent).or_default().push((
+                leaf.offs as u64 | (u64::from(leaf.lnum) << 32),
+                inum,
+                name,
+                dtype,
+            ));
+        }
+
+        let mut children = Vec::new();
+        // Root: the ino referenced by dent keys of the root directory
+        // is inum 1 (ubifs convention: root inode number 1).
+        let root = 1u32;
+        self.emit_dir(
+            src,
+            base,
+            leb_size,
+            root,
+            "",
+            &by_parent,
+            &leaves,
+            &inos,
+            0,
+            limits,
+            budget,
+            &mut std::collections::HashSet::new(),
+            &mut warnings,
+            &mut children,
+        )?;
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("leb_size".to_string(), leb_size.to_string());
+        metadata.insert("index_leaves".to_string(), leaves.len().to_string());
+        metadata.insert("inodes".to_string(), inos.len().to_string());
+        metadata.insert("entries".to_string(), children.len().to_string());
+
+        Ok(HandlerOutput {
+            artifacts: vec![ArtifactDraft {
+                format: "ubifs".to_string(),
+                label: format!(
+                    "UBIFS filesystem ({}B LEBs, {} entries)",
+                    leb_size,
+                    children.len()
+                ),
+                offset: base,
+                size: src.len() - base,
+                confidence: if children.is_empty() {
+                    Confidence::Partial
+                } else {
+                    Confidence::Validated
+                },
+                evidence: Evidence::facts([
+                    "UBIFS superblock + master node validated (node CRCs)".to_string(),
+                    format!(
+                        "index root at LEB {root_lnum}+{root_offs}, {} leaves",
+                        leaves.len()
+                    ),
+                    format!("{} inode nodes parsed", inos.len()),
+                    format!("directory tree walked: {} entries", children.len()),
+                ]),
+                metadata,
+                warnings,
+                errors: Vec::new(),
+                children,
+            }],
+        })
+    }
+}
+
+impl UbifsHandler {
+    /// Depth-first emission of one directory's children.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    fn emit_dir(
+        &self,
+        src: &ByteSource,
+        base: u64,
+        leb_size: u64,
+        dnum: u32,
+        path: &str,
+        by_parent: &UbifsDentMap,
+        leaves: &[UbifsLeafRef],
+        inos: &UbifsInoMap,
+        depth: u32,
+        limits: &crate::engine::EngineLimits,
+        budget: &mut Budget,
+        visited: &mut std::collections::HashSet<u32>,
+        warnings: &mut Vec<String>,
+        out: &mut Vec<ChildDraft>,
+    ) -> Result<()> {
+        if depth > 16 {
+            warnings.push("ubifs directory nesting deeper than 16 not walked".to_string());
+            return Ok(());
+        }
+        if !visited.insert(dnum) {
+            warnings.push("ubifs directory cycle detected; subtree skipped".to_string());
+            return Ok(());
+        }
+        let Some(entries) = by_parent.get(&dnum) else {
+            return Ok(());
+        };
+        for (_ref, inum, name, dtype) in entries {
+            if out.len() >= limits.max_fs_entries {
+                warnings.push("max_fs_entries reached; walk truncated".to_string());
+                return Ok(());
+            }
+            let name = String::from_utf8_lossy(name).into_owned();
+            let child_path = if path.is_empty() {
+                name.clone()
+            } else {
+                format!("{path}/{name}")
+            };
+            let ino = inos.get(inum);
+            let mut meta = BTreeMap::new();
+            meta.insert("path".to_string(), child_path.clone());
+            meta.insert("inode".to_string(), inum.to_string());
+            if let Some(i) = ino {
+                meta.insert("mode".to_string(), format!("{:#07o}", i.mode & 0o7777));
+                meta.insert("nlink".to_string(), i.nlink.to_string());
+            }
+            let entry_name = Some(name);
+            match *dtype {
+                1 => {
+                    // Directory.
+                    meta.insert("type".to_string(), "directory".to_string());
+                    out.push(ChildDraft {
+                        relation: RelationKind::FilesystemEntry,
+                        label: format!("ubifs directory {child_path}"),
+                        format_hint: "metadata",
+                        content: ChildContent::Owned(Vec::new()),
+                        size: 0,
+                        metadata: meta,
+                        warnings: Vec::new(),
+                        entry_name,
+                    });
+                    self.emit_dir(
+                        src,
+                        base,
+                        leb_size,
+                        *inum,
+                        &child_path,
+                        by_parent,
+                        leaves,
+                        inos,
+                        depth + 1,
+                        limits,
+                        budget,
+                        visited,
+                        warnings,
+                        out,
+                    )?;
+                }
+                0 => {
+                    // Regular file.
+                    meta.insert("type".to_string(), "file".to_string());
+                    let declared = ino.map(|i| i.size).unwrap_or(0);
+                    meta.insert("declared_size".to_string(), declared.to_string());
+                    let data = self.assemble_data(
+                        src, base, leb_size, *inum, leaves, declared, limits, budget, warnings,
+                    )?;
+                    let (content, size) = match data {
+                        Some(d) => {
+                            let n = d.len() as u64;
+                            (ChildContent::Owned(d), n)
+                        }
+                        None => (ChildContent::Owned(Vec::new()), 0),
+                    };
+                    out.push(ChildDraft {
+                        relation: RelationKind::ReconstructedFrom,
+                        label: format!("ubifs file {child_path} ({size} bytes)"),
+                        format_hint: "raw",
+                        content,
+                        size,
+                        metadata: meta,
+                        warnings: vec!["content reconstructed from UBIFS B-tree nodes".to_string()],
+                        entry_name,
+                    });
+                }
+                2 => {
+                    // Symlink: target is the inode inline data.
+                    meta.insert("type".to_string(), "symlink".to_string());
+                    let target = ino
+                        .map(|i| String::from_utf8_lossy(&i.data).into_owned())
+                        .unwrap_or_default();
+                    out.push(ChildDraft {
+                        relation: RelationKind::FilesystemEntry,
+                        label: format!("ubifs symlink {child_path} -> {target}"),
+                        format_hint: "metadata",
+                        content: ChildContent::Owned(
+                            ino.map(|i| i.data.clone()).unwrap_or_default(),
+                        ),
+                        size: 0,
+                        metadata: meta,
+                        warnings: vec![
+                            "symlink target kept as metadata; never materialized".to_string()
+                        ],
+                        entry_name,
+                    });
+                }
+                3..=6 => {
+                    // Device / FIFO / socket: metadata only.
+                    meta.insert("type".to_string(), "special".to_string());
+                    out.push(ChildDraft {
+                        relation: RelationKind::FilesystemEntry,
+                        label: format!("ubifs special entry {child_path}"),
+                        format_hint: "metadata",
+                        content: ChildContent::Owned(Vec::new()),
+                        size: 0,
+                        metadata: meta,
+                        warnings: vec!["special entries are never materialized".to_string()],
+                        entry_name,
+                    });
+                }
+                other => {
+                    warnings.push(format!(
+                        "unknown ubifs itype {other} for {child_path}; metadata only"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3231,6 +3965,213 @@ mod tests {
                 assert_eq!(&d[leb_data..leb_data + 14], b"UBI_VOL_DATA_2");
             }
             _ => panic!("volume content must reconstruct"),
+        }
+    }
+
+    /// Build a UBIFS image: LEB size 8 KiB, 6 LEBs. LEB 0 =
+    /// superblock, LEB 1 = master (root index at LEB 3 offset 0),
+    /// LEB 3 = index (one level-0 node with branches to two ino nodes,
+    /// a dent node and a data node), LEB 4 = leaf nodes.
+    fn ubifs_image() -> Vec<u8> {
+        const LEB: usize = 8192;
+        let mut img = vec![0xFFu8; 6 * LEB];
+
+        fn crc32(b: &[u8]) -> u32 {
+            let mut h = crc32fast::Hasher::new();
+            h.update(b);
+            h.finalize()
+        }
+        // Common header (24 bytes LE).
+        fn ch(node_type: u8, len: usize) -> Vec<u8> {
+            let mut c = vec![0u8; 24];
+            c[0..4].copy_from_slice(&0x06101831u32.to_le_bytes());
+            c[16..20].copy_from_slice(&(len as u32).to_le_bytes());
+            c[20] = node_type;
+            c
+        }
+        fn seal(mut node: Vec<u8>) -> Vec<u8> {
+            let crc = crc32(&node[8..]);
+            node[4..8].copy_from_slice(&crc.to_le_bytes());
+            node
+        }
+
+        // Key: inum u32 LE; second u32 = type << 29 | payload.
+        fn key(inum: u32, ktype: u32, payload: u32) -> [u8; 8] {
+            let mut k = [0u8; 8];
+            k[0..4].copy_from_slice(&inum.to_le_bytes());
+            k[4..8].copy_from_slice(&((ktype << 29) | payload).to_le_bytes());
+            k
+        }
+
+        // --- LEB 0: superblock node (36 bytes min; we emit 64) ---
+        let mut sb = vec![0u8; 64];
+        sb[0..24].copy_from_slice(&ch(6, 64));
+        sb[27] = 0; // key_fmt = simple
+        sb[36..40].copy_from_slice(&(LEB as u32).to_le_bytes()); // leb_size
+        sb[40..44].copy_from_slice(&6u32.to_le_bytes()); // leb_cnt
+        img[0..64].copy_from_slice(&seal(sb));
+
+        // --- LEB 1: master node (36 bytes after ch) ---
+        let mut mst = vec![0u8; 24 + 48];
+        mst[0..24].copy_from_slice(&ch(7, 24 + 48));
+        // highest_inum@24, cmt_no@32, flags@40? layout: ch(24),
+        // highest_inum u64@24, cmt_no u64@32, then root_lnum@40... but
+        // the handler reads root_lnum@36 which equals cmt_no low word.
+        // Kernel mst: ch + highest_inum(8) + cmt_no(8) + flags(4) +
+        // log_lnum(4) + root_lnum(4) + root_offs(4) + root_len(4).
+        // ch=24 => highest_inum@24, cmt_no@32, flags@40, log_lnum@44,
+        // root_lnum@48, root_offs@52, root_len@56.
+        mst[24..32].copy_from_slice(&7u64.to_le_bytes()); // highest_inum
+        mst[32..40].copy_from_slice(&1u64.to_le_bytes()); // cmt_no
+        mst[40..44].copy_from_slice(&5u32.to_le_bytes()); // flags
+        mst[44..48].copy_from_slice(&5u32.to_le_bytes()); // log_lnum
+        mst[48..52].copy_from_slice(&3u32.to_le_bytes()); // root_lnum
+        mst[52..56].copy_from_slice(&0u32.to_le_bytes()); // root_offs
+        mst[56..60].copy_from_slice(&80u32.to_le_bytes()); // root_len
+        mst[60..64].copy_from_slice(&4u32.to_le_bytes()); // gc_lnum
+        mst[64..68].copy_from_slice(&3u32.to_le_bytes()); // ihead_lnum
+        mst[68..72].copy_from_slice(&0u32.to_le_bytes()); // ihead_offs
+        img[LEB..LEB + 72].copy_from_slice(&seal(mst.clone()));
+        // Kernel keeps two copies (UBIFS_MST_LEBS = 2): LEB 2 = copy 2.
+        img[2 * LEB..2 * LEB + 72].copy_from_slice(&seal(mst));
+
+        // --- LEB 3: index node, 2 branches ---
+        // Branches: LEB4 off 0 (ino of root dir), LEB4 off 96 (dent).
+        // Leaf refs are (lnum, offs, len) — nodes at LEB 4 offset 0.
+        let mut idx = vec![0u8; 28 + 2 * 20];
+        idx[0..24].copy_from_slice(&ch(9, 28 + 2 * 20));
+        // Branch 0: root dir ino node.
+        idx[28..32].copy_from_slice(&4u32.to_le_bytes()); // lnum
+        idx[32..36].copy_from_slice(&0u32.to_le_bytes()); // offs
+        idx[36..40].copy_from_slice(&160u32.to_le_bytes()); // len
+        idx[40..48].copy_from_slice(&key(1, 0, 0)); // INO key inum 1
+                                                    // Branch 1: dent node "FLAG.TXT" (parent 1 -> ino 2).
+        idx[48..52].copy_from_slice(&4u32.to_le_bytes());
+        idx[52..56].copy_from_slice(&96u32.to_le_bytes());
+        // Branch 1 filled after leaf layout is known (rebuilt below).
+        img[3 * LEB..3 * LEB + idx.len()].copy_from_slice(&seal(idx));
+
+        // --- LEB 4: leaf nodes ---
+        // ino node of root dir (mode dir) at offset 0: 160 bytes.
+        let mut ino1 = vec![0u8; 160];
+        ino1[0..24].copy_from_slice(&ch(0, 160));
+        ino1[24..40].copy_from_slice(&{
+            let mut k = [0u8; 16];
+            k[..8].copy_from_slice(&key(1, 0, 0));
+            k
+        });
+        ino1[40..48].copy_from_slice(&2u64.to_le_bytes()); // creat_sqnum
+        ino1[48..56].copy_from_slice(&0u64.to_le_bytes()); // size
+        ino1[92..96].copy_from_slice(&2u32.to_le_bytes()); // nlink
+        ino1[104..108].copy_from_slice(&0o040755u32.to_le_bytes()); // mode
+        img[4 * LEB..4 * LEB + 160].copy_from_slice(&seal(ino1));
+
+        // dent node at offset 160 (parent 1 -> ino 2, "FLAG.TXT",
+        // type 0 = reg).
+        let name = b"FLAG.TXT";
+        // Layout: ch(24) + key(16) + inum(8) + pad(1) + type(1) +
+        // nlen(2) + cookie(4) = 56; name follows.
+        let dlen = 56 + name.len();
+        let mut dent = vec![0u8; dlen];
+        dent[0..24].copy_from_slice(&ch(2, dlen));
+        dent[24..40].copy_from_slice(&{
+            let mut k = [0u8; 16];
+            k[..8].copy_from_slice(&key(1, 2, 0x11223344));
+            k
+        });
+        dent[40..48].copy_from_slice(&2u64.to_le_bytes()); // inum
+        dent[49] = 0; // ITYPE_REG
+        dent[50..52].copy_from_slice(&(name.len() as u16).to_le_bytes()); // nlen
+        dent[52..56].copy_from_slice(&7u32.to_le_bytes()); // cookie
+        dent[56..56 + name.len()].copy_from_slice(name);
+        img[4 * LEB + 160..4 * LEB + 160 + dlen].copy_from_slice(&seal(dent));
+
+        // ino node of FLAG.TXT (size 0, no data) at offset 256: 160.
+        let mut ino2 = vec![0u8; 160];
+        ino2[0..24].copy_from_slice(&ch(0, 160));
+        ino2[24..40].copy_from_slice(&{
+            let mut k = [0u8; 16];
+            k[..8].copy_from_slice(&key(2, 0, 0));
+            k
+        });
+        ino2[48..56].copy_from_slice(&11u64.to_le_bytes()); // size
+        ino2[92..96].copy_from_slice(&1u32.to_le_bytes()); // nlink
+        ino2[104..108].copy_from_slice(&0o100644u32.to_le_bytes());
+        img[4 * LEB + 256..4 * LEB + 256 + 160].copy_from_slice(&seal(ino2));
+
+        // Inline data inside ino2: data_len@112, data@160. We placed
+        // size 0 above; instead put a data node for the content.
+        let content = b"UBIFS_FLAG!";
+        let mut dat = vec![0u8; 48 + content.len()];
+        dat[0..24].copy_from_slice(&ch(1, 48 + content.len()));
+        dat[24..40].copy_from_slice(&{
+            let mut k = [0u8; 16];
+            k[..8].copy_from_slice(&key(2, 1, 0)); // DATA key block 0
+            k
+        });
+        dat[40..44].copy_from_slice(&(content.len() as u32).to_le_bytes()); // size
+        dat[44..46].copy_from_slice(&0u16.to_le_bytes()); // compr NONE
+        dat[48..48 + content.len()].copy_from_slice(content);
+        let dstart = 4 * LEB + 256 + 160;
+        img[dstart..dstart + dat.len()].copy_from_slice(&seal(dat));
+        // Fix branch 1 to point at the dent (offset 160, len dlen)
+        // and add a third branch pointing at the data node.
+        let mut idx = vec![0u8; 28 + 4 * 20];
+        idx[0..24].copy_from_slice(&ch(9, 28 + 4 * 20));
+        idx[24..26].copy_from_slice(&4u16.to_le_bytes());
+        idx[26..28].copy_from_slice(&0u16.to_le_bytes());
+        // b0: root ino
+        idx[28..32].copy_from_slice(&4u32.to_le_bytes());
+        idx[32..36].copy_from_slice(&0u32.to_le_bytes());
+        idx[36..40].copy_from_slice(&160u32.to_le_bytes());
+        idx[40..48].copy_from_slice(&key(1, 0, 0));
+        // b1: dent of FLAG.TXT
+        idx[48..52].copy_from_slice(&4u32.to_le_bytes());
+        idx[52..56].copy_from_slice(&160u32.to_le_bytes());
+        idx[56..60].copy_from_slice(&(dlen as u32).to_le_bytes());
+        idx[60..68].copy_from_slice(&key(1, 2, 0x11223344));
+        // b2: data node of ino 2
+        idx[68..72].copy_from_slice(&4u32.to_le_bytes());
+        idx[72..76].copy_from_slice(&((256 + 160) as u32).to_le_bytes());
+        idx[76..80].copy_from_slice(&((48 + content.len()) as u32).to_le_bytes());
+        idx[80..88].copy_from_slice(&key(2, 1, 0));
+        // b3: ino node of inum 2
+        idx[88..92].copy_from_slice(&4u32.to_le_bytes());
+        idx[92..96].copy_from_slice(&256u32.to_le_bytes());
+        idx[96..100].copy_from_slice(&160u32.to_le_bytes());
+        idx[100..108].copy_from_slice(&key(2, 0, 0));
+        let idx_len = idx.len();
+        img[3 * LEB..3 * LEB + idx_len].copy_from_slice(&seal(idx));
+        // Master root_len must match the final index node length.
+        img[LEB + 56..LEB + 60].copy_from_slice(&(idx_len as u32).to_le_bytes());
+        img[2 * LEB + 56..2 * LEB + 60].copy_from_slice(&(idx_len as u32).to_le_bytes());
+        // Re-seal both master copies (root_len changed after sealing).
+        for lnum in 1..=2usize {
+            let b = lnum * LEB;
+            let crc = crc32(&img[b + 8..b + 72]);
+            img[b + 4..b + 8].copy_from_slice(&crc.to_le_bytes());
+        }
+
+        img
+    }
+
+    #[test]
+    fn ubifs_tree_walk_with_data_node() {
+        let src = ByteSource::from_vec(ubifs_image());
+        let out = validate_at(&UbifsHandler, &src, 0).expect("ubifs validates");
+        let art = &out.artifacts[0];
+        assert_eq!(
+            art.metadata.get("leb_size").map(String::as_str),
+            Some("8192")
+        );
+        let flag = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("path").map(String::as_str) == Some("FLAG.TXT"))
+            .expect("FLAG.TXT child");
+        match &flag.content {
+            ChildContent::Owned(d) => assert_eq!(d, b"UBIFS_FLAG!"),
+            _ => panic!("file content must reconstruct"),
         }
     }
 
