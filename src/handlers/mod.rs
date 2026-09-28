@@ -8,6 +8,7 @@ pub mod cramfs;
 pub mod disk;
 pub mod exec;
 pub mod exfat;
+pub mod ext;
 pub mod fat;
 pub mod filesystems;
 pub mod firmware;

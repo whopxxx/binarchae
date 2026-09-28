@@ -235,6 +235,7 @@ pub fn builtin_handlers() -> Vec<Box<dyn Handler>> {
         Box::new(handlers::exfat::ExfatHandler),
         Box::new(handlers::filesystems::SquashfsHandler),
         Box::new(handlers::filesystems::Iso9660Handler),
+        Box::new(handlers::ext::ExtHandler),
         Box::new(handlers::filesystems::ExtHandler),
         Box::new(handlers::filesystems::NtfsHandler),
         Box::new(handlers::filesystems::UbiHandler),
