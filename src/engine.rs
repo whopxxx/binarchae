@@ -242,6 +242,7 @@ pub fn builtin_handlers() -> Vec<Box<dyn Handler>> {
         Box::new(handlers::filesystems::NtfsHandler),
         Box::new(handlers::filesystems::UbiVolumeHandler),
         Box::new(handlers::filesystems::UbifsHandler),
+        Box::new(handlers::filesystems::Yaffs2Handler),
         Box::new(handlers::romfs::RomfsHandler),
         Box::new(handlers::cramfs::CramfsHandler),
         Box::new(handlers::firmware::DtbHandler),
