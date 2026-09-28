@@ -824,6 +824,218 @@ fn b4_encrypted_zip_without_candidates_reports_bounded_attempts() {
     );
 }
 
+// ---------- FINAL-B6: DNS-over-TCP, channel decode, PCAPNG per-interface ----------
+
+/// Build a DNS response message with a TXT answer carrying `payload`.
+fn dns_txt_response(payload: &[u8]) -> Vec<u8> {
+    let mut d = Vec::new();
+    d.extend(0x1234u16.to_be_bytes()); // id
+    d.extend(0x8180u16.to_be_bytes()); // flags: response
+    d.extend(1u16.to_be_bytes()); // qd
+    d.extend(1u16.to_be_bytes()); // an
+    d.extend(0u16.to_be_bytes());
+    d.extend(0u16.to_be_bytes());
+    // Query: "x.example.com" A IN.
+    for label in ["x", "example", "com"] {
+        d.push(label.len() as u8);
+        d.extend_from_slice(label.as_bytes());
+    }
+    d.push(0);
+    d.extend(1u16.to_be_bytes()); // type A
+    d.extend(1u16.to_be_bytes()); // class IN
+                                  // Answer: pointer to the query name, TXT.
+    d.extend(0xC00Cu16.to_be_bytes());
+    d.extend(16u16.to_be_bytes()); // TXT
+    d.extend(1u16.to_be_bytes()); // class IN
+    d.extend(60u32.to_be_bytes()); // ttl
+    d.extend(((payload.len() + 1) as u16).to_be_bytes()); // rdlength
+    d.push(payload.len() as u8); // TXT char-string len
+    d.extend_from_slice(payload);
+    d
+}
+
+/// B6 + B8: DNS-over-TCP channel. A port-53 TCP flow carries one
+/// length-framed DNS message whose TXT rdata is base64; the decoded
+/// payload must appear as a nested child artifact.
+#[test]
+fn b6_dns_over_tcp_base64_channel_nested() {
+    // Frame helper (Ethernet + IPv4 + TCP, configurable ports/seq).
+    let frame = |sport: u16, dport: u16, seq: u32, payload: &[u8]| -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend([0x02u8; 6]);
+        f.extend([0x01u8; 6]);
+        f.extend(0x0800u16.to_be_bytes());
+        let total_len = (20 + 20 + payload.len()) as u16;
+        f.extend(0x45u8.to_be_bytes());
+        f.extend(0u8.to_be_bytes());
+        f.extend(total_len.to_be_bytes());
+        f.extend(1u16.to_be_bytes());
+        f.extend(0x4000u16.to_be_bytes());
+        f.extend(64u8.to_be_bytes());
+        f.extend(6u8.to_be_bytes());
+        f.extend(0u16.to_be_bytes());
+        f.extend([10u8, 0, 0, 1]);
+        f.extend([10u8, 0, 0, 2]);
+        f.extend(sport.to_be_bytes());
+        f.extend(dport.to_be_bytes());
+        f.extend(seq.to_be_bytes());
+        f.extend(1u32.to_be_bytes());
+        f.extend(0x5018u16.to_be_bytes()); // PSH|ACK
+        f.extend(0xFFFFu16.to_be_bytes());
+        f.extend(0u16.to_be_bytes());
+        f.extend(0u16.to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    };
+
+    // Secret: base64("FLAG{dnstcp}") = RkxBR3tkbnN0Y3B9.
+    let b64 = "RkxBR3tkbnN0Y3B9";
+    let dns_msg = dns_txt_response(b64.as_bytes());
+
+    // DNS-over-TCP framing: u16 BE length + message.
+    let mut stream = Vec::new();
+    stream.extend((dns_msg.len() as u16).to_be_bytes());
+    stream.extend_from_slice(&dns_msg);
+
+    // Split the framed stream across two TCP segments (sequence-aware).
+    let mid = 10;
+    let (p1, p2) = stream.split_at(mid);
+    let pkt1 = frame(55555, 53, 1, p1);
+    let pkt2 = frame(55555, 53, 1 + mid as u32, p2);
+
+    let mut p = Vec::new();
+    p.extend_from_slice(&[0xD4, 0xC3, 0xB2, 0xA1]);
+    p.extend(2u16.to_le_bytes());
+    p.extend(4u16.to_le_bytes());
+    p.extend(0u32.to_le_bytes());
+    p.extend(0u32.to_le_bytes());
+    p.extend(262144u32.to_le_bytes());
+    p.extend(1u32.to_le_bytes());
+    for pkt in [&pkt1, &pkt2] {
+        p.extend(1u32.to_le_bytes());
+        p.extend(0u32.to_le_bytes());
+        p.extend((pkt.len() as u32).to_le_bytes());
+        p.extend((pkt.len() as u32).to_le_bytes());
+        p.extend_from_slice(pkt);
+    }
+    let graph = engine().analyze(&ByteSource::from_vec(p), true);
+    let decoded = graph
+        .artifacts
+        .iter()
+        .find(|a| a.label.contains("Decoded base64 payload from DNS-over-TCP"))
+        .expect("decoded DNS-over-TCP channel payload");
+    assert_eq!(
+        decoded.metadata.get("codec").map(String::as_str),
+        Some("base64")
+    );
+    assert_eq!(
+        decoded.metadata.get("transport").map(String::as_str),
+        Some("tcp")
+    );
+    // The raw TXT rdata child and its decoded payload are siblings
+    // under the same capture parent; both must exist with provenance.
+    let parent = graph
+        .artifacts
+        .iter()
+        .find(|a| a.label.contains("DNS-over-TCP rdata"))
+        .expect("raw TXT rdata child");
+    assert_eq!(parent.parent, decoded.parent, "same capture parent");
+    assert_eq!(
+        decoded.metadata.get("query").map(String::as_str),
+        Some("x.example.com"),
+        "decoded payload keeps DNS provenance"
+    );
+}
+
+/// B6: PCAPNG with TWO IDBs (Ethernet + usbmon) — each EPB must use
+/// ITS interface's linktype: the Ethernet EPB reconstructs TCP, the
+/// usbmon IDB is recorded but not applied to foreign EPBs.
+#[test]
+fn b6_pcapng_per_interface_linktype() {
+    // Ethernet frame carrying an HTTP request (port 80).
+    let mut eth = Vec::new();
+    eth.extend([0x02u8; 6]);
+    eth.extend([0x01u8; 6]);
+    eth.extend(0x0800u16.to_be_bytes());
+    let payload: &[u8] = b"GET /f.txt HTTP/1.1\x0d\x0a\x0d\x0a";
+    let total_len = (20 + 20 + payload.len()) as u16;
+    eth.extend(0x45u8.to_be_bytes());
+    eth.extend(0u8.to_be_bytes()); // tos
+    eth.extend(total_len.to_be_bytes());
+    eth.extend(1u16.to_be_bytes()); // id
+    eth.extend(0x4000u16.to_be_bytes()); // don't fragment
+    eth.extend(64u8.to_be_bytes());
+    eth.extend(6u8.to_be_bytes());
+    eth.extend(0u16.to_be_bytes());
+    eth.extend([10u8, 0, 0, 1]);
+    eth.extend([10u8, 0, 0, 2]);
+    eth.extend(55555u16.to_be_bytes());
+    eth.extend(80u16.to_be_bytes());
+    eth.extend(1u32.to_be_bytes());
+    eth.extend(1u32.to_be_bytes());
+    eth.extend(0x5018u16.to_be_bytes());
+    eth.extend(0xFFFFu16.to_be_bytes());
+    eth.extend(0u16.to_be_bytes());
+    eth.extend(0u16.to_be_bytes());
+    eth.extend_from_slice(payload);
+
+    // SHB.
+    let mut p = Vec::new();
+    p.extend(0x0A0D0D0Au32.to_le_bytes());
+    p.extend(28u32.to_le_bytes()); // block length
+    p.extend(0x1A2B3C4Du32.to_le_bytes());
+    p.extend(1u32.to_le_bytes()); // version
+    p.extend(0xFFFFu32.to_le_bytes()); // section length -1
+    p.extend(0x1A2B3C4Du32.to_le_bytes());
+    p.extend(28u32.to_le_bytes());
+
+    // IDB 0: Ethernet (linktype 1).
+    p.extend(1u32.to_le_bytes());
+    p.extend(20u32.to_le_bytes());
+    p.extend(1u16.to_le_bytes()); // linktype
+    p.extend(0u16.to_le_bytes()); // reserved
+    p.extend(0u32.to_le_bytes()); // snaplen
+    p.extend(20u32.to_le_bytes());
+
+    // IDB 1: usbmon (linktype 220).
+    p.extend(1u32.to_le_bytes());
+    p.extend(20u32.to_le_bytes());
+    p.extend(220u16.to_le_bytes());
+    p.extend(0u16.to_le_bytes());
+    p.extend(0u32.to_le_bytes());
+    p.extend(20u32.to_le_bytes());
+
+    // EPB on interface 0 (Ethernet): HTTP request frame.
+    let pad0 = (4 - eth.len() % 4) % 4;
+    let epb0_len = 32 + eth.len() + pad0;
+    p.extend(6u32.to_le_bytes());
+    p.extend((epb0_len as u32).to_le_bytes());
+    p.extend(0u32.to_le_bytes()); // interface 0
+    p.extend(0u32.to_le_bytes()); // ts high
+    p.extend(0u32.to_le_bytes()); // ts low
+    p.extend((eth.len() as u32).to_le_bytes());
+    p.extend((eth.len() as u32).to_le_bytes());
+    p.extend_from_slice(&eth);
+    p.extend(vec![0u8; pad0]);
+    p.extend((epb0_len as u32).to_le_bytes());
+
+    let graph = engine().analyze(&ByteSource::from_vec(p), true);
+    if std::env::var("B6DBG").is_ok() {
+        for a in &graph.artifacts {
+            println!("ART: {} | {} | {:?}", a.format, a.label, a.metadata);
+        }
+    }
+    let http = graph
+        .artifacts
+        .iter()
+        .find(|a| a.label.contains("HTTP") && a.metadata.contains_key("direction"))
+        .map(|a| a.id);
+    assert!(
+        http.is_some(),
+        "TCP/HTTP must be reconstructed from the EPB on the Ethernet interface"
+    );
+}
+
 // ---------- graph helpers ----------
 
 fn has_ancestor(graph: &ctf_tools::artifact::ArtifactGraph, id: u64, ancestor: u64) -> bool {

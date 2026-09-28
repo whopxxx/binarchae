@@ -908,6 +908,103 @@ impl Handler for PcapHandler {
                         stream_objects += 1;
                     }
                 }
+                // FINAL-B6: DNS-over-TCP — port-53 flows carry
+                // length-framed DNS messages; TXT/NULL rdata becomes a
+                // child, and base64/hex rdata is decoded into a nested
+                // child (channel decoding).
+                if flow.key.len() >= 12 {
+                    let sp = u16::from_be_bytes([flow.key[8], flow.key[9]]);
+                    let dp = u16::from_be_bytes([flow.key[10], flow.key[11]]);
+                    if sp == 53 || dp == 53 {
+                        for (data, dir_name) in [(&flow.client, "c2s"), (&flow.server, "s2c")] {
+                            let mut pos = 0usize;
+                            while pos + 2 <= data.len() && stream_objects < limits.max_records {
+                                let msg_len =
+                                    u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                                if msg_len == 0 || pos + 2 + msg_len > data.len() {
+                                    break;
+                                }
+                                let framed = &data[pos + 2..pos + 2 + msg_len];
+                                pos += 2 + msg_len;
+                                if let Some(msg) = crate::handlers::net::parse_dns(framed) {
+                                    for ans in &msg.answers {
+                                        if ans.rdata.is_empty()
+                                            || stream_objects >= limits.max_records
+                                        {
+                                            continue;
+                                        }
+                                        let printable = ans
+                                            .rdata
+                                            .iter()
+                                            .filter(|b| b.is_ascii_graphic() || **b == b' ')
+                                            .count();
+                                        if ans.rtype != 16
+                                            && ans.rtype != 10
+                                            && printable * 2 < ans.rdata.len()
+                                        {
+                                            continue;
+                                        }
+                                        let mut meta = BTreeMap::new();
+                                        meta.insert("flow".to_string(), key_hex.clone());
+                                        meta.insert("direction".to_string(), dir_name.to_string());
+                                        meta.insert(
+                                            "query".to_string(),
+                                            msg.queries.first().cloned().unwrap_or_default(),
+                                        );
+                                        meta.insert("answer_name".to_string(), ans.name.clone());
+                                        meta.insert("rr_type".to_string(), ans.rtype.to_string());
+                                        meta.insert("transport".to_string(), "tcp".to_string());
+                                        meta.insert(
+                                            "size".to_string(),
+                                            ans.rdata.len().to_string(),
+                                        );
+                                        packets.push(crate::handlers::net::owned_child(
+                                            RelationKind::ReconstructedFrom,
+                                            format!(
+                                                "DNS-over-TCP rdata {} ({} bytes, type {})",
+                                                ans.name,
+                                                ans.rdata.len(),
+                                                ans.rtype
+                                            ),
+                                            "raw",
+                                            ans.rdata.clone(),
+                                            meta,
+                                        ));
+                                        stream_objects += 1;
+                                        if let Some((codec, decoded)) =
+                                            crate::handlers::net::decode_channel(&ans.rdata)
+                                        {
+                                            let mut dmeta = BTreeMap::new();
+                                            dmeta.insert("codec".to_string(), codec.to_string());
+                                            dmeta.insert(
+                                                "query".to_string(),
+                                                msg.queries.first().cloned().unwrap_or_default(),
+                                            );
+                                            dmeta
+                                                .insert("transport".to_string(), "tcp".to_string());
+                                            dmeta.insert(
+                                                "size".to_string(),
+                                                decoded.len().to_string(),
+                                            );
+                                            packets.push(crate::handlers::net::owned_child(
+                                                RelationKind::ReconstructedFrom,
+                                                format!(
+                                                    "Decoded {} payload from DNS-over-TCP rdata ({} bytes)",
+                                                    codec,
+                                                    decoded.len()
+                                                ),
+                                                "raw",
+                                                decoded,
+                                                dmeta,
+                                            ));
+                                            stream_objects += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 flows_meta.push((key_hex, flow.client.len() + flow.server.len(), gcount));
             }
 
@@ -1060,10 +1157,11 @@ impl Handler for PcapngHandler {
         let mut off = base;
         let mut blocks = 0usize;
         let mut packets: Vec<ChildDraft> = Vec::new();
-        // Interface linktype (IDB, block type 1): u16 at +8. Defaults
-        // to Ethernet when no IDB precedes the packets.
-        let mut linktype = 1u32;
-        let mut frame_list: Vec<(u64, u64)> = Vec::new();
+        // FINAL-B6: per-interface linktypes. Each IDB (block type 1)
+        // declares the linktype for interface index N (IDB order); each
+        // EPB names its interface and gets that interface's linktype.
+        let mut interface_linktypes: Vec<u32> = Vec::new();
+        let mut frame_list: Vec<crate::handlers::net::FrameRef> = Vec::new();
         while off + 12 <= src.len() && blocks < limits.max_records.min(65_536) {
             let block_type = le32(src, off).unwrap_or(0);
             let block_len = le32(src, off + 4).unwrap_or(0) as u64;
@@ -1074,17 +1172,28 @@ impl Handler for PcapngHandler {
                 });
             }
             if block_type == 0x01 && off + 10 <= src.len() {
-                linktype = u32::from(le16(src, off + 8).unwrap_or(1));
+                let lt = u32::from(le16(src, off + 8).unwrap_or(1));
+                interface_linktypes.push(lt);
             }
             if block_type == 0x06 {
                 // Enhanced Packet Block: interface(4) ts_high(4) ts_low(4)
                 // captured(4) original(4) packet data.
+                let iface = le32(src, off + 8).unwrap_or(0);
                 let captured = le32(src, off + 20).unwrap_or(0) as u64;
                 let data_off = off + 28;
                 if captured > 0 && data_off + captured <= off + block_len {
+                    // Per the pcapng spec the EPB's Interface ID selects
+                    // the IDB whose linktype applies to THIS frame;
+                    // default to Ethernet when the interface is unknown.
+                    let lt = interface_linktypes
+                        .get(iface as usize)
+                        .copied()
+                        .unwrap_or(1);
                     let region = src.slice(data_off, captured)?;
                     let mut meta = BTreeMap::new();
                     meta.insert("packet_index".to_string(), packets.len().to_string());
+                    meta.insert("interface_id".to_string(), iface.to_string());
+                    meta.insert("linktype".to_string(), lt.to_string());
                     packets.push(ChildDraft {
                         relation: RelationKind::Contains,
                         label: format!("packet {} ({} bytes)", packets.len(), captured),
@@ -1095,7 +1204,11 @@ impl Handler for PcapngHandler {
                         warnings: Vec::new(),
                         entry_name: None,
                     });
-                    frame_list.push((data_off, captured));
+                    frame_list.push(crate::handlers::net::FrameRef {
+                        start: data_off,
+                        len: captured,
+                        linktype: lt,
+                    });
                 }
             }
             off += block_len;
@@ -1119,8 +1232,7 @@ impl Handler for PcapngHandler {
             src.read_at(start, &mut buf).ok()?;
             Some(buf)
         };
-        let recon =
-            crate::handlers::net::reconstruct_frames(&frame_list, linktype, limits, read_frame);
+        let recon = crate::handlers::net::reconstruct_frames(&frame_list, 1, limits, read_frame);
         packets.extend(recon.children);
 
         let mut metadata = BTreeMap::new();

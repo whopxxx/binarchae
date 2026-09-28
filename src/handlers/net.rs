@@ -44,12 +44,18 @@ struct DirState {
 }
 
 impl DirState {
-    fn push(&mut self, seq: u32, payload: &[u8], max_bytes: u64) {
+    /// FINAL-B6: `remaining` is the REASSEMBLER-WIDE budget left for
+    /// this segment (global cap minus bytes buffered everywhere), so
+    /// the cap is truly global: per-direction caps let one flow hold
+    /// 2x the limit and N flows hold Nx. New bytes only count when
+    /// they extend a segment (retransmissions are deduplicated).
+    fn push(&mut self, seq: u32, payload: &[u8], remaining: u64) {
         if payload.is_empty() {
             return;
         }
-        let total: u64 = self.segs.values().map(|v| v.len() as u64).sum();
-        if total + payload.len() as u64 > max_bytes {
+        let existing_len = self.segs.get(&seq).map(Vec::len).unwrap_or(0) as u64;
+        let new_bytes = (payload.len() as u64).saturating_sub(existing_len);
+        if new_bytes == 0 || new_bytes > remaining {
             return;
         }
         let s = self.segs.entry(seq).or_default();
@@ -208,24 +214,49 @@ impl TcpReassembler {
         }
     }
 
+    /// Reassembler-wide buffered bytes (deduplicated across flows and
+    /// directions). This is the quantity the byte cap applies to.
+    fn buffered_bytes(&self) -> u64 {
+        self.flows
+            .values()
+            .map(|(c, s)| {
+                let c: u64 = c.segs.values().map(|v| v.len() as u64).sum();
+                let s: u64 = s.segs.values().map(|v| v.len() as u64).sum();
+                c + s
+            })
+            .sum()
+    }
+
     pub fn feed(&mut self, key: &[u8], seq: u32, payload: &[u8]) {
-        if payload.is_empty() || self.total_bytes >= self.max_bytes {
+        if payload.is_empty() || self.buffered_bytes() >= self.max_bytes {
             return;
         }
-        if !self.flows.contains_key(key) && self.flows.len() >= self.max_flows {
-            return;
-        }
-        // Direction: last byte of the key (1 or 2).
-        let dir = *key.last().unwrap_or(&1);
-        let fk = key[..key.len() - 1].to_vec();
-        let entry = self.flows.entry(fk).or_default();
+        // FINAL-B6: the lookup key is the FLOW key (key without the
+        // direction byte) — using the full key here rejected every
+        // segment after the first of an existing flow once the flow
+        // count reached the cap, and in general keyed lookups at the
+        // wrong granularity.
+        let dir = match key.split_last() {
+            Some((&d, fk)) => {
+                if !self.flows.contains_key(fk) && self.flows.len() >= self.max_flows {
+                    return;
+                }
+                d
+            }
+            None => return,
+        };
+        // Buffered bytes BEFORE this segment; the push itself adds the
+        // deduplicated delta, so the global cap is checked against the
+        // pre-feed total plus the delta inside push (no re-entrant
+        // borrow needed).
+        let spent_before = self.buffered_bytes();
+        let entry = self.flows.entry(key[..key.len() - 1].to_vec()).or_default();
         let (c, s) = &mut *entry;
         if dir == 1 {
-            c.push(seq, payload, self.max_bytes);
+            c.push(seq, payload, self.max_bytes.saturating_sub(spent_before));
         } else {
-            s.push(seq, payload, self.max_bytes);
+            s.push(seq, payload, self.max_bytes.saturating_sub(spent_before));
         }
-        self.total_bytes += payload.len() as u64;
     }
 
     /// Reconstructed flows in discovery order with gap stats.
@@ -683,6 +714,77 @@ impl HidDecoder {
 
 /// Convenience: build a ChildDraft for reconstructed content.
 #[allow(clippy::too_many_arguments)]
+/// FINAL-B6: channel decoding — CTF exfil hides payloads in DNS
+/// rdata as base64 or hex. A printable rdata that decodes cleanly as
+/// one of the two yields nested artifact bytes.
+pub fn decode_channel(rdata: &[u8]) -> Option<(&'static str, Vec<u8>)> {
+    if rdata.is_empty() || rdata.len() > 64 * 1024 {
+        return None;
+    }
+    const PRINTABLE_WS: &[u8] = b" 	
+";
+    if !rdata
+        .iter()
+        .all(|b| b.is_ascii_graphic() || PRINTABLE_WS.contains(b))
+    {
+        return None;
+    }
+    let text = String::from_utf8_lossy(rdata);
+    let trimmed = text.trim();
+    // Hex: even length, all hex digits, length >= 8.
+    let hex_ok = trimmed.len() >= 8
+        && trimmed.len() % 2 == 0
+        && trimmed.as_bytes().iter().all(|b| b.is_ascii_hexdigit());
+    if hex_ok {
+        let bytes: Vec<u8> = trimmed
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
+            .collect();
+        return Some(("hex", bytes));
+    }
+    // Base64 (standard alphabet, optional padding, length >= 8).
+    const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let compact: Vec<u8> = trimmed
+        .as_bytes()
+        .iter()
+        .copied()
+        .filter(|b| {
+            !b" 	
+"
+            .contains(b)
+        })
+        .collect();
+    if compact.len() >= 8
+        && compact.len() % 4 == 0
+        && compact.iter().all(|b| B64.contains(b) || *b == b'=')
+    {
+        let mut out = Vec::with_capacity(compact.len() / 4 * 3);
+        for chunk in compact.chunks_exact(4) {
+            let mut vals = [0u32; 4];
+            let mut pad = 0usize;
+            for (i, c) in chunk.iter().enumerate() {
+                if *c == b'=' {
+                    pad += 1;
+                    vals[i] = 0;
+                } else {
+                    vals[i] = B64.iter().position(|v| v == c).unwrap_or(0) as u32;
+                }
+            }
+            let n = (vals[0] << 18) | (vals[1] << 12) | (vals[2] << 6) | vals[3];
+            out.push((n >> 16) as u8);
+            if pad < 2 {
+                out.push((n >> 8) as u8);
+            }
+            if pad < 1 {
+                out.push(n as u8);
+            }
+        }
+        return Some(("base64", out));
+    }
+    None
+}
+
 pub fn owned_child(
     relation: RelationKind,
     label: String,
@@ -715,9 +817,18 @@ pub struct Reconstructed {
 /// keystrokes. `frames` yields (frame_start, frame_len) in capture
 /// order; `read` pulls one frame's bytes. Shared by the PCAP and
 /// PCAPNG handlers (#7 §7.1 parity).
+/// One capture frame with the LINKTYPE of the interface it arrived on
+/// (FINAL-B6: PCAPNG EPBs name their interface; each interface has its
+/// own IDB linktype. Classic PCAP uses one linktype for all frames).
+pub struct FrameRef {
+    pub start: u64,
+    pub len: u64,
+    pub linktype: u32,
+}
+
 pub fn reconstruct_frames(
-    frames: &[(u64, u64)],
-    linktype: u32,
+    frames: &[FrameRef],
+    _linktype: u32,
     limits: &crate::engine::EngineLimits,
     read_frame: impl Fn(u64, u64) -> Option<Vec<u8>>,
 ) -> Reconstructed {
@@ -725,12 +836,17 @@ pub fn reconstruct_frames(
     let mut dns_payloads: Vec<Vec<u8>> = Vec::new();
     let mut hid = HidDecoder::new(4096);
     let mut usb_reports = 0usize;
-    for &(frame_start, frame_len) in frames {
-        let frame = match read_frame(frame_start, frame_len) {
+    for FrameRef {
+        start: frame_start,
+        len: frame_len,
+        linktype,
+    } in frames
+    {
+        let frame = match read_frame(*frame_start, *frame_len) {
             Some(f) => f,
             None => continue,
         };
-        if linktype == 220 {
+        if *linktype == 220 {
             // USB (usbmon mmapped): 64-byte header + data.
             if frame.len() >= 64 && frame[19] == b'<' {
                 let len_cap = u32::from_le_bytes([frame[36], frame[37], frame[38], frame[39]])
@@ -755,7 +871,8 @@ pub fn reconstruct_frames(
 
     let mut children = Vec::new();
     let mut flow_summary = Vec::new();
-    for flow in reasm.flows() {
+    let flow_buffers = reasm.flows();
+    for flow in &flow_buffers {
         let key_hex: String = flow.key.iter().map(|b| format!("{b:02x}")).collect();
         let gcount = flow.client_gaps + flow.server_gaps;
         for (dir_name, data) in [("c2s", &flow.client), ("s2c", &flow.server)] {
@@ -837,6 +954,118 @@ pub fn reconstruct_frames(
                     ans.rdata.clone(),
                     meta,
                 ));
+                if let Some((codec, decoded)) = decode_channel(&ans.rdata) {
+                    let mut dmeta = BTreeMap::new();
+                    dmeta.insert("codec".to_string(), codec.to_string());
+                    dmeta.insert("source".to_string(), "dns-udp".to_string());
+                    dmeta.insert(
+                        "query".to_string(),
+                        msg.queries.first().cloned().unwrap_or_default(),
+                    );
+                    dmeta.insert("size".to_string(), decoded.len().to_string());
+                    children.push(owned_child(
+                        RelationKind::ReconstructedFrom,
+                        format!(
+                            "Decoded {} payload from DNS rdata ({} bytes)",
+                            codec,
+                            decoded.len()
+                        ),
+                        "raw",
+                        decoded,
+                        dmeta,
+                    ));
+                }
+            }
+        }
+    }
+
+    // FINAL-B6: DNS over TCP — port 53 flows carry length-prefixed
+    // DNS messages (u16 BE length + message). The reassembled stream
+    // is walked as a sequence of framed messages in each direction.
+    for flow in &flow_buffers {
+        let key_hex: String = flow.key.iter().map(|b| format!("{b:02x}")).collect();
+        // TCP DNS ports: src/dst ports are the 3rd/5th bytes of the
+        // flow key (addr(4) port(2) addr(4) port(2)).
+        if flow.key.len() < 12 {
+            continue;
+        }
+        // Flow key layout (dir byte stripped): addr_a(4) addr_b(4)
+        // port_a(2) port_b(2) — ports at [8..10] and [10..12].
+        let sp = u16::from_be_bytes([flow.key[8], flow.key[9]]);
+        let dp = u16::from_be_bytes([flow.key[10], flow.key[11]]);
+        if sp != 53 && dp != 53 {
+            continue;
+        }
+        for (data, dir_name) in [(&flow.client, "c2s"), (&flow.server, "s2c")] {
+            let mut pos = 0usize;
+            while pos + 2 <= data.len() && dns_messages < limits.max_records {
+                let msg_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                if msg_len == 0 || pos + 2 + msg_len > data.len() {
+                    break;
+                }
+                let framed = &data[pos + 2..pos + 2 + msg_len];
+                pos += 2 + msg_len;
+                if let Some(msg) = parse_dns(framed) {
+                    dns_messages += 1;
+                    for ans in &msg.answers {
+                        if ans.rdata.is_empty() || children.len() >= limits.max_records {
+                            continue;
+                        }
+                        let printable = ans
+                            .rdata
+                            .iter()
+                            .filter(|b| b.is_ascii_graphic() || **b == b'\n')
+                            .count();
+                        if ans.rtype != 16 && ans.rtype != 10 && printable * 2 < ans.rdata.len() {
+                            continue;
+                        }
+                        let mut meta = BTreeMap::new();
+                        meta.insert("dns_id".to_string(), msg.id.to_string());
+                        meta.insert(
+                            "query".to_string(),
+                            msg.queries.first().cloned().unwrap_or_default(),
+                        );
+                        meta.insert("answer_name".to_string(), ans.name.clone());
+                        meta.insert("rr_type".to_string(), ans.rtype.to_string());
+                        meta.insert("transport".to_string(), "tcp".to_string());
+                        meta.insert("direction".to_string(), dir_name.to_string());
+                        meta.insert("flow".to_string(), key_hex.clone());
+                        meta.insert("size".to_string(), ans.rdata.len().to_string());
+                        children.push(owned_child(
+                            RelationKind::ReconstructedFrom,
+                            format!(
+                                "DNS-over-TCP rdata {} ({} bytes, type {})",
+                                ans.name,
+                                ans.rdata.len(),
+                                ans.rtype
+                            ),
+                            "raw",
+                            ans.rdata.clone(),
+                            meta,
+                        ));
+                        if let Some((codec, decoded)) = decode_channel(&ans.rdata) {
+                            let mut dmeta = BTreeMap::new();
+                            dmeta.insert("codec".to_string(), codec.to_string());
+                            dmeta.insert("source".to_string(), "dns-tcp".to_string());
+                            dmeta.insert(
+                                "query".to_string(),
+                                msg.queries.first().cloned().unwrap_or_default(),
+                            );
+                            dmeta.insert("size".to_string(), decoded.len().to_string());
+                            children.push(owned_child(
+                                RelationKind::ReconstructedFrom,
+                                format!(
+                                    "Decoded {} payload from DNS-over-TCP rdata ({} bytes)",
+                                    codec,
+                                    decoded.len()
+                                ),
+                                "raw",
+                                decoded,
+                                dmeta,
+                            ));
+                        }
+                    }
+                }
             }
         }
     }
@@ -891,5 +1120,85 @@ fn parse_dns_from_frame(frame: &[u8], out: &mut Vec<Vec<u8>>) {
     let dns = &frame[udp + 8..];
     if dns.len() >= 12 && dns.len() <= 512 {
         out.push(dns.to_vec());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FINAL-B6: max_streams must not reject later segments of an
+    /// ALREADY-TRACKED flow (the old lookup used the full key with the
+    /// direction byte while flows are stored without it).
+    #[test]
+    fn reassembler_existing_flow_survives_stream_cap() {
+        let mut reasm = TcpReassembler::new(1, 1 << 20);
+        // Flow key: 12 bytes + dir byte.
+        let mut k1 = vec![0u8; 13];
+        k1[12] = 1;
+        reasm.feed(&k1, 0, b"first");
+        // Same flow, opposite direction: full key differs in the dir
+        // byte; the flow is already tracked so this must be accepted
+        // even at max_flows = 1.
+        let mut k2 = k1.clone();
+        k2[12] = 2;
+        reasm.feed(&k2, 0, b"response-from-server");
+        let flows = reasm.flows();
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].client, b"first");
+        assert_eq!(flows[0].server, b"response-from-server");
+    }
+
+    /// FINAL-B6: the reconstructed-bytes cap is GLOBAL — N flows and
+    /// both directions together cannot exceed max_bytes.
+    #[test]
+    fn reassembler_byte_cap_is_global() {
+        let mut reasm = TcpReassembler::new(64, 1000);
+        // 10 flows x 2 directions x 300 bytes would be 6000 without a
+        // global cap; with the global cap the buffered total stays
+        // <= 1000.
+        for i in 0..10u32 {
+            for dir in 1..=2u8 {
+                let mut k = vec![0u8; 13];
+                k[0..4].copy_from_slice(&i.to_le_bytes());
+                k[12] = dir;
+                reasm.feed(&k, 0, &[b'A'; 300]);
+            }
+        }
+        let flows = reasm.flows();
+        let total: usize = flows.iter().map(|f| f.client.len() + f.server.len()).sum();
+        assert!(total <= 1000, "global byte cap must hold: {total} > 1000");
+    }
+
+    /// FINAL-B6: retransmissions must not double-count against the cap.
+    #[test]
+    fn reassembler_retransmission_dedup_against_cap() {
+        let mut reasm = TcpReassembler::new(4, 100);
+        let mut k = vec![0u8; 13];
+        k[12] = 1;
+        reasm.feed(&k, 0, &[b'X'; 80]);
+        // Retransmit the same seq with a shorter payload: no new bytes.
+        reasm.feed(&k, 0, &[b'X'; 40]);
+        // Different seq, within cap.
+        reasm.feed(&k, 80, &[b'Y'; 20]);
+        let flows = reasm.flows();
+        assert_eq!(flows[0].client.len(), 100);
+    }
+
+    /// FINAL-B6: decode_channel accepts canonical hex and base64 and
+    /// rejects arbitrary printable text.
+    #[test]
+    fn decode_channel_hex_and_base64() {
+        let hex = decode_channel(b"4142434445464748");
+        assert!(matches!(hex, Some(("hex", _))));
+        if let Some(("hex", bytes)) = hex {
+            assert_eq!(bytes, b"ABCDEFGH");
+        }
+        let b64 = decode_channel(b"Q1RGe2I2NH0=");
+        assert!(matches!(b64, Some(("base64", _))));
+        if let Some(("base64", bytes)) = b64 {
+            assert_eq!(&bytes, b"CTF{b64}");
+        }
+        assert!(decode_channel(b"just a normal sentence!").is_none());
     }
 }
