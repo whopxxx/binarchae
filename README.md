@@ -80,31 +80,27 @@ stubs for the major formats:
 - **Recovery**: truncated-ZIP local-entry salvage — partial data beats
   none, and recovery never masks honest validation of intact archives.
 
-Handler children are either **owned bytes** (decompression output) or
-**source-backed regions** (zero-copy views into the parent input) — the
-latter is what makes firmware images, disk images, and packet captures
-cheap to analyze.
-See [docs/capabilities.md](docs/capabilities.md) for the full matrix,
-[docs/architecture.md](docs/architecture.md) for the engine design, and
-[docs/security.md](docs/security.md) for the extraction safety model.
+Handler children are either **owned bytes** (decompression output,
+bounded by expansion limits) or **source-backed regions** (zero-copy
+views into the parent input). Source-backed artifacts stream to disk in
+bounded chunks at extraction time — large partitions/files are never
+materialized in memory.
 
-Handler children are either **owned bytes** (decompression output) or
-**source-backed regions** (zero-copy views into the parent input) — the
-latter is what makes firmware/initramfs containers cheap to analyze.
-See [docs/capabilities.md](docs/capabilities.md) for the full matrix,
-[docs/architecture.md](docs/architecture.md) for the engine design, and
-[docs/security.md](docs/security.md) for the extraction safety model.
+Dependency provenance, licenses, and the native/unsafe footprint are
+documented in [docs/dependencies.md](docs/dependencies.md); release
+history in [CHANGELOG.md](CHANGELOG.md).
 
 ## Development
 
 ```bash
 cargo test --workspace          # unit + integration scenarios
-cargo bench                     # criterion scan benchmarks
-cargo install cargo-fuzz && cargo fuzz run engine_scan_memory   # fuzzing (nightly)
+cargo bench                     # criterion scan + expanded benchmarks
+cargo install cargo-fuzz && cargo fuzz run handler_roundtrip     # fuzzing (nightly)
 ```
 
-`fuzz/` targets the whole engine, per-handler validation, and the
-carving-rule parser; `benches/` tracks scan throughput regressions.
+`fuzz/` includes per-format-family targets (archives, filesystems,
+registry/sqlite, network, memory forensics, firmware, documents) and a
+bounded fuzz-smoke job in CI; long campaigns remain manual.
 
 ## Resource limits
 

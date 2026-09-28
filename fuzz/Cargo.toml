@@ -40,3 +40,64 @@ bench = false
 
 [profile.release]
 debug = 1
+
+[[bin]]
+name = "archive_family"
+path = "fuzz_targets/archive_family.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "filesystem_family"
+path = "fuzz_targets/filesystem_family.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "registry_sqlite"
+path = "fuzz_targets/registry_sqlite.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "network_family"
+path = "fuzz_targets/network_family.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "memory_forensics_family"
+path = "fuzz_targets/memory_forensics_family.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "firmware_family"
+path = "fuzz_targets/firmware_family.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
+name = "document_family"
+path = "fuzz_targets/document_family.rs"
+test = false
+doc = false
+bench = false
+
+
+
+
+
+

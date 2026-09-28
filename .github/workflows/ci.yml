@@ -41,3 +41,39 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build (musl static)
         run: cargo build --workspace --target x86_64-unknown-linux-musl
+
+  # #7 §14: short bounded fuzz-smoke (500 mutations per target, ~1-2 min
+  # total). Long campaigns remain manual/nightly.
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz smoke (all targets, bounded)
+        run: |
+          for t in engine_scan_memory handler_roundtrip carving_rules \
+                   archive_family filesystem_family registry_sqlite \
+                   network_family memory_forensics_family firmware_family \
+                   document_family; do
+            cargo fuzz run "$t" -- -max_total_time=15 -rss_limit_mb=2560 || exit 1
+          done
+
+  # #7 §16.2: package + install smoke.
+  package-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo package validation
+        run: cargo package --allow-dirty
+      - name: cargo install smoke
+        run: cargo install --path . --locked
+      - name: Installed binary analyzes a fixture
+        run: |
+          printf 'CTF{install-smoke}' > /tmp/fixture.bin
+          ~/.cargo/bin/ctf-tools /tmp/fixture.bin -r
