@@ -1,19 +1,19 @@
 [package]
-name = "ctf-tools"
+name = "binarchae"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "CTF-first binary analysis and extraction tool: artifact graph over nested/trailing/carved data"
+description = "Recursive binary archaeology: analysis, extraction, recovery, and provenance over arbitrary binary data"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/whopxxx/ctf-tools"
+repository = "https://github.com/whopxxx/binarchae"
 readme = "README.md"
 
 [lib]
-name = "ctf_tools"
+name = "binarchae"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ctf-tools"
+name = "binarchae"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,9 +1,9 @@
 //! M2 unit/integration tests: CPIO newc/crc, source-backed children,
 //! and shared fixtures for the uImage -> gzip -> CPIO -> PNG chain.
 
-use ctf_tools::artifact::{Confidence, RelationKind};
-use ctf_tools::bytesource::ByteSource;
-use ctf_tools::engine::{Budget, EngineLimits, Handler, RecursiveEngine};
+use binarchae::artifact::{Confidence, RelationKind};
+use binarchae::bytesource::ByteSource;
+use binarchae::engine::{Budget, EngineLimits, Handler, RecursiveEngine};
 
 pub fn hexf(v: u64) -> String {
     format!("{v:08X}")
@@ -53,15 +53,15 @@ pub fn data_sum(data: &[u8]) -> u64 {
     data.iter().fold(0u64, |acc: u64, &b| acc + u64::from(b))
 }
 
-pub fn validate_first(src: &ByteSource) -> ctf_tools::engine::HandlerOutput {
+pub fn validate_first(src: &ByteSource) -> binarchae::engine::HandlerOutput {
     validate_first_with_limits(src, |_| {})
 }
 
 pub fn validate_first_with_limits(
     src: &ByteSource,
     tune: impl FnOnce(&mut EngineLimits),
-) -> ctf_tools::engine::HandlerOutput {
-    let h = ctf_tools::handlers::cpio::CpioHandler;
+) -> binarchae::engine::HandlerOutput {
+    let h = binarchae::handlers::cpio::CpioHandler;
     let cands = h.find_candidates(src);
     assert!(!cands.is_empty(), "cpio candidate must exist");
     let mut limits = EngineLimits::default();
@@ -95,7 +95,7 @@ fn cpio_newc_nested_path() {
         .expect("flag.png entry");
     assert_eq!(file_child.size, png.len() as u64);
     match &file_child.content {
-        ctf_tools::engine::ChildContent::Source(region) => {
+        binarchae::engine::ChildContent::Source(region) => {
             assert_eq!(region.read_all().unwrap(), png);
         }
         _ => panic!("regular file must be source-backed"),
@@ -178,7 +178,7 @@ fn cpio_trailer_exact_boundary() {
 /// (12) CPIO traversal pathname is rejected by the safe-path layer.
 #[test]
 fn cpio_traversal_contained() {
-    use ctf_tools::extract::safe_join;
+    use binarchae::extract::safe_join;
     let root = std::path::Path::new("/tmp/x");
     assert!(safe_join(root, "../../escape").is_err());
     assert!(safe_join(root, "nested/../../../up").is_err());
@@ -320,7 +320,7 @@ fn cpio_wrong_padding_is_rejected() {
     }
     arch.extend_from_slice(b"TRAILER!!!\0\0");
     let src = ByteSource::from_vec(arch);
-    let h = ctf_tools::handlers::cpio::CpioHandler;
+    let h = binarchae::handlers::cpio::CpioHandler;
     let cands = h.find_candidates(&src);
     let any_ok = cands.iter().any(|c| {
         h.validate(&src, *c, &EngineLimits::default(), &mut Budget::default())
@@ -422,7 +422,7 @@ fn cpio_entry_limit_not_bypassed_by_oversized_entries() {
         .chain(trailer("070701"))
         .collect();
     let src = ByteSource::from_vec(arch);
-    let h = ctf_tools::handlers::cpio::CpioHandler;
+    let h = binarchae::handlers::cpio::CpioHandler;
     let cands = h.find_candidates(&src);
     assert!(!cands.is_empty());
     let limits = EngineLimits {
@@ -433,7 +433,7 @@ fn cpio_entry_limit_not_bypassed_by_oversized_entries() {
     let mut budget = Budget::default();
     let res = h.validate(&src, cands[0], &limits, &mut budget);
     let reason = match &res {
-        Err(ctf_tools::Error::Validation { reason, .. }) => Some(reason.clone()),
+        Err(binarchae::Error::Validation { reason, .. }) => Some(reason.clone()),
         Ok(out) => {
             // A validated archive must not carry more than 2 children.
             assert!(
@@ -514,7 +514,7 @@ fn cpio_name_without_nul_rejected() {
     arch.extend_from_slice(b"d"); // 1 data byte, no padding needed
     arch.extend_from_slice(&trailer("070701"));
     let src = ByteSource::from_vec(arch);
-    let h = ctf_tools::handlers::cpio::CpioHandler;
+    let h = binarchae::handlers::cpio::CpioHandler;
     let cands = h.find_candidates(&src);
     // The candidate AT the malformed entry (offset 0) must reject. (A
     // candidate at the trailer offset can still legitimately parse a
@@ -532,7 +532,7 @@ fn cpio_name_without_nul_rejected() {
     );
     let err = res.expect_err("missing NUL in name must reject the entry");
     match err {
-        ctf_tools::Error::Validation { reason, .. } => {
+        binarchae::Error::Validation { reason, .. } => {
             assert!(
                 reason.contains("NUL"),
                 "rejection must cite the NUL check: {reason}"
@@ -548,7 +548,7 @@ fn cpio_name_without_nul_rejected() {
 fn validate_raw_name_field(
     name_field: &[u8],
     data: &[u8],
-) -> Result<ctf_tools::engine::HandlerOutput, ctf_tools::Error> {
+) -> Result<binarchae::engine::HandlerOutput, binarchae::Error> {
     let mut arch: Vec<u8> = Vec::new();
     arch.extend_from_slice(b"070701");
     for v in [
@@ -577,7 +577,7 @@ fn validate_raw_name_field(
     arch.resize(arch.len() + dpad as usize, 0);
     arch.extend_from_slice(&trailer("070701"));
     let src = ByteSource::from_vec(arch);
-    let h = ctf_tools::handlers::cpio::CpioHandler;
+    let h = binarchae::handlers::cpio::CpioHandler;
     let cands = h.find_candidates(&src);
     let first = cands
         .iter()
@@ -598,7 +598,7 @@ fn cpio_name_garbage_after_nul_rejected() {
     let res = validate_raw_name_field(b"a\0X", b"d");
     let err = res.expect_err("a\\0X must reject");
     match err {
-        ctf_tools::Error::Validation { reason, .. } => {
+        binarchae::Error::Validation { reason, .. } => {
             assert!(
                 reason.contains("non-NUL byte after name terminator"),
                 "rejection must cite the post-NUL check: {reason}"

@@ -21,12 +21,12 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     // Rule parsing must never panic on arbitrary text.
-    if let Ok(rules) = ctf_tools::carving::parse_user_rules(rule_text) {
-        let src = ctf_tools::bytesource::ByteSource::from_vec(body.to_vec());
-        let limits = ctf_tools::engine::EngineLimits::default();
-        let mut budget = ctf_tools::engine::Budget::default();
+    if let Ok(rules) = binarchae::carving::parse_user_rules(rule_text) {
+        let src = binarchae::bytesource::ByteSource::from_vec(body.to_vec());
+        let limits = binarchae::engine::EngineLimits::default();
+        let mut budget = binarchae::engine::Budget::default();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = ctf_tools::carving::carve_with_rules(&src, &limits, &mut budget, &rules);
+            let _ = binarchae::carving::carve_with_rules(&src, &limits, &mut budget, &rules);
         }));
     }
 });

@@ -2,7 +2,7 @@
 
 ## Overview
 
-ctf-tools is built around one invariant: **every useful thing discovered from
+binarchae is built around one invariant: **every useful thing discovered from
 input data is an Artifact, and every parser/extractor exists to discover
 additional artifacts.**
 
@@ -172,7 +172,7 @@ handlers check it before accepting expansion.
 
 ## Extraction layout
 
-`ctf-tools -e input` writes deterministically:
+`binarchae -e input` writes deterministically:
 
 ```text
 <input>.extracted/

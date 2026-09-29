@@ -20,18 +20,18 @@ fuzz_target!(|data: &[u8]| {
         body[0x2000..0x2008].copy_from_slice(b"PAGEDU64");
         body[0x2088..0x208C].copy_from_slice(&2u32.to_le_bytes());
     }
-    let src = ctf_tools::bytesource::ByteSource::from_vec(body);
-    let limits = ctf_tools::engine::EngineLimits {
+    let src = binarchae::bytesource::ByteSource::from_vec(body);
+    let limits = binarchae::engine::EngineLimits {
         max_child_size: 64 * 1024,
         max_total_expanded_bytes: 1 << 20,
         max_records: 256,
         ..Default::default()
     };
-    let mut budget = ctf_tools::engine::Budget::default();
+    let mut budget = binarchae::engine::Budget::default();
     const FORMATS: &[&str] = &["minidump", "pagedu64"];
-    for handler in ctf_tools::engine::builtin_handlers() {
+    for handler in binarchae::engine::builtin_handlers() {
         if FORMATS.contains(&handler.format()) {
-            let c = ctf_tools::engine::Candidate { offset: 0 };
+            let c = binarchae::engine::Candidate { offset: 0 };
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = handler.validate(&src, c, &limits, &mut budget);
             }));

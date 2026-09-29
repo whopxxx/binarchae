@@ -2,7 +2,7 @@
 
 ## Threat model / malicious-input assumptions
 
-ctf-tools is built to parse **untrusted, possibly hostile binary data**:
+binarchae is built to parse **untrusted, possibly hostile binary data**:
 
 - Input bytes are attacker-controlled: malformed structures, depth bombs,
   ratio bombs, and hostile embedded paths are expected, not exceptional.
