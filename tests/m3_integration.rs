@@ -1702,6 +1702,213 @@ fn s2_filename_password_source_e2e() {
     assert!(has_ancestor(&graph, gz, zip_art.id));
 }
 
+/// FINAL-S4: the FULL firmware chain in one image:
+/// uImage -> gzip -> JFFS2 filesystem -> FLAG.PNG file -> nested PNG.
+/// Every hop must be a distinct artifact with intact parent provenance.
+#[test]
+fn s4_firmware_gzip_jffs2_file_png_full_chain() {
+    fn crc32b(b: &[u8]) -> u32 {
+        let mut h = crc32fast::Hasher::new();
+        h.update(b);
+        h.finalize()
+    }
+    let png = make_png_valid();
+    let mut jffs = Vec::new();
+    // Dirent: pino 1, ino 2, FLAG.PNG.
+    let name = b"FLAG.PNG";
+    let totlen = 40 + name.len();
+    let mut h = [0u8; 40];
+    h[0..2].copy_from_slice(&0x1985u16.to_be_bytes());
+    h[2..4].copy_from_slice(&0xe001u16.to_be_bytes());
+    h[4..8].copy_from_slice(&(totlen as u32).to_be_bytes());
+    let hc = crc32b(&h[..8]);
+    h[8..12].copy_from_slice(&hc.to_be_bytes());
+    h[12..16].copy_from_slice(&1u32.to_be_bytes());
+    h[16..20].copy_from_slice(&1u32.to_be_bytes());
+    h[20..24].copy_from_slice(&2u32.to_be_bytes());
+    h[28] = name.len() as u8;
+    h[29] = 8; // DT_REG
+    let nc = crc32b(&h[..32]);
+    h[32..36].copy_from_slice(&nc.to_be_bytes());
+    h[36..40].copy_from_slice(&crc32b(name).to_be_bytes());
+    jffs.extend_from_slice(&h);
+    jffs.extend_from_slice(name);
+    while jffs.len() % 4 != 0 {
+        jffs.push(0);
+    }
+    // Inode: ino 2, plain data = PNG bytes.
+    let totlen = 68 + png.len();
+    let mut h2 = [0u8; 68];
+    h2[0..2].copy_from_slice(&0x1985u16.to_be_bytes());
+    h2[2..4].copy_from_slice(&0xe002u16.to_be_bytes());
+    h2[4..8].copy_from_slice(&(totlen as u32).to_be_bytes());
+    let hc2 = crc32b(&h2[..8]);
+    h2[8..12].copy_from_slice(&hc2.to_be_bytes());
+    h2[12..16].copy_from_slice(&2u32.to_be_bytes());
+    h2[16..20].copy_from_slice(&1u32.to_be_bytes());
+    h2[20..24].copy_from_slice(&0o100644u32.to_be_bytes());
+    h2[28..32].copy_from_slice(&(png.len() as u32).to_be_bytes());
+    h2[44..48].copy_from_slice(&0u32.to_be_bytes());
+    h2[48..52].copy_from_slice(&(png.len() as u32).to_be_bytes());
+    h2[52..56].copy_from_slice(&(png.len() as u32).to_be_bytes());
+    h2[56] = 0; // compr: none
+    h2[60..64].copy_from_slice(&crc32b(&png).to_be_bytes());
+    let nc2 = crc32b(&h2[..60]);
+    h2[64..68].copy_from_slice(&nc2.to_be_bytes());
+    jffs.extend_from_slice(&h2);
+    jffs.extend_from_slice(&png);
+    while jffs.len() % 4 != 0 {
+        jffs.push(0);
+    }
+
+    // Wrap: uImage payload = gzip(JFFS2).
+    let gz = make_gzip(&jffs);
+    let mut hdr = [0u8; 64];
+    hdr[0..4].copy_from_slice(&0x27051956u32.to_be_bytes());
+    hdr[8..12].copy_from_slice(&1_700_000_000u32.to_be_bytes());
+    hdr[12..16].copy_from_slice(&(gz.len() as u32).to_be_bytes());
+    hdr[16..20].copy_from_slice(&0x8000_0000u32.to_be_bytes());
+    hdr[20..24].copy_from_slice(&0x8000_8000u32.to_be_bytes());
+    hdr[24..28].copy_from_slice(&crc32b(&gz).to_be_bytes());
+    hdr[28] = 5;
+    hdr[29] = 2;
+    hdr[30] = 2; // kernel
+    hdr[31] = 0; // comp: none (the gzip is a payload the engine finds)
+    let mut zh = hdr;
+    zh[4..8].fill(0);
+    hdr[4..8].copy_from_slice(&crc32b(&zh).to_be_bytes());
+    let mut img = hdr.to_vec();
+    img.extend_from_slice(&gz);
+
+    let graph = engine().analyze(&ByteSource::from_vec(img), true);
+    let uid = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "uimage")
+        .map(|a| a.id)
+        .expect("uimage validated");
+    let gz_id = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "gzip" && has_ancestor(&graph, a.id, uid))
+        .map(|a| a.id)
+        .expect("gzip under uImage");
+    let jffs_id = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "jffs2" && has_ancestor(&graph, a.id, gz_id))
+        .map(|a| a.id)
+        .expect("JFFS2 under gzip");
+    let file_child = graph
+        .children(jffs_id)
+        .iter()
+        .find(|(_, c)| c.label.contains("FLAG.PNG"))
+        .map(|(_, c)| c.id)
+        .expect("file under JFFS2");
+    let png_id = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "png" && has_ancestor(&graph, a.id, file_child))
+        .map(|a| a.id)
+        .expect("nested PNG under the recovered file");
+    assert!(
+        has_ancestor(&graph, png_id, uid),
+        "full chain uImage -> gzip -> jffs2 -> file -> PNG"
+    );
+}
+
+/// FINAL-S4: DNS decoded channel content must RECURSE into a nested
+/// format — the aggregate decodes to gzip bytes, and the gzip artifact
+/// must appear under the decoded child.
+#[test]
+fn s4_dns_aggregate_decoded_recurses_to_format() {
+    // Base64 of a gzip stream, split across two TXT answers.
+    let inner = make_gzip(b"FLAG{dns-nested}");
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut b64 = String::new();
+    for chunk in inner.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        b64.push(T[(n >> 18) as usize & 63] as char);
+        b64.push(T[(n >> 12) as usize & 63] as char);
+        b64.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        b64.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    let (p1, p2) = b64.split_at(b64.len() / 2);
+    let m1 = dns_txt_response(p1.as_bytes());
+    let m2 = dns_txt_response(p2.as_bytes());
+
+    let frame = |payload: &[u8]| -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend([0x02u8; 6]);
+        f.extend([0x01u8; 6]);
+        f.extend(0x0800u16.to_be_bytes());
+        let total_len = (20 + 8 + payload.len()) as u16;
+        f.extend(0x45u8.to_be_bytes());
+        f.extend(0u8.to_be_bytes());
+        f.extend(total_len.to_be_bytes());
+        f.extend(1u16.to_be_bytes());
+        f.extend(0u16.to_be_bytes());
+        f.extend(64u8.to_be_bytes());
+        f.extend(17u8.to_be_bytes());
+        f.extend(0u16.to_be_bytes());
+        f.extend([10u8, 0, 0, 1]);
+        f.extend([10u8, 0, 0, 2]);
+        f.extend(40000u16.to_be_bytes());
+        f.extend(53u16.to_be_bytes());
+        f.extend(((8 + payload.len()) as u16).to_be_bytes());
+        f.extend(0u16.to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    };
+    let pkt1 = frame(&m1);
+    let pkt2 = frame(&m2);
+    let mut p = Vec::new();
+    p.extend_from_slice(&[0xD4, 0xC3, 0xB2, 0xA1]);
+    p.extend(2u16.to_le_bytes());
+    p.extend(4u16.to_le_bytes());
+    p.extend(0u32.to_le_bytes());
+    p.extend(0u32.to_le_bytes());
+    p.extend(262144u32.to_le_bytes());
+    p.extend(1u32.to_le_bytes());
+    for pkt in [&pkt1, &pkt2] {
+        p.extend(1u32.to_le_bytes());
+        p.extend(0u32.to_le_bytes());
+        p.extend((pkt.len() as u32).to_le_bytes());
+        p.extend((pkt.len() as u32).to_le_bytes());
+        p.extend_from_slice(pkt);
+    }
+    let graph = engine().analyze(&ByteSource::from_vec(p), true);
+    let decoded = graph
+        .artifacts
+        .iter()
+        .find(|a| {
+            a.label
+                .contains("Decoded base64 payload from DNS channel aggregate")
+        })
+        .map(|a| a.id)
+        .expect("aggregate decoded");
+    let gz = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "gzip" && has_ancestor(&graph, a.id, decoded))
+        .map(|a| a.id)
+        .expect("decoded channel bytes recursed into gzip format");
+    assert!(has_ancestor(&graph, gz, decoded));
+}
+
 // ---------- graph helpers ----------
 
 fn has_ancestor(graph: &ctf_tools::artifact::ArtifactGraph, id: u64, ancestor: u64) -> bool {
