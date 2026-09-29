@@ -2,9 +2,9 @@
 //! fixture classes — single image, nested containers, archive with many
 //! entries, and high-entropy blob (worst case for signature scanning).
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use binarchae::bytesource::ByteSource;
 use binarchae::engine::{EngineLimits, RecursiveEngine};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::io::Write;
