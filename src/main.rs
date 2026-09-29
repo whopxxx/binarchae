@@ -1,6 +1,5 @@
 //! binarchae CLI: analyze / extract / recurse over binary artifacts.
 
-use clap::Parser;
 use binarchae::artifact::{ExtractionStatus, RelationKind};
 use binarchae::bytesource::ByteSource;
 use binarchae::entropy;
@@ -8,6 +7,7 @@ use binarchae::extract::{dedup_path, safe_join};
 use binarchae::output;
 use binarchae::report::Report;
 use binarchae::{EngineLimits, RecursiveEngine};
+use clap::Parser;
 use std::io::Write;
 use std::path::PathBuf;
 
