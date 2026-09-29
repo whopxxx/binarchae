@@ -1,4 +1,4 @@
-# binarchae
+# binwalkx
 
 Recursive binary archaeology for extraction, recovery, and artifact analysis in Rust.
 
@@ -17,35 +17,35 @@ of CTF binary challenges.
 Requires a current stable Rust toolchain.
 
 ```bash
-git clone https://github.com/whopxxx/binarchae
-cd binarchae
+git clone https://github.com/whopxxx/binwalkx
+cd binwalkx
 cargo build --release
-# binary at target/release/binarchae
+# binary at target/release/binwalkx
 ```
 
 ## CLI examples
 
 ```bash
 # Analyze and print a compact artifact tree
-binarchae file.bin
+binwalkx file.bin
 
 # Materialize recoverable/extractable artifacts under file.bin.extracted/
-binarchae -e file.bin
+binwalkx -e file.bin
 
 # Recursively analyze child artifacts
-binarchae -r file.bin
+binwalkx -r file.bin
 
 # Recursive analysis + extraction
-binarchae -er file.bin
+binwalkx -er file.bin
 
 # Stable JSON output (graph with IDs, provenance, offsets, hashes, evidence)
-binarchae --json file.bin
+binwalkx --json file.bin
 
 # Verbose diagnostics (warnings + evidence facts)
-binarchae -v file.bin
+binwalkx -v file.bin
 
 # Custom carving rules
-binarchae --carving-rules rules.toml file.bin
+binwalkx --carving-rules rules.toml file.bin
 ```
 
 Example output on a PNG with an appended ZIP:
