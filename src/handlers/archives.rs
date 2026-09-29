@@ -506,7 +506,10 @@ impl Handler for SevenZHandler {
                 reason: format!("unsupported version {}.{}", version.0, version.1),
             });
         }
-        let stored_crc = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
+        // FINAL-T2: the 7z spec stores StartHeaderCRC little-endian;
+        // reading it big-endian rejected every genuine 7z file and let
+        // only the generic carve rule fire.
+        let stored_crc = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
         let mut zh = [0u8; 20];
         zh.copy_from_slice(&hdr[12..32]);
         let mut h = crc32fast::Hasher::new();
@@ -573,85 +576,133 @@ impl Handler for SevenZHandler {
                         opened = Some((reader, used));
                         break;
                     }
-                    Err(e) => last_err = Some(e),
+                    Err(e) => {
+                        // FINAL-T2: a header-encrypted archive reports
+                        // PasswordRequired for the empty password — a
+                        // distinct, honest encryption signal. Surface it
+                        // so the engine's filename-candidate retry can
+                        // fire (the draft will carry no working password).
+                        if matches!(e, sevenz_rust2::Error::PasswordRequired) {
+                            encrypted = true;
+                        }
+                        last_err = Some(e);
+                    }
                 }
             }
-            match opened {
-                Some((mut reader, pw)) => {
-                    if let Some(p) = pw {
-                        working_password = Some(p);
-                    }
-                    // Encrypted-entries detection: coders whose method id
-                    // is AES-256-SHA256 (0x06F10701) per the 7z spec.
-                    encrypted = reader.archive().blocks.iter().any(|b| {
-                        b.coders
-                            .iter()
-                            .any(|c| c.encoder_method_id() == [0x06, 0xF1, 0x07, 0x01])
-                    });
-                    let max_children = limits.max_archive_entries;
-                    let max_size = limits.max_child_size as usize;
-                    if let Err(e) = reader.for_each_entries(|entry, stream| {
-                        if entry_names.len() < 1024 {
-                            entry_names.push(entry.name().to_string());
-                        }
-                        if children.len() >= max_children {
-                            return Ok(false);
-                        }
-                        if !entry.has_stream() {
-                            return Ok(true); // directories: skip
-                        }
-                        if entry.size() as usize > max_size {
-                            warnings.push(format!(
-                                "entry {} exceeds max_child_size; skipped",
-                                entry.name()
-                            ));
-                            // FINAL-B1: drain with a FIXED buffer (read
-                            // into a scratch chunk, discard) so an
-                            // attacker-declared huge entry can never
-                            // grow an allocation.
-                            let mut scratch = [0u8; 64 * 1024];
-                            while let Ok(n) = stream.read(&mut scratch) {
-                                if n == 0 {
-                                    break;
-                                }
-                            }
-                            return Ok(true);
-                        }
-                        let mut out = Vec::new();
-                        if stream.read_to_end(&mut out).is_ok() {
-                            if !budget.charge(limits, entry.size()) {
-                                return Err(sevenz_rust2::Error::Other(
-                                    "run-wide expanded-byte budget exhausted".into(),
-                                ));
-                            }
-                            children.push(ChildDraft {
-                                    relation: RelationKind::Contains,
-                                    label: format!(
-                                        "7z file {} ({} bytes)",
-                                        entry.name(),
-                                        entry.size()
-                                    ),
-                                    format_hint: "raw",
-                                    content: ChildContent::Owned(out),
-                                    size: entry.size(),
-                                    metadata: BTreeMap::new(),
-                                    warnings: Vec::new(),
-                                    entry_name: Some(entry.name().to_string()),
-                                    confidence: Confidence::Validated,
-                                    evidence: vec![
-                                        "structurally decoded by parent handler".to_string()
-                                    ],
-                                });
-                        }
-                        Ok(true)
-                    }) {
-                        warnings.push(format!("entry walk: {e}"));
-                    }
+            // FINAL-T2: with a plaintext header the empty password
+            // always OPENS (decryption happens per-entry), so an
+            // encrypted archive first parses with garbage output. When
+            // AES coders are present and we hold more candidates,
+            // re-open with each until entries actually decode.
+            let opened_somewhere = opened.is_some();
+            let mut open_attempts: Vec<Option<String>> = opened
+                .as_ref()
+                .map(|(_, pw)| vec![pw.clone()])
+                .unwrap_or_default();
+            if opened.is_some() {
+                let has_aes = opened
+                    .as_ref()
+                    .map(|(r, _)| {
+                        r.archive().blocks.iter().any(|b| {
+                            b.coders
+                                .iter()
+                                .any(|c| c.encoder_method_id() == [0x06, 0xF1, 0x07, 0x01])
+                        })
+                    })
+                    .unwrap_or(false);
+                if has_aes && opened.as_ref().is_some_and(|(_, pw)| pw.is_none()) {
+                    open_attempts = limits.passwords.iter().cloned().map(Some).collect();
                 }
-                None => {
-                    if let Some(e) = last_err {
-                        warnings.push(format!("archive open: {e}"));
+            }
+            let mut reused = opened.map(|(r, _)| r);
+            'open_walk: for attempt_pw in open_attempts {
+                let cursor = std::io::Cursor::new(&data[..]);
+                let mut reader = match &attempt_pw {
+                    Some(pw) => match sevenz_rust2::ArchiveReader::new(
+                        cursor,
+                        sevenz_rust2::Password::new(pw),
+                    ) {
+                        Ok(r) => r,
+                        Err(_) => continue 'open_walk,
+                    },
+                    None => match reused.take() {
+                        Some(r) => r,
+                        None => continue 'open_walk,
+                    },
+                };
+                working_password = attempt_pw.clone();
+                // Encrypted-entries detection: coders whose method id
+                // is AES-256-SHA256 (0x06F10701) per the 7z spec.
+                encrypted = reader.archive().blocks.iter().any(|b| {
+                    b.coders
+                        .iter()
+                        .any(|c| c.encoder_method_id() == [0x06, 0xF1, 0x07, 0x01])
+                });
+                let max_children = limits.max_archive_entries;
+                let max_size = limits.max_child_size as usize;
+                let before = children.len();
+                if let Err(e) = reader.for_each_entries(|entry, stream| {
+                    if entry_names.len() < 1024 {
+                        entry_names.push(entry.name().to_string());
                     }
+                    if children.len() >= max_children {
+                        return Ok(false);
+                    }
+                    if !entry.has_stream() {
+                        return Ok(true); // directories: skip
+                    }
+                    if entry.size() as usize > max_size {
+                        warnings.push(format!(
+                            "entry {} exceeds max_child_size; skipped",
+                            entry.name()
+                        ));
+                        // FINAL-B1: drain with a FIXED buffer (read
+                        // into a scratch chunk, discard) so an
+                        // attacker-declared huge entry can never
+                        // grow an allocation.
+                        let mut scratch = [0u8; 64 * 1024];
+                        while let Ok(n) = stream.read(&mut scratch) {
+                            if n == 0 {
+                                break;
+                            }
+                        }
+                        return Ok(true);
+                    }
+                    let mut out = Vec::new();
+                    if stream.read_to_end(&mut out).is_ok() {
+                        if !budget.charge(limits, entry.size()) {
+                            return Err(sevenz_rust2::Error::Other(
+                                "run-wide expanded-byte budget exhausted".into(),
+                            ));
+                        }
+                        children.push(ChildDraft {
+                            relation: RelationKind::Contains,
+                            label: format!("7z file {} ({} bytes)", entry.name(), entry.size()),
+                            format_hint: "raw",
+                            content: ChildContent::Owned(out),
+                            size: entry.size(),
+                            metadata: BTreeMap::new(),
+                            warnings: Vec::new(),
+                            entry_name: Some(entry.name().to_string()),
+                            confidence: Confidence::Validated,
+                            evidence: vec!["structurally decoded by parent handler".to_string()],
+                        });
+                    }
+                    Ok(true)
+                }) {
+                    warnings.push(format!("entry walk: {e}"));
+                }
+                // A wrong content password yields garbage that fails
+                // to decompress: the walk surfaces no children. Try the
+                // next candidate before giving up.
+                if children.len() > before {
+                    break 'open_walk;
+                }
+                working_password = None;
+            }
+            if !opened_somewhere {
+                if let Some(e) = last_err {
+                    warnings.push(format!("archive open: {e}"));
                 }
             }
         } else {

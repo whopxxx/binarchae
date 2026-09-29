@@ -634,10 +634,15 @@ impl RecursiveEngine {
                 for handler in &self.handlers {
                     for candidate in handler.find_candidates(src) {
                         // Only re-run candidates that produced a failed
-                        // encrypted draft at this offset.
+                        // encrypted draft at this offset. FINAL-T2a: the
+                        // encrypted marker differs per handler (ZIP:
+                        // `encrypted=true`; 7z/RAR:
+                        // `encrypted_entries=yes`) — recognize both.
                         let retry_worthy = drafts.iter().any(|d| {
                             d.offset == candidate.offset
-                                && d.metadata.get("encrypted").map(String::as_str) == Some("true")
+                                && (d.metadata.get("encrypted").map(String::as_str) == Some("true")
+                                    || d.metadata.get("encrypted_entries").map(String::as_str)
+                                        == Some("yes"))
                                 && !d.metadata.contains_key("password")
                         });
                         if !retry_worthy {
@@ -662,9 +667,26 @@ impl RecursiveEngine {
                                         && d.format == redraft.format
                                         && !d.metadata.contains_key("password")
                                 }) {
-                                    let spend = shadow.expanded_bytes;
+                                    // FINAL-T2b: one logical expansion per
+                                    // region, also across retries. Bill only
+                                    // the DELTA over what this region's
+                                    // first parse already spent.
+                                    let region_hash = src
+                                        .slice(redraft.offset, redraft.size)
+                                        .map(|r| r.hash_all())
+                                        .ok();
+                                    let already = region_hash
+                                        .as_ref()
+                                        .and_then(|h| spends_by_region.get(h))
+                                        .copied()
+                                        .unwrap_or(0);
+                                    let spend = shadow.expanded_bytes.saturating_sub(already);
                                     if spend > 0 && !budget.charge(&self.limits, spend) {
                                         continue;
+                                    }
+                                    if let Some(h) = region_hash {
+                                        spends_by_region
+                                            .insert(h, shadow.expanded_bytes.max(already));
                                     }
                                     redraft.warnings.push(
                                         "decrypted after filename-derived password                                          candidates were harvested"

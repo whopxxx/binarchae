@@ -458,7 +458,17 @@ impl NtfsHandler {
                             continue;
                         }
                     };
-                    if off + take <= src.len() {
+                    // FINAL-T1: the range end itself is checked — `off`
+                    // may be near u64::MAX, and `off + take` was the
+                    // last unchecked addition in this walk.
+                    let end = match off.checked_add(take) {
+                        Some(v) => v,
+                        None => {
+                            warnings.push("run range overflow; run skipped".to_string());
+                            continue;
+                        }
+                    };
+                    if end <= src.len() {
                         src.read_at(off, &mut out[off_vcn as usize..(off_vcn + take) as usize])?;
                     } else {
                         warnings.push("run past source; zero-filled".to_string());
@@ -1111,6 +1121,69 @@ mod tests {
         sparse.extend_from_slice(&u64::MAX.to_le_bytes());
         let parsed2 = NtfsHandler::unpack_runs(&sparse, 512);
         assert!(parsed2.is_empty(), "overflowing sparse run aborts");
+    }
+
+    /// FINAL-T1: a run whose PHYSICAL RANGE (off + take) overflows
+    /// u64 must be skipped with a warning — no debug panic, no
+    /// release wrap into a small "in-bounds" offset.
+    #[test]
+    fn ntfs_run_range_end_overflow_skipped() {
+        let cluster = 512u64;
+        let mft_lcn = 4u64;
+        let rec = 1024usize;
+        let mut img = vec![0u8; 200 * cluster as usize];
+        img[3..11].copy_from_slice(b"NTFS    ");
+        img[0x0C] = 0x02;
+        img[0x0D] = 1;
+        img[0x28..0x30].copy_from_slice(&200u64.to_le_bytes());
+        img[0x30..0x38].copy_from_slice(&mft_lcn.to_le_bytes());
+        img[0x40] = 2;
+        img[0x1FE..0x200].copy_from_slice(&[0x55, 0xAA]);
+        let mft_off = (mft_lcn * cluster) as usize;
+        let mut r = vec![0u8; rec];
+        r[0..4].copy_from_slice(b"FILE");
+        r[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+        r[0x14..0x16].copy_from_slice(&0x30u16.to_le_bytes());
+        r[0x16..0x18].copy_from_slice(&1u16.to_le_bytes());
+        r[0x18..0x1C].copy_from_slice(&0xA0u32.to_le_bytes()); // used
+        r[0x1C..0x20].copy_from_slice(&(rec as u32).to_le_bytes());
+        r[4..6].copy_from_slice(&0x1Eu16.to_le_bytes());
+        r[6..8].copy_from_slice(&3u16.to_le_bytes());
+        r[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+        r[0x20..0x22].copy_from_slice(&1u16.to_le_bytes());
+        r[0x22..0x24].copy_from_slice(&1u16.to_le_bytes());
+        r[510..512].copy_from_slice(&1u16.to_le_bytes());
+        r[1022..1024].copy_from_slice(&1u16.to_le_bytes());
+        // Non-resident $DATA: runlist = header 0x81 (1B len, 8B offset),
+        // len 1 cluster, delta chosen so LCN * 512 + base fits u64
+        // (off ~ u64::MAX - 10 KiB) but off + take (512) overflows —
+        // exercising exactly the T1 range-end check.
+        let a = 0x30usize;
+        r[a..a + 4].copy_from_slice(&0x80u32.to_le_bytes()); // type
+        r[a + 4..a + 8].copy_from_slice(&0x60u32.to_le_bytes()); // length
+        r[a + 8] = 1; // non-resident
+        r[a + 0x20..a + 0x22].copy_from_slice(&0x40u16.to_le_bytes()); // run_off
+        r[a + 0x30..a + 0x38].copy_from_slice(&512u64.to_le_bytes()); // data_size
+        r[a + 0x40] = 0x81;
+        let delta: u64 = u64::MAX / 512; // LCN*512 = u64::MAX-511
+                                         // Layout: header, len (1 byte), offset (8 bytes), terminator.
+        r[a + 0x41] = 1; // len = 1 cluster
+        r[a + 0x42..a + 0x4A].copy_from_slice(&delta.to_le_bytes());
+        r[a + 0x4A] = 0; // end
+        r[a + 0x60..a + 0x64].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // ATTR_END
+        img[mft_off + 16 * rec..mft_off + 17 * rec].copy_from_slice(&r);
+        let src = ByteSource::from_vec(img);
+        let out = validate_at(&src, 0).expect("volume validates");
+        let art = &out.artifacts[0];
+        // The hostile run is skipped with an explicit warning; nothing
+        // panics and no zero-length bogus data is exposed.
+        assert!(
+            art.warnings
+                .iter()
+                .any(|w| w.contains("run range overflow") || w.contains("run offset overflow")),
+            "overflow run must be reported, got {:?}",
+            art.warnings
+        );
     }
 
     #[test]

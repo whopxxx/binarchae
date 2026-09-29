@@ -1909,6 +1909,59 @@ fn s4_dns_aggregate_decoded_recurses_to_format() {
     assert!(has_ancestor(&graph, gz, decoded));
 }
 
+/// FINAL-T2: filename retry covers 7z/RAR too. A 7z with AES-encrypted
+/// entries whose password equals the entry NAME: first parse reports
+/// `encrypted_entries=yes` without a working password; the engine then
+/// merges filename candidates and re-validates, decrypting with
+/// provenance "entry filename".
+#[test]
+fn t2_sevenz_filename_password_retry() {
+    let secret = make_gzip(b"FLAG{7z-name-pw}");
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut w = sevenz_rust2::ArchiveWriter::new(&mut buf).expect("writer");
+        // Header stays plaintext so entry names are readable on the
+        // first pass; only entry content is AES-encrypted (the exact
+        // scenario the filename retry covers).
+        w.set_encrypt_header(false);
+        w.set_content_methods(vec![sevenz_rust2::EncoderConfiguration::from(
+            sevenz_rust2::encoder_options::AesEncoderOptions::new(sevenz_rust2::Password::new(
+                "s3cr3t",
+            )),
+        )]);
+        w.push_archive_entry(
+            sevenz_rust2::ArchiveEntry::new_file("s3cr3t.bin"),
+            Some(&secret[..]),
+        )
+        .expect("entry");
+        w.finish().expect("finish");
+    }
+    let data = buf.into_inner();
+    let graph = engine().analyze(&ByteSource::from_vec(data), true);
+    let sz = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "7z")
+        .expect("7z validated");
+    assert_eq!(
+        sz.metadata.get("password").map(String::as_str),
+        Some("s3cr3t"),
+        "filename-derived password must decrypt the 7z"
+    );
+    assert_eq!(
+        sz.metadata.get("password_source").map(String::as_str),
+        Some("entry filename"),
+        "provenance: retry used the filename candidate"
+    );
+    let gz = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "gzip" && has_ancestor(&graph, a.id, sz.id))
+        .map(|a| a.id)
+        .expect("decrypted content recursed");
+    assert!(has_ancestor(&graph, gz, sz.id));
+}
+
 // ---------- graph helpers ----------
 
 fn has_ancestor(graph: &ctf_tools::artifact::ArtifactGraph, id: u64, ancestor: u64) -> bool {
