@@ -949,6 +949,18 @@ impl Handler for LzmaAloneHandler {
         }
         let dict_size = u32::from_le_bytes(hdr[1..5].try_into().unwrap());
         let uncomp_size = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
+        // FINAL-R1b: the decoder allocates the declared dictionary up
+        // front. Enforce the same plausibility gate as find_candidates
+        // (power of two, [4 KiB, 1.5 GiB]) BEFORE construction — a
+        // fuzz-found input with dict_size 0xFFFF0000 and the unknown-
+        // size sentinel previously caused a ~4 GiB malloc because
+        // validate passed `u32::MAX` (no limit) as the mem limit.
+        if !dict_size.is_power_of_two() || !(4096..=0x6000_0000).contains(&dict_size) {
+            return Err(Error::Validation {
+                format: "lzma-alone",
+                reason: format!("implausible dict size {dict_size:#x}"),
+            });
+        }
         let size_known = uncomp_size != LZMA_SIZE_UNKNOWN;
         if size_known && uncomp_size > limits.max_child_size {
             return Err(Error::Validation {
@@ -959,11 +971,14 @@ impl Handler for LzmaAloneHandler {
 
         // Decode via lzma-rust: new_mem_limit parses the 13-byte
         // .lzma header itself, so hand it the stream from the
-        // candidate offset (not after the header).
+        // candidate offset (not after the header). The mem limit is a
+        // real bound (256 MiB), not "unlimited" — the decoder's own
+        // DICT_SIZE_MAX is u32-range and would happily allocate a
+        // declared 4 GiB dictionary before any output check runs.
         let data = src.read_all()?;
         let mut reader = lzma_rust::LZMAReader::new_mem_limit(
             std::io::Cursor::new(&data[base as usize..]),
-            u32::MAX,
+            256 * 1024,
             None,
         )
         .map_err(|e| Error::Validation {
@@ -1350,5 +1365,31 @@ mod lzma_alone_tests {
         blob.extend_from_slice(b"junk");
         let src = ByteSource::from_vec(blob);
         assert!(validate_at(&LzmaAloneHandler, &src, 0).is_err());
+    }
+
+    /// FINAL-R1b (fuzz-found OOM): dict_size 0xFFFF0000 with the
+    /// unknown-size sentinel must be rejected BEFORE decoder
+    /// construction — the previous code passed an unlimited mem limit
+    /// and the decoder malloc'd the full ~4 GiB dictionary.
+    #[test]
+    fn lzma_alone_hostile_dict_size_rejected() {
+        // props 0, dict 0xFFFF0000 (LE), size sentinel all-FF, no body.
+        let blob: Vec<u8> = std::iter::once(0u8)
+            .chain(0xFFFF_0000u32.to_le_bytes())
+            .chain(0xFFFF_FFFF_FFFF_FFFFu64.to_le_bytes())
+            .chain(std::iter::repeat(0u8).take(5))
+            .collect();
+        let src = ByteSource::from_vec(blob);
+        assert!(
+            validate_at(&LzmaAloneHandler, &src, 0).is_err(),
+            "implausible dict size must fail fast, not allocate"
+        );
+        // A non-power-of-two dict in range is equally rejected.
+        let mut blob2 = vec![93u8];
+        blob2.extend_from_slice(&0x0FFF_0000u32.to_le_bytes());
+        blob2.extend_from_slice(&13u64.to_le_bytes());
+        blob2.extend_from_slice(b"junk");
+        let src2 = ByteSource::from_vec(blob2);
+        assert!(validate_at(&LzmaAloneHandler, &src2, 0).is_err());
     }
 }
