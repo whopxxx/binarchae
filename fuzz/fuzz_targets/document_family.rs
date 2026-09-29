@@ -11,8 +11,8 @@ fuzz_target!(|data: &[u8]| {
     }
     let mut body = data.to_vec();
     body[0..5].copy_from_slice(b"%PDF-");
-    if body.len() > 10 {
-        body[5..10].copy_from_slice(b"1.5\n%\xe2"); // version + comment
+    if body.len() > 11 {
+        body[5..11].copy_from_slice(b"1.5\n%\xe2"); // version + comment
     }
     if body.len() > 20 {
         body[10..16].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1]); // OLE
