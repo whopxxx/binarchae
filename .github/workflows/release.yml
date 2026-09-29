@@ -66,9 +66,10 @@ jobs:
         run: |
           cargo generate-lockfile
           cargo tree --workspace --all-features > dist/dependency-tree.txt
-          cargo install --locked cargo-cyclonedx || true
-          cargo cyclonedx --format json --output-path dist/sbom.json || true
+          cargo install --locked cargo-cyclonedx
+          cargo cyclonedx --format json --output-path dist/sbom.json
           cp Cargo.lock dist/Cargo.lock
+          sha256sum dist/Cargo.lock dist/dependency-tree.txt dist/sbom.json > dist/dependency-inventory.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
