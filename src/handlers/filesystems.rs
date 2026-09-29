@@ -430,7 +430,11 @@ impl SquashfsHandler {
         // (compressed) size. Previously every block was read from the
         // same start_block offset, so multi-block files repeated block
         // 0. Keep a running cursor instead.
-        let mut cursor = sb.data_start + u64::from(ino.start_block);
+        // FINAL-R2: per the Squashfs 4.0 spec the file inode's
+        // blocks_start is "the offset from the start of the ARCHIVE"
+        // (absolute), not relative to the data area — do not add
+        // sb.data_start. Fragment table starts are likewise absolute.
+        let mut cursor = base + u64::from(ino.start_block);
         for &blk in &ino.block_list {
             let stored = blk & !COMPRESSED_BIT_BLOCK;
             if stored == 0 {
@@ -473,7 +477,7 @@ impl SquashfsHandler {
             if let Some(frag) = Self::fragment_entry(src, base, sb, ino.fragment)? {
                 let stored = frag.size & !COMPRESSED_BIT_BLOCK;
                 let uncompressed = frag.size & COMPRESSED_BIT_BLOCK != 0;
-                let frag_abs = sb.data_start + frag.start_block;
+                let frag_abs = base + frag.start_block;
                 if stored > 0 && frag_abs + u64::from(stored) <= src.len() && ino.offset < bs {
                     let mut raw = vec![0u8; stored as usize];
                     src.read_at(frag_abs, &mut raw)?;
@@ -842,7 +846,9 @@ struct SqfsSuper {
     compression: u16,
     dict_size: u32,
     /// Absolute position of the data area (base + 96, or +100 with
-    /// compressor options present).
+    /// compressor options present). Retained for metadata reporting —
+    /// file data addressing is archive-absolute (FINAL-R2).
+    #[allow(dead_code)]
     data_start: u64,
     inodes: u32,
     fragments: u32,
@@ -4266,15 +4272,18 @@ mod tests {
         inodes.extend_from_slice(&28u16.to_le_bytes()); // file_size
         inodes.extend_from_slice(&0u16.to_le_bytes()); // offset
         inodes.extend_from_slice(&0u32.to_le_bytes()); // parent
-                                                       // FLAG.TXT reg inode @32: data at data-area offset 0, fragment
-                                                       // INVALID, file_size 10, one uncompressed full-block entry.
+                                                       // FLAG.TXT reg inode @32: data blocks at ABSOLUTE archive
+                                                       // offset 96 (the data area starts at 96 and this file's
+                                                       // blocks are first), fragment INVALID, file_size 10, one
+                                                       // uncompressed full-block entry. FINAL-R2: start_block is
+                                                       // archive-absolute per the Squashfs 4.0 spec.
         inodes.extend_from_slice(&2u16.to_le_bytes());
         inodes.extend_from_slice(&0o100644u16.to_le_bytes());
         inodes.extend_from_slice(&0u16.to_le_bytes());
         inodes.extend_from_slice(&0u16.to_le_bytes());
         inodes.extend_from_slice(&0u32.to_le_bytes()); // mtime
         inodes.extend_from_slice(&2u32.to_le_bytes()); // inode number
-        inodes.extend_from_slice(&0u32.to_le_bytes()); // start_block
+        inodes.extend_from_slice(&96u32.to_le_bytes()); // start_block (ABSOLUTE)
         inodes.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // fragment
         inodes.extend_from_slice(&0u32.to_le_bytes()); // frag offset
         inodes.extend_from_slice(&10u32.to_le_bytes()); // file_size
@@ -4373,7 +4382,7 @@ mod tests {
         inodes.extend_from_slice(&0u16.to_le_bytes());
         inodes.extend_from_slice(&0u32.to_le_bytes()); // mtime
         inodes.extend_from_slice(&2u32.to_le_bytes()); // inode number
-        inodes.extend_from_slice(&0u32.to_le_bytes()); // start_block 0
+        inodes.extend_from_slice(&96u32.to_le_bytes()); // start_block (ABSOLUTE: data area at 96)
         inodes.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // fragment: none
         inodes.extend_from_slice(&0u32.to_le_bytes()); // frag offset
         inodes.extend_from_slice(&(2 * 65536u32).to_le_bytes()); // file_size

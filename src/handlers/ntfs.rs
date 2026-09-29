@@ -385,7 +385,14 @@ impl NtfsHandler {
                 i64::try_from(val).unwrap_or(i64::MAX)
             };
             pos += offset_size;
-            prev_lcn = prev_lcn.wrapping_add(delta);
+            // FINAL-R2: the accumulator is CHECKED, not wrapping — a
+            // negative result (relative run below LCN 0) or an overflow
+            // is a corrupt runlist and must abort the walk instead of
+            // wrapping into a huge u64 "LCN" via `as`.
+            prev_lcn = match prev_lcn.checked_add(delta) {
+                Some(v) if v >= 0 => v,
+                _ => break,
+            };
             if delta == 0 || delta == i64::MAX {
                 // Zero delta with nonzero offset field is invalid; stop.
                 break;
@@ -1007,9 +1014,11 @@ mod tests {
         img
     }
 
-    /// FINAL-B2 regression: an 8-byte negative run delta previously
-    /// computed `1i64 << 64` (shift overflow). Wide deltas must decode
-    /// with correct sign extension.
+    /// FINAL-B2 + FINAL-R2: an 8-byte negative run delta previously
+    /// computed `1i64 << 64` (shift overflow); the B2 fix made the
+    /// accumulator wrapping so the negative LCN reappeared as
+    /// u64::MAX. The honest contract: a run whose LCN would go below 0
+    /// is corrupt and ABORTS the runlist walk (no run emitted).
     #[test]
     fn ntfs_runlist_wide_negative_delta() {
         // Header: size field 1 byte, offset field 8 bytes.
@@ -1019,12 +1028,16 @@ mod tests {
         runs.extend_from_slice(&(-1i64).to_le_bytes()); // offset = -1
         let cluster_size = 512;
         let parsed = NtfsHandler::unpack_runs(&runs, cluster_size);
-        assert_eq!(parsed.len(), 1, "one run parsed");
-        let (lcn, len) = parsed[0];
-        // Length is in BYTES; LCN is the raw cluster number.
-        assert_eq!(len, cluster_size);
-        // prev LCN starts at 0; delta -1 => LCN -1 (wraps as u64::MAX).
-        assert_eq!(lcn, Some(u64::MAX));
+        assert!(
+            parsed.is_empty(),
+            "negative LCN must abort the walk, not wrap: {parsed:?}"
+        );
+        // A wide POSITIVE delta still decodes (sign extension works).
+        let mut runs2 = vec![0x81u8];
+        runs2.push(1); // len = 1
+        runs2.extend_from_slice(&1i64.to_le_bytes()); // offset = +1
+        let parsed2 = NtfsHandler::unpack_runs(&runs2, cluster_size);
+        assert_eq!(parsed2, vec![(Some(1), cluster_size)]);
     }
 
     /// FINAL-B2: sparse run (offset field 0) plus a following wide run.
@@ -1161,10 +1174,11 @@ mod tests {
 
     #[test]
     fn ntfs_runlist_negative_offset_decode() {
-        // Header 0x21: 1 length byte, 2 offset bytes. len 2, delta -3
-        // (0xFD 0xFF little-endian, sign-extended 16-bit).
+        // FINAL-R2: a relative run that lands below LCN 0 is corrupt;
+        // the walk aborts with no run emitted (previously wrapped to a
+        // huge u64 "LCN" that sliced far out of bounds).
         let runs = [0x21u8, 0x02, 0xFD, 0xFF, 0x00];
         let parsed = NtfsHandler::unpack_runs(&runs, 512);
-        assert_eq!(parsed, vec![(Some((-3i64) as u64), 2 * 512)]);
+        assert!(parsed.is_empty(), "negative LCN must abort: {parsed:?}");
     }
 }
