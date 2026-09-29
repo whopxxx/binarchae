@@ -58,53 +58,75 @@ Example output on a PNG with an appended ZIP:
 entropy: 0x0(4.05)
 ```
 
-## Supported formats (M3 core roadmap)
+## Supported formats
 
 Structural parsing across the core CTF format space — no magic-only
 stubs for the major formats:
 
-- **Archives/compression**: ZIP, gzip, XZ, zlib, bzip2, Zstd, LZ4, TAR,
-  CPIO (newc/crc), AR, DEB, CAB, 7z (extraction; encrypted detected);
-  Brotli/deflate via nesting (no signature exists — stated honestly).
+- **Archives/compression**: ZIP (incl. ZipCrypto decryption with
+  auto-discovered or `--password` candidates), gzip, XZ, zlib, bzip2,
+  Zstd, LZ4, LZMA-alone, TAR (incl. truncated-entry salvage), CPIO
+  (newc/crc), AR, DEB, CAB, RAR (via `rars`; encrypted candidates
+  tried), 7z (extraction; encrypted candidates tried); Brotli/deflate
+  via nesting (no signature exists — stated honestly).
 - **Images/media**: PNG, JPEG, GIF, BMP, TIFF, WebP, RIFF (WAV/AVI),
   MP3 (strict frame validation), FLAC.
-- **Executables**: ELF, PE, Mach-O, WASM, OLE/CFB, RTF.
+- **Executables/documents**: ELF, PE, Mach-O, WASM, OLE/CFB (stream
+  extraction via FAT and mini-FAT chains), RTF.
 - **Disks/filesystems**: MBR (+EBR chains), GPT (CRC-verified), FAT12/16/32
-  (LFN, fragmented-file reconstruction), ISO9660; NTFS/ext/SquashFS/UBI
-  superblock-level (documented Partial).
+  (LFN, fragmented-file reconstruction), ISO9660, exFAT, NTFS (fixups,
+  runlists incl. sparse/wide deltas, deleted-MFT recovery), ext2/3/4
+  (extent trees, gapped extents), SquashFS (contiguous multi-block
+  files), JFFS2 (node walk, compressed fragments), YAFFS2 (packed
+  tags2, tree walk), UBI/UBIFS, cramfs, ROMFS, Android sparse.
 - **Firmware**: uImage (legacy, CRC-verified), DTB/FIT, Android boot,
-  TRX, UEFI firmware volume (Partial).
+  TRX, UEFI firmware volume incl. FFS section walk and LZMA
+  COMPRESSION/GUID_DEFINED section decoding (Tiano type 1 stays
+  metadata-only, stated honestly).
 - **Forensics**: SQLite (b-tree walk, records, overflow chains), PCAP
-  (all endianness variants), PCAPNG, Windows Minidump, Registry hive
-  (hbin/cell walk, Partial), string/URL/flag hints (heuristic).
+  (all endianness variants), PCAPNG (per-interface linktypes), Windows
+  Minidump (+ PAGEDU64 memory ranges), Registry hive (regf-spec cell
+  walk, subkey lists li/lf/lh/ri), sequence-aware TCP reassembly with
+  HTTP framing and DNS-over-UDP/TCP, base64/hex channel decoding, USB
+  HID keystroke reconstruction, entropy regions, string/URL/flag hints
+  (heuristic).
+- **Documents**: PDF (xref verification against the startxref table,
+  raw stream carving — /Filter decoding not applied, stated honestly).
 - **Recovery**: truncated-ZIP local-entry salvage — partial data beats
-  none, and recovery never masks honest validation of intact archives.
+  none; recovered children are labeled `Recovered`, never `Validated`,
+  and recovery never masks honest validation of intact archives.
 
-Handler children are either **owned bytes** (decompression output) or
-**source-backed regions** (zero-copy views into the parent input) — the
-latter is what makes firmware images, disk images, and packet captures
-cheap to analyze.
-See [docs/capabilities.md](docs/capabilities.md) for the full matrix,
-[docs/architecture.md](docs/architecture.md) for the engine design, and
-[docs/security.md](docs/security.md) for the extraction safety model.
+Password candidates propagate automatically: archive comments,
+printable strings, and entry filenames harvested from every scanned
+region feed one deterministic bounded queue (`--password` candidates
+keep priority); a working candidate is surfaced with its provenance
+(`password_source`) on the artifact.
 
-Handler children are either **owned bytes** (decompression output) or
-**source-backed regions** (zero-copy views into the parent input) — the
-latter is what makes firmware/initramfs containers cheap to analyze.
-See [docs/capabilities.md](docs/capabilities.md) for the full matrix,
-[docs/architecture.md](docs/architecture.md) for the engine design, and
-[docs/security.md](docs/security.md) for the extraction safety model.
+Child artifacts carry a confidence claim (`Validated`, `Recovered`,
+`Partial`, `Heuristic`) with structural evidence facts — recovered
+bytes are always distinguishable from structurally decoded ones.
+
+Handler children are either **owned bytes** (decompression output,
+bounded by expansion limits) or **source-backed regions** (zero-copy
+views into the parent input). Source-backed artifacts stream to disk in
+bounded chunks at extraction time — large partitions/files are never
+materialized in memory.
+
+Dependency provenance, licenses, and the native/unsafe footprint are
+documented in [docs/dependencies.md](docs/dependencies.md); release
+history in [CHANGELOG.md](CHANGELOG.md).
 
 ## Development
 
 ```bash
 cargo test --workspace          # unit + integration scenarios
-cargo bench                     # criterion scan benchmarks
-cargo install cargo-fuzz && cargo fuzz run engine_scan_memory   # fuzzing (nightly)
+cargo bench                     # criterion scan + expanded benchmarks
+cargo install cargo-fuzz && cargo fuzz run handler_roundtrip     # fuzzing (nightly)
 ```
 
-`fuzz/` targets the whole engine, per-handler validation, and the
-carving-rule parser; `benches/` tracks scan throughput regressions.
+`fuzz/` includes per-format-family targets (archives, filesystems,
+registry/sqlite, network, memory forensics, firmware, documents) and a
+bounded fuzz-smoke job in CI; long campaigns remain manual.
 
 ## Resource limits
 

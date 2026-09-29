@@ -381,6 +381,8 @@ impl FatHandler {
                             .to_string(),
                     ],
                     entry_name: Some(entry.name.clone()),
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
                 continue;
             }
@@ -411,6 +413,8 @@ impl FatHandler {
                     },
                     warnings: Vec::new(),
                     entry_name: Some(entry.name.clone()),
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
                 // Recurse into subdirectory content: re-walk the parsed
                 // chain bytes through walk_dir (depth-capped).
@@ -456,6 +460,8 @@ impl FatHandler {
                     metadata: meta,
                     warnings: Vec::new(),
                     entry_name: Some(entry.name.clone()),
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
                 continue;
             }
@@ -472,6 +478,8 @@ impl FatHandler {
                         metadata: meta,
                         warnings: Vec::new(),
                         entry_name: Some(entry.name.clone()),
+                        confidence: Confidence::Validated,
+                        evidence: vec!["structurally decoded by parent handler".to_string()],
                     });
                     continue;
                 }
@@ -510,6 +518,8 @@ impl FatHandler {
                         .to_string(),
                 ],
                 entry_name: Some(entry.name.clone()),
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
         }
         Ok(())
@@ -648,6 +658,7 @@ impl Handler for FatHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

@@ -169,6 +169,7 @@ impl Handler for MbrHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -239,6 +240,8 @@ fn mbr_children(
             metadata: meta,
             warnings: Vec::new(),
             entry_name: None,
+            confidence: Confidence::Validated,
+            evidence: vec!["structurally decoded by parent handler".to_string()],
         });
     }
 
@@ -298,6 +301,8 @@ fn mbr_children(
                     metadata: meta,
                     warnings: Vec::new(),
                     entry_name: None,
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
             }
             logical += 1;
@@ -471,6 +476,8 @@ impl Handler for GptHandler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name: None,
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
         }
 
@@ -511,6 +518,7 @@ impl Handler for GptHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

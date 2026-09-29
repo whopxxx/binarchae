@@ -6,9 +6,11 @@
 //! honest. Embedded regions (sections, OLE streams) become children
 //! where bounded and useful.
 
-use crate::artifact::{Confidence, Evidence};
+use crate::artifact::{Confidence, Evidence, RelationKind};
 use crate::bytesource::ByteSource;
-use crate::engine::{ArtifactDraft, Budget, Candidate, Handler, HandlerOutput};
+use crate::engine::{
+    ArtifactDraft, Budget, Candidate, ChildContent, ChildDraft, Handler, HandlerOutput,
+};
 use crate::error::{Error, Result};
 use crate::handlers::find_all;
 use std::collections::BTreeMap;
@@ -243,6 +245,7 @@ impl Handler for ElfHandler {
                 },
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -356,17 +359,80 @@ impl Handler for PeHandler {
 
         // B6: provable structural end = end of the section table plus the
         // furthest section raw data (PointerToRawData + SizeOfRawData).
+        // Sections with file bytes are also exposed as executable-region
+        // children (source-backed slices).
         let mut struct_end =
             (pe_at - base) + 24 + opt_header_size as u64 + num_sections as u64 * 40;
+        let mut children = Vec::new();
         for i in 0..num_sections {
             let sh = base + (pe_at - base) + 24 + opt_header_size as u64 + i as u64 * 40;
             if sh + 40 > src.len() {
                 break;
             }
+            let mut name_raw = [0u8; 8];
+            src.read_at(sh, &mut name_raw)?;
+            let sec_name =
+                String::from_utf8_lossy(name_raw.split(|&b| b == 0).next().unwrap_or(&name_raw))
+                    .into_owned();
+            let virt_size = crate::handlers::media_read_u32_le(src, sh + 8).unwrap_or(0) as u64;
             let raw_size = crate::handlers::media_read_u32_le(src, sh + 16).unwrap_or(0) as u64;
             let raw_ptr = crate::handlers::media_read_u32_le(src, sh + 20).unwrap_or(0) as u64;
+            let characteristics = crate::handlers::media_read_u32_le(src, sh + 36).unwrap_or(0);
             struct_end = struct_end.max(raw_ptr + raw_size);
+            // Executable-region child: file-backed sections only.
+            if raw_size > 0
+                && raw_ptr > 0
+                && base + raw_ptr + raw_size <= src.len()
+                && raw_size <= limits.max_child_size
+                && children.len() < limits.max_streams
+            {
+                let region = src.slice(base + raw_ptr, raw_size)?;
+                let mut meta = BTreeMap::new();
+                meta.insert("section_name".to_string(), sec_name.clone());
+                meta.insert("virtual_size".to_string(), virt_size.to_string());
+                meta.insert(
+                    "characteristics".to_string(),
+                    format!("0x{characteristics:08x}"),
+                );
+                let is_exec = characteristics & 0x2000_0000 != 0;
+                meta.insert(
+                    "characteristics_flags".to_string(),
+                    format!(
+                        "{}{}{}",
+                        if is_exec { "X" } else { "-" },
+                        if characteristics & 0x4000_0000 != 0 {
+                            "W"
+                        } else {
+                            "-"
+                        },
+                        if characteristics & 0x4000_0000 != 0 || characteristics & 0x8000_0000 != 0
+                        {
+                            "R"
+                        } else {
+                            "-"
+                        }
+                    ),
+                );
+                children.push(ChildDraft {
+                    relation: RelationKind::Contains,
+                    label: format!(
+                        "PE section {} ({} raw bytes{})",
+                        sec_name,
+                        raw_size,
+                        if is_exec { ", executable" } else { "" }
+                    ),
+                    format_hint: "raw",
+                    content: ChildContent::Source(region),
+                    size: raw_size,
+                    metadata: meta,
+                    warnings: Vec::new(),
+                    entry_name: Some(format!("section_{sec_name}")),
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
+                });
+            }
         }
+
         let proven_end = base + struct_end <= src.len();
         let pe_size = if proven_end {
             struct_end
@@ -405,7 +471,8 @@ impl Handler for PeHandler {
                 metadata,
                 warnings: Vec::new(),
                 errors: Vec::new(),
-                children: Vec::new(),
+                children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -559,6 +626,7 @@ impl Handler for MachOHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -666,6 +734,7 @@ impl Handler for WasmHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -707,13 +776,371 @@ fn read_leb128(src: &ByteSource, off: u64) -> Result<(u64, u64)> {
 
 pub struct OleHandler;
 
+const OLE_MAGIC: &[u8] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1";
+const OLE_NOSTREAM: u32 = 0xFFFF_FFFF;
+/// Mini-stream cutoff (MS-CFB): streams smaller than this live in the
+/// mini-FAT.
+const OLE_MINI_CUTOFF: u64 = 4096;
+
+/// Object types (MS-CFB 2.6.1).
+const OBJ_STREAM: u8 = 2;
+const OBJ_ROOT: u8 = 5;
+
+/// One directory entry.
+#[derive(Debug, Clone)]
+struct OleDirEntry {
+    name: String,
+    obj_type: u8,
+    left: u32,
+    right: u32,
+    child: u32,
+    /// Retained for upcoming stream extraction (FAT chain decode).
+    #[allow(dead_code)]
+    start_sector: u32,
+    size: u64,
+}
+
+/// Parsed header fields.
+struct OleHeader {
+    sector_size: u64,
+    /// Mini-FAT parameters retained for upcoming stream extraction;
+    /// the current tree walk reports stream sizes only.
+    #[allow(dead_code)]
+    mini_sector_size: u64,
+    first_dir_sector: u32,
+    #[allow(dead_code)]
+    mini_fat_start: u32,
+    #[allow(dead_code)]
+    num_mini_fat: u32,
+    fat_sectors: Vec<u32>,
+}
+
+impl OleHandler {
+    fn parse_header(src: &ByteSource, base: u64) -> Result<OleHeader> {
+        // DIFAT[109] spans 0x4C..0x200; read the full 512-byte header.
+        let mut hdr = [0u8; 512];
+        src.read_at(base, &mut hdr)?;
+        let sector_shift = u16::from_le_bytes([hdr[30], hdr[31]]);
+        let mini_shift = u16::from_le_bytes([hdr[32], hdr[33]]);
+        if !(6..=9).contains(&sector_shift) || mini_shift != 6 {
+            return Err(Error::Validation {
+                format: "ole",
+                reason: format!("invalid sector shifts {sector_shift}/{mini_shift}"),
+            });
+        }
+        let num_fat = u32::from_le_bytes(hdr[0x2C..0x30].try_into().unwrap());
+        let first_dir_sector = u32::from_le_bytes(hdr[0x30..0x34].try_into().unwrap());
+        // MS-CFB 2.2: 0x34 transaction, 0x38 mini-stream cutoff (u32),
+        // 0x3C first mini FAT sector, 0x40 num mini FAT sectors,
+        // 0x44 first DIFAT sector, 0x48 num DIFAT sectors.
+        let mini_cutoff = u32::from_le_bytes(hdr[0x38..0x3C].try_into().unwrap());
+        if u64::from(mini_cutoff) != OLE_MINI_CUTOFF {
+            return Err(Error::Validation {
+                format: "ole",
+                reason: format!("unsupported mini-stream cutoff {mini_cutoff}"),
+            });
+        }
+        let mini_fat_start = u32::from_le_bytes(hdr[0x3C..0x40].try_into().unwrap());
+        let num_mini_fat = u32::from_le_bytes(hdr[0x40..0x44].try_into().unwrap());
+        // DIFAT: 109 u32 entries in the header, then (FINAL-R5) the
+        // EXTERNAL DIFAT chain at 0x44/0x48 for images with more than
+        // 109 FAT sectors — each DIFAT sector holds (ss/4 - 1) FAT
+        // sector numbers, and its last entry is the next DIFAT sector
+        // (ENDOFCHAIN terminates the chain).
+        let first_difat = u32::from_le_bytes(hdr[0x44..0x48].try_into().unwrap());
+        let num_difat = u32::from_le_bytes(hdr[0x48..0x4C].try_into().unwrap());
+        let ss = 1u64 << sector_shift;
+        let mut fat_sectors = Vec::new();
+        for i in 0..109usize {
+            let s = u32::from_le_bytes(hdr[0x4C + i * 4..0x4C + i * 4 + 4].try_into().unwrap());
+            if s != 0xFFFF_FFFF {
+                fat_sectors.push(s);
+            }
+        }
+        if first_difat != 0xFFFF_FFFF && num_difat > 0 {
+            let per_sector = (ss / 4) as usize;
+            let mut cur = first_difat;
+            let mut seen = 0u32;
+            while cur != 0xFFFF_FFFE && cur != 0xFFFF_FFFF && seen < num_difat {
+                seen += 1;
+                if seen > 65536 {
+                    return Err(Error::Validation {
+                        format: "ole",
+                        reason: "external DIFAT chain too long".into(),
+                    });
+                }
+                let sec_abs = base + (1 + u64::from(cur)) * ss;
+                let mut raw = vec![0u8; ss as usize];
+                src.read_at(sec_abs, &mut raw)?;
+                for k in 0..per_sector {
+                    let v = u32::from_le_bytes(raw[k * 4..k * 4 + 4].try_into().unwrap());
+                    // Last entry of the sector is the NEXT DIFAT sector.
+                    if k + 1 == per_sector {
+                        cur = v;
+                    } else if v != 0xFFFF_FFFF && v != 0xFFFF_FFFE {
+                        fat_sectors.push(v);
+                    }
+                }
+            }
+        }
+        if fat_sectors.len() as u32 != num_fat {
+            return Err(Error::Validation {
+                format: "ole",
+                reason: format!(
+                    "DIFAT lists {} sectors but header declares {num_fat}",
+                    fat_sectors.len()
+                ),
+            });
+        }
+        Ok(OleHeader {
+            sector_size: ss,
+            mini_sector_size: 1u64 << mini_shift,
+            first_dir_sector,
+            mini_fat_start,
+            num_mini_fat,
+            fat_sectors,
+        })
+    }
+
+    /// Read one FAT sector-chain: the FAT is an array of u32 entries
+    /// spread across `fat_sectors`.
+    fn read_fat(src: &ByteSource, base: u64, hdr: &OleHeader) -> Result<Vec<u32>> {
+        let ss = hdr.sector_size as usize;
+        let entries_per_sector = ss / 4;
+        let mut fat = Vec::with_capacity(fat_sectors_len(hdr) * entries_per_sector);
+        let mut raw = vec![0u8; ss];
+        for &s in &hdr.fat_sectors {
+            src.read_at(base + (1 + u64::from(s)) * hdr.sector_size, &mut raw)?;
+            for c in raw.chunks_exact(4) {
+                fat.push(u32::from_le_bytes(c.try_into().unwrap()));
+            }
+        }
+        Ok(fat)
+    }
+
+    /// Follow a FAT chain from `start`, collecting sector numbers.
+    fn follow_chain(
+        fat: &[u32],
+        start: u32,
+        max_len: usize,
+        warnings: &mut Vec<String>,
+    ) -> Vec<u32> {
+        const FREESECT: u32 = 0xFFFF_FFFF;
+        const ENDOFCHAIN: u32 = 0xFFFF_FFFE;
+        const FATSECT: u32 = 0xFFFF_FFFD;
+        let mut chain = Vec::new();
+        let mut cur = start;
+        while cur != ENDOFCHAIN && cur != FREESECT && cur != FATSECT {
+            if chain.len() >= max_len {
+                warnings.push("FAT chain too long; truncated".to_string());
+                break;
+            }
+            chain.push(cur);
+            if cur as usize >= fat.len() {
+                warnings.push("FAT chain points past FAT; truncated".to_string());
+                break;
+            }
+            cur = fat[cur as usize];
+        }
+        chain
+    }
+
+    /// Read the directory chain into a flat list of entries.
+    fn read_directory(
+        src: &ByteSource,
+        base: u64,
+        hdr: &OleHeader,
+        fat: &[u32],
+        limits: &crate::engine::EngineLimits,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<OleDirEntry>> {
+        let dir_sectors =
+            Self::follow_chain(fat, hdr.first_dir_sector, limits.max_records, warnings);
+        let mut raw = Vec::new();
+        let mut buf = vec![0u8; hdr.sector_size as usize];
+        for s in &dir_sectors {
+            src.read_at(base + (1 + u64::from(*s)) * hdr.sector_size, &mut buf)?;
+            raw.extend_from_slice(&buf);
+        }
+        let mut entries = Vec::new();
+        for chunk in raw.chunks_exact(128) {
+            let name_len = u16::from_le_bytes([chunk[64], chunk[65]]) as usize;
+            let obj_type = chunk[66];
+            if obj_type == 0 {
+                continue; // unused
+            }
+            if !(2..=64).contains(&name_len) || name_len % 2 != 0 {
+                continue;
+            }
+            let units: Vec<u16> = chunk[..name_len - 2]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let name = String::from_utf16_lossy(&units);
+            let left = u32::from_le_bytes(chunk[68..72].try_into().unwrap());
+            let right = u32::from_le_bytes(chunk[72..76].try_into().unwrap());
+            let child = u32::from_le_bytes(chunk[76..80].try_into().unwrap());
+            let start_sector = u32::from_le_bytes(chunk[116..120].try_into().unwrap());
+            let size = u64::from_le_bytes(chunk[120..128].try_into().unwrap());
+            entries.push(OleDirEntry {
+                name,
+                obj_type,
+                left,
+                right,
+                child,
+                start_sector,
+                size,
+            });
+            if entries.len() >= limits.max_records {
+                warnings.push("directory entries exceed max_records; truncated".to_string());
+                break;
+            }
+        }
+        Ok(entries)
+    }
+
+    /// FINAL-B5: read the mini-FAT chain (mini FAT sectors follow a FAT
+    /// chain rooted at hdr.mini_fat_start) into u32 entries.
+    fn read_mini_fat(
+        src: &ByteSource,
+        base: u64,
+        hdr: &OleHeader,
+        fat: &[u32],
+        limits: &crate::engine::EngineLimits,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<u32>> {
+        let entries_per_sector = hdr.sector_size as usize / 4;
+        let chain = Self::follow_chain(fat, hdr.mini_fat_start, limits.max_records, warnings);
+        let mut mini_fat = Vec::new();
+        let mut buf = vec![0u8; hdr.sector_size as usize];
+        for s in &chain {
+            src.read_at(base + (1 + u64::from(*s)) * hdr.sector_size, &mut buf)?;
+            for c in buf.chunks_exact(4) {
+                mini_fat.push(u32::from_le_bytes(c.try_into().unwrap()));
+            }
+        }
+        Ok(mini_fat
+            .into_iter()
+            .take(entries_per_sector * chain.len().min(limits.max_records))
+            .collect())
+    }
+
+    /// Read the mini-stream (root entry's own sector chain) as raw bytes.
+    fn read_mini_stream(
+        src: &ByteSource,
+        base: u64,
+        hdr: &OleHeader,
+        fat: &[u32],
+        root: &OleDirEntry,
+        limits: &crate::engine::EngineLimits,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<u8>> {
+        let chain = Self::follow_chain(fat, root.start_sector, limits.max_records, warnings);
+        let max_bytes = limits
+            .max_child_size
+            .min(limits.max_records.max(1) as u64 * hdr.sector_size);
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; hdr.sector_size as usize];
+        for s in &chain {
+            src.read_at(base + (1 + u64::from(*s)) * hdr.sector_size, &mut buf)?;
+            out.extend_from_slice(&buf);
+            if out.len() as u64 > max_bytes {
+                warnings.push("mini-stream exceeds extraction cap; truncated".to_string());
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Extract one stream's bytes: regular FAT streams come from the
+    /// sector chain; mini streams come from the root's mini-stream
+    /// sliced by the mini-FAT chain. Extraction is budget-capped.
+    #[allow(clippy::too_many_arguments)]
+    fn extract_stream(
+        src: &ByteSource,
+        base: u64,
+        hdr: &OleHeader,
+        fat: &[u32],
+        mini_fat: &[u32],
+        mini_stream: &[u8],
+        entry: &OleDirEntry,
+        budget: &mut Budget,
+        limits: &crate::engine::EngineLimits,
+        warnings: &mut Vec<String>,
+    ) -> Option<Vec<u8>> {
+        if entry.size == 0 || entry.size > limits.max_child_size {
+            return None;
+        }
+        if entry.size < OLE_MINI_CUTOFF {
+            // Mini stream: follow the mini-FAT chain.
+            let mini_ss = hdr.mini_sector_size as usize;
+            let mut out = Vec::new();
+            let mut cur = entry.start_sector;
+            const ENDOFCHAIN: u32 = 0xFFFF_FFFE;
+            const FREESECT: u32 = 0xFFFF_FFFF;
+            while cur != ENDOFCHAIN && cur != FREESECT {
+                if cur as usize >= mini_fat.len() {
+                    warnings.push("mini-FAT chain past table; truncated".to_string());
+                    break;
+                }
+                let start = cur as usize * mini_ss;
+                let end = start + mini_ss;
+                if end > mini_stream.len() {
+                    warnings.push("mini-stream slice out of range; truncated".to_string());
+                    break;
+                }
+                out.extend_from_slice(&mini_stream[start..end]);
+                if out.len() as u64 >= entry.size {
+                    break;
+                }
+                cur = mini_fat[cur as usize];
+            }
+            out.truncate(entry.size as usize);
+            Some(out)
+        } else {
+            // Regular stream: sector chain.
+            let chain = Self::follow_chain(fat, entry.start_sector, limits.max_records, warnings);
+            let mut out = Vec::new();
+            let mut buf = vec![0u8; hdr.sector_size as usize];
+            for s in &chain {
+                if src
+                    .read_at(base + (1 + u64::from(*s)) * hdr.sector_size, &mut buf)
+                    .is_err()
+                {
+                    warnings.push("FAT chain sector unreadable; truncated".to_string());
+                    break;
+                }
+                out.extend_from_slice(&buf);
+                if out.len() as u64 >= entry.size {
+                    break;
+                }
+            }
+            out.truncate(entry.size as usize);
+            Some(out)
+        }
+        .and_then(|bytes| {
+            // Budget: only commit if the run-wide accounting accepts.
+            if budget.charge(limits, bytes.len() as u64) {
+                Some(bytes)
+            } else {
+                warnings.push("stream extraction budget exhausted".to_string());
+                None
+            }
+        })
+    }
+}
+
+fn fat_sectors_len(hdr: &OleHeader) -> usize {
+    hdr.fat_sectors.len()
+}
+
 impl Handler for OleHandler {
     fn format(&self) -> &'static str {
         "ole"
     }
 
     fn find_candidates(&self, src: &ByteSource) -> Vec<Candidate> {
-        find_all(src, b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")
+        find_all(src, OLE_MAGIC)
             .into_iter()
             .map(|offset| Candidate { offset })
             .collect()
@@ -724,7 +1151,7 @@ impl Handler for OleHandler {
         src: &ByteSource,
         candidate: Candidate,
         limits: &crate::engine::EngineLimits,
-        _budget: &mut Budget,
+        budget: &mut Budget,
     ) -> Result<HandlerOutput> {
         let base = candidate.offset;
         if base + 80 > src.len() {
@@ -733,62 +1160,167 @@ impl Handler for OleHandler {
                 reason: "truncated header".into(),
             });
         }
-        let minor = crate::handlers::media_read_u16_le(src, base + 24).unwrap_or(0);
         let major = crate::handlers::media_read_u16_le(src, base + 26).unwrap_or(0);
-        let sector_shift = crate::handlers::media_read_u16_le(src, base + 30).unwrap_or(9);
-        let sector_size = 1u64 << sector_shift;
-        if !(6..=9).contains(&sector_shift) {
-            return Err(Error::Validation {
-                format: "ole",
-                reason: format!("invalid sector shift {sector_shift}"),
-            });
-        }
         if major != 3 && major != 4 {
             return Err(Error::Validation {
                 format: "ole",
-                reason: format!("unsupported version {major}.{minor}"),
+                reason: format!("unsupported version {major}"),
             });
         }
-        let dir_start = crate::handlers::media_read_u32_le(src, base + 48).unwrap_or(0) as u64;
-        let dir_end = dir_start
-            .checked_add(1)
-            .and_then(|n| n.checked_mul(sector_size))
-            .ok_or(Error::Validation {
-                format: "ole",
-                reason: "directory offset overflow".into(),
-            })?;
-        if base + dir_end > src.len() {
+        let hdr = Self::parse_header(src, base)?;
+        let mut warnings = Vec::new();
+        let fat = Self::read_fat(src, base, &hdr)?;
+        let entries = Self::read_directory(src, base, &hdr, &fat, limits, &mut warnings)?;
+        if entries.is_empty() {
             return Err(Error::Validation {
                 format: "ole",
-                reason: "directory chain out of bounds".into(),
+                reason: "empty directory".into(),
             });
         }
-        let _ = limits;
+        // Root entry must be first.
+        if entries[0].obj_type != OBJ_ROOT {
+            return Err(Error::Validation {
+                format: "ole",
+                reason: "first directory entry is not the root".into(),
+            });
+        }
+
+        // Walk the red-black tree of each storage; FINAL-B5 extracts
+        // stream bytes (regular FAT chains and mini-FAT streams from
+        // the root's mini-stream) as children with provenance.
+        let root = entries[0].clone();
+        let mini_fat = Self::read_mini_fat(src, base, &hdr, &fat, limits, &mut warnings)?;
+        let mini_stream =
+            Self::read_mini_stream(src, base, &hdr, &fat, &root, limits, &mut warnings)?;
+        let mut visited = std::collections::HashSet::new();
+        fn visit(
+            entries: &[OleDirEntry],
+            idx: u32,
+            path: &str,
+            visited: &mut std::collections::HashSet<u32>,
+            out: &mut Vec<String>,
+        ) {
+            if idx == OLE_NOSTREAM || !visited.insert(idx) || idx as usize >= entries.len() {
+                return;
+            }
+            let e = &entries[idx as usize];
+            visit(entries, e.left, path, visited, out);
+            let child_path = if path.is_empty() {
+                e.name.clone()
+            } else {
+                format!("{path}/{}", e.name)
+            };
+            if e.obj_type == OBJ_STREAM {
+                // Declared size distinguishes mini-FAT streams
+                // (< OLE_MINI_CUTOFF) from regular FAT streams.
+                out.push(format!(
+                    "{child_path} ({} bytes, {})",
+                    e.size,
+                    if e.size < OLE_MINI_CUTOFF {
+                        "mini-fat"
+                    } else {
+                        "fat"
+                    }
+                ));
+            }
+            visit(entries, e.right, path, visited, out);
+            visit(entries, e.child, path, visited, out);
+        }
+        let mut names = Vec::new();
+        visit(&entries, entries[0].child, "", &mut visited, &mut names);
+
+        // FINAL-B5: extract streams as children (bounded + budgeted).
+        let mut children: Vec<ChildDraft> = Vec::new();
+        {
+            let mut ordered = std::collections::HashSet::new();
+            let mut stack = vec![(entries[0].child, String::new())];
+            while let Some((i, p)) = stack.pop() {
+                if i == OLE_NOSTREAM || !ordered.insert(i) || i as usize >= entries.len() {
+                    continue;
+                }
+                let e = &entries[i as usize];
+                let child_path = if p.is_empty() {
+                    e.name.clone()
+                } else {
+                    format!("{p}/{}", e.name)
+                };
+                if e.obj_type == OBJ_STREAM {
+                    if children.len() >= limits.max_archive_entries {
+                        warnings.push("stream child cap reached; extraction truncated".to_string());
+                    } else if let Some(bytes) = Self::extract_stream(
+                        src,
+                        base,
+                        &hdr,
+                        &fat,
+                        &mini_fat,
+                        &mini_stream,
+                        e,
+                        budget,
+                        limits,
+                        &mut warnings,
+                    ) {
+                        let mut meta = BTreeMap::new();
+                        meta.insert("path".to_string(), child_path.clone());
+                        meta.insert(
+                            "storage".to_string(),
+                            if e.size < OLE_MINI_CUTOFF {
+                                "mini-fat"
+                            } else {
+                                "fat"
+                            }
+                            .to_string(),
+                        );
+                        children.push(ChildDraft {
+                            relation: RelationKind::Contains,
+                            label: format!("OLE stream {child_path} ({} bytes)", bytes.len()),
+                            format_hint: "raw",
+                            content: ChildContent::Owned(bytes),
+                            size: e.size,
+                            metadata: meta,
+                            warnings: Vec::new(),
+                            entry_name: Some(child_path.replace('/', "_")),
+                            confidence: Confidence::Validated,
+                            evidence: vec!["structurally decoded by parent handler".to_string()],
+                        });
+                    }
+                }
+                stack.push((e.left, p.clone()));
+                stack.push((e.right, p.clone()));
+                stack.push((e.child, child_path.clone()));
+            }
+        }
 
         let mut metadata = BTreeMap::new();
         metadata.insert("major_version".to_string(), major.to_string());
-        metadata.insert("sector_size".to_string(), sector_size.to_string());
-        metadata.insert("directory_start_sector".to_string(), dir_start.to_string());
+        metadata.insert("sector_size".to_string(), hdr.sector_size.to_string());
+        metadata.insert("directory_entries".to_string(), entries.len().to_string());
+        metadata.insert("stream_count".to_string(), names.len().to_string());
 
         Ok(HandlerOutput {
             artifacts: vec![ArtifactDraft {
                 format: "ole".to_string(),
-                label: format!("OLE compound file (v{major}, {}B sectors)", sector_size),
+                label: format!(
+                    "OLE compound file (v{major}, {}B sectors, {} streams)",
+                    hdr.sector_size,
+                    names.len()
+                ),
                 offset: base,
                 size: src.len() - base,
-                confidence: Confidence::Validated,
+                confidence: if names.is_empty() {
+                    Confidence::Partial
+                } else {
+                    Confidence::Validated
+                },
                 evidence: Evidence::facts([
                     "OLE CFB magic (D0CF11E0A1B11AE1) validated".to_string(),
-                    format!("{} sector size", sector_size),
-                    "directory-chain bounds checked".to_string(),
+                    format!("{} directory entries parsed", entries.len()),
+                    format!("stream tree walked: {} streams", names.len()),
                 ]),
                 metadata,
-                warnings: vec![
-                    "stream enumeration planned for a hardening pass; header validated structurally here"
-                        .to_string(),
-                ],
+                warnings,
                 errors: Vec::new(),
-                children: Vec::new(),
+                children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -888,6 +1420,7 @@ impl Handler for RtfHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -1066,5 +1599,311 @@ mod exec_tests {
         let art = &out.artifacts[0];
         assert_eq!(art.size, 29, "boundary = balanced close brace");
         assert!(art.size < src.len(), "trailing text stays outside");
+    }
+
+    /// Hand-built PE with two sections (.text executable, .data
+    /// readable): handler must expose file-backed section regions as
+    /// source-backed children with X/W/R flags.
+    #[test]
+    fn pe_section_regions_as_children() {
+        // DOS header: "MZ", e_lfanew=0x40.
+        let mut pe = vec![0u8; 0x400];
+        pe[0] = b'M';
+        pe[1] = b'Z';
+        pe[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        // PE signature + COFF header.
+        let pe_at = 0x40usize;
+        pe[pe_at..pe_at + 4].copy_from_slice(b"PE\0\0");
+        pe[pe_at + 4..pe_at + 6].copy_from_slice(&0x8664u16.to_le_bytes()); // x64
+        pe[pe_at + 6..pe_at + 8].copy_from_slice(&2u16.to_le_bytes()); // 2 sections
+        pe[pe_at + 20..pe_at + 22].copy_from_slice(&240u16.to_le_bytes()); // opt header size
+                                                                           // Section table at pe_at + 24 + 240.
+        let st = pe_at + 24 + 240;
+        // .text: raw 0x100 bytes at file offset 0x200, executable.
+        pe[st..st + 6].copy_from_slice(b".text\0");
+        pe[st + 8..st + 12].copy_from_slice(&0x100u32.to_le_bytes()); // virtual size
+        pe[st + 16..st + 20].copy_from_slice(&0x100u32.to_le_bytes()); // raw size
+        pe[st + 20..st + 24].copy_from_slice(&0x200u32.to_le_bytes()); // raw ptr
+        pe[st + 36..st + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // RXC
+                                                                             // .data: raw 0x40 bytes at 0x300.
+        let d = st + 40;
+        pe[d..d + 8].copy_from_slice(&[0x2E, 0x64, 0x61, 0x74, 0x61, 0, 0, 0]);
+        pe[d + 8..d + 12].copy_from_slice(&0x40u32.to_le_bytes());
+        pe[d + 16..d + 20].copy_from_slice(&0x40u32.to_le_bytes());
+        pe[d + 20..d + 24].copy_from_slice(&0x300u32.to_le_bytes());
+        pe[d + 36..d + 40].copy_from_slice(&0xC000_0040u32.to_le_bytes()); // RW
+                                                                           // Section content.
+        pe[0x200..0x200 + 14].copy_from_slice(b"TEXT_BYTES_OK!");
+        pe[0x300..0x300 + 14].copy_from_slice(b"DATA_BYTES_OK!");
+
+        let src = ByteSource::from_vec(pe);
+        let out = validate_at(&PeHandler, &src, 0).expect("pe validates");
+        let art = &out.artifacts[0];
+        assert_eq!(art.confidence, Confidence::Validated);
+        assert_eq!(art.children.len(), 2);
+        let text = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("section_name").map(String::as_str) == Some(".text"))
+            .expect(".text child");
+        assert!(
+            text.metadata
+                .get("characteristics_flags")
+                .map(String::as_str)
+                .unwrap_or("")
+                .contains('X'),
+            ".text must be flagged executable"
+        );
+        match &text.content {
+            ChildContent::Source(r) => {
+                let mut b = [0u8; 14];
+                r.read_at(0, &mut b).unwrap();
+                assert_eq!(&b, b"TEXT_BYTES_OK!");
+            }
+            _ => panic!("section must be source-backed"),
+        }
+        let data = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("section_name").map(String::as_str) == Some(".data"))
+            .expect(".data child");
+        assert!(
+            !data
+                .metadata
+                .get("characteristics_flags")
+                .map(String::as_str)
+                .unwrap_or("")
+                .contains('X'),
+            ".data must not be executable"
+        );
+    }
+    /// FINAL-B5: synthetic CFB (v3, 512B sectors) with one regular FAT
+    /// stream and one mini-FAT stream; both must be extracted as
+    /// children with the correct storage provenance.
+    fn ole_cfb() -> Vec<u8> {
+        const SS: usize = 512;
+        let mut f: Vec<u8> = Vec::new();
+        // Header (512 bytes).
+        f.extend_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        f.extend([0u8; 16]); // CLSID
+        f.extend(0x003Eu16.to_le_bytes()); // minor
+        f.extend(0x0003u16.to_le_bytes()); // major v3
+        f.extend(0xFFFEu16.to_le_bytes()); // byte order
+        f.extend(9u16.to_le_bytes()); // sector shift (512)
+        f.extend(6u16.to_le_bytes()); // mini shift (64)
+        f.extend([0u8; 6]); // reserved + dir sect len
+        f.extend(0u32.to_le_bytes()); // num dir sectors (v3: 0)
+        f.extend(1u32.to_le_bytes()); // num FAT sectors
+        f.extend(1u32.to_le_bytes()); // first dir sector
+        f.extend(0u32.to_le_bytes()); // transaction
+        f.extend(4096u32.to_le_bytes()); // mini cutoff
+        f.extend(4u32.to_le_bytes()); // first mini FAT sector
+        f.extend(1u32.to_le_bytes()); // num mini FAT sectors
+        f.extend(0xFFFF_FFFFu32.to_le_bytes()); // first DIFAT sector
+        f.extend(0u32.to_le_bytes()); // num DIFAT sectors
+                                      // DIFAT: 109 entries; FAT at sector 0.
+        f.extend(0u32.to_le_bytes());
+        for _ in 1..109 {
+            f.extend(0xFFFF_FFFFu32.to_le_bytes());
+        }
+        assert_eq!(f.len(), 512);
+        // Sector 0: FAT. Layout: [0]=FATSECT(0xFFFFFFFD) [1]=END [2]=END
+        // [3]=END (dir chain of one sector).
+        // Sector allocation: FAT@0, dir@1, regstream@2, ministream@3.
+        let mut fat: Vec<u32> = vec![0xFFFF_FFFF; SS / 4];
+        fat[0] = 0xFFFF_FFFD; // FATSECT
+        fat[1] = 0xFFFF_FFFE; // dir: single sector chain
+        fat[2] = 0xFFFF_FFFE; // regular stream: single sector
+        fat[3] = 0xFFFF_FFFE; // mini stream container: single sector
+        fat[4] = 0xFFFF_FFFE; // mini FAT: single sector
+        for v in fat {
+            f.extend(v.to_le_bytes());
+        }
+        // Sector 1: directory. 4 entries x 128 bytes. Root's mini
+        // stream lives in sector 3; the small stream uses mini sector 0.
+        // Helper fields: red-black tree as flat list (left=right=child=NOSTREAM
+        // for leaves; root's child -> entry 1; entry 1 right -> entry 2;
+        // entry 2 right -> entry 3).
+        let mut dir = vec![0u8; 4 * 128];
+        let mut put = |idx: usize,
+                       name: &str,
+                       typ: u8,
+                       left: u32,
+                       right: u32,
+                       child: u32,
+                       start: u32,
+                       size: u64| {
+            let e = &mut dir[idx * 128..(idx + 1) * 128];
+            let units: Vec<u16> = name.encode_utf16().collect();
+            for (i, u) in units.iter().enumerate() {
+                e[i * 2..i * 2 + 2].copy_from_slice(&u.to_le_bytes());
+            }
+            let name_field = (units.len() * 2 + 2) as u16;
+            e[64..66].copy_from_slice(&name_field.to_le_bytes());
+            e[66] = typ;
+            e[67] = 0x01; // black
+            e[68..72].copy_from_slice(&left.to_le_bytes());
+            e[72..76].copy_from_slice(&right.to_le_bytes());
+            e[76..80].copy_from_slice(&child.to_le_bytes());
+            e[116..120].copy_from_slice(&start.to_le_bytes());
+            e[120..128].copy_from_slice(&size.to_le_bytes());
+        };
+        // 0: Root Entry (mini-stream container), start sector 3.
+        put(0, "Root Entry", 5, 0xFFFF_FFFF, 0xFFFF_FFFF, 1, 3, 512);
+        // 1: BIG (regular stream), size 8192 > cutoff, sector 2.
+        put(1, "BIG", 2, 0xFFFF_FFFF, 2, 0xFFFF_FFFF, 2, 8192);
+        // 2: small (mini stream), size 64 < cutoff, mini sector 0.
+        put(2, "small", 2, 0xFFFF_FFFF, 3, 0xFFFF_FFFF, 0, 64);
+        // 3: empty storage.
+        put(3, "dir", 1, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0);
+        f.extend_from_slice(&dir);
+        // Sector 2: regular stream data (512 bytes; declared 8192 is
+        // truncated on disk -> extraction must truncate to what exists).
+        let big: Vec<u8> = (0..512).map(|i| (i % 251) as u8).collect();
+        f.extend_from_slice(&big);
+        // Sector 3: mini-stream container (512 bytes = 8 mini sectors).
+        let mut mini = vec![0u8; 512];
+        let payload = b"MINI_STREAM_PAYLOAD_012345678901234567890123456";
+        mini[0..payload.len()].copy_from_slice(payload);
+        f.extend_from_slice(&mini);
+        // Sector 4: mini FAT (128 x u32): mini sector 0 -> ENDOFCHAIN.
+        let mut mfat: Vec<u32> = vec![0xFFFF_FFFF; SS / 4];
+        mfat[0] = 0xFFFF_FFFE;
+        for v in mfat {
+            f.extend(v.to_le_bytes());
+        }
+        f
+    }
+
+    /// FINAL-R5: a CFB with more than 109 FAT sectors must be accepted
+    /// via the external DIFAT chain (0x44/0x48). Fixture: 110 FAT
+    /// sectors — 109 in the header DIFAT + 1 via a single external
+    /// DIFAT sector.
+    #[test]
+    fn ole_external_difat_chain_walked() {
+        const SS: usize = 512;
+        let n_fat_sectors = 110usize;
+        let mut f: Vec<u8> = Vec::new();
+        f.extend_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        f.extend([0u8; 16]);
+        f.extend(0x003Eu16.to_le_bytes());
+        f.extend(0x0003u16.to_le_bytes());
+        f.extend(0xFFFEu16.to_le_bytes());
+        f.extend(9u16.to_le_bytes()); // 512B sectors
+        f.extend(6u16.to_le_bytes()); // 64B mini
+        f.extend([0u8; 6]);
+        f.extend(0u32.to_le_bytes()); // num dir sectors
+        f.extend((n_fat_sectors as u32).to_le_bytes()); // num FAT sectors
+        f.extend(((1 + n_fat_sectors) as u32).to_le_bytes()); // first dir sector
+        f.extend(0u32.to_le_bytes()); // transaction
+        f.extend(4096u32.to_le_bytes()); // mini cutoff
+        f.extend(0xFFFF_FFFFu32.to_le_bytes()); // first mini FAT
+        f.extend(0u32.to_le_bytes()); // num mini FAT
+        f.extend((n_fat_sectors as u32).to_le_bytes()); // first DIFAT sector (110: after the 110 FAT sectors)
+        f.extend(1u32.to_le_bytes()); // num DIFAT sectors
+                                      // Header DIFAT: 109 entries = FAT sectors 0..108; the LAST slot
+                                      // (index 108) must hold the next-DIFAT pointer? No — the header
+                                      // DIFAT holds only FAT sectors; external chain starts at 0x44.
+        for i in 0..109u32 {
+            f.extend(i.to_le_bytes());
+        }
+        assert_eq!(f.len(), 512);
+        // FAT sectors 0..109: all FATSECT markers; entry for dir sector
+        // and the external DIFAT sector marked FATSECT too.
+        // Each FAT sector: every entry is a FATSECT marker (the chain
+        // layout itself is irrelevant to the DIFAT count assertion).
+        for _ in 0..n_fat_sectors {
+            let mut raw: Vec<u8> = Vec::with_capacity(SS);
+            for _ in 0..SS / 4 {
+                raw.extend(0xFFFF_FFFDu32.to_le_bytes());
+            }
+            f.extend_from_slice(&raw);
+        }
+        // Sector 110: external DIFAT sector. 127 FAT-sector entries + 1
+        // next pointer. We need FAT sector 109 (the 110th) listed here;
+        // the rest FREESECT; last slot = ENDOFCHAIN.
+        let mut difat: Vec<u8> = Vec::new();
+        difat.extend(109u32.to_le_bytes());
+        for _ in 1..SS / 4 - 1 {
+            difat.extend(0xFFFF_FFFFu32.to_le_bytes());
+        }
+        difat.extend(0xFFFF_FFFEu32.to_le_bytes()); // next DIFAT: end
+        f.extend_from_slice(&difat);
+        // Sector 111: directory sector — 4 unused entries (all-zero,
+        // obj_type 0 = unused): parse yields an empty dir -> validation
+        // fails on "first directory entry is not the root"? A zeroed
+        // dir produces no entries; that's fine — the point of this test
+        // is that parse_header accepts 110 FAT sectors.
+        let dir = vec![0u8; SS];
+        f.extend_from_slice(&dir);
+
+        let src = ByteSource::from_vec(f);
+        // Header must parse: num_fat (110) == header DIFAT (109) +
+        // external (1). Validation may fail later (empty dir) but the
+        // DIFAT mismatch error must NOT occur.
+        let err = OleHandler
+            .validate(
+                &src,
+                Candidate { offset: 0 },
+                &EngineLimits::default(),
+                &mut Budget::default(),
+            )
+            .err();
+        if let Some(e) = &err {
+            let msg = format!("{e}");
+            assert!(
+                !msg.contains("DIFAT lists"),
+                "external DIFAT chain must be walked: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn ole_stream_extraction_fat_and_mini_fat() {
+        let src = ByteSource::from_vec(ole_cfb());
+        let mut budget = Budget::default();
+        let out = OleHandler
+            .validate(
+                &src,
+                Candidate { offset: 0 },
+                &EngineLimits::default(),
+                &mut budget,
+            )
+            .expect("ole validates");
+        let art = &out.artifacts[0];
+        let big = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("path").map(String::as_str) == Some("BIG"))
+            .expect("regular FAT stream extracted");
+        assert_eq!(big.metadata.get("storage").map(String::as_str), Some("fat"));
+        match &big.content {
+            ChildContent::Owned(bytes) => {
+                assert_eq!(bytes.len(), 512, "truncated to on-disk bytes");
+                assert_eq!(&bytes[..4], &[0, 1, 2, 3]);
+            }
+            _ => panic!("stream must be owned bytes"),
+        }
+        // Mini-FAT stream: resolved through the root mini-stream and
+        // the mini FAT chain.
+        let small = art
+            .children
+            .iter()
+            .find(|c| c.metadata.get("path").map(String::as_str) == Some("small"))
+            .expect("mini-fat stream extracted");
+        assert_eq!(
+            small.metadata.get("storage").map(String::as_str),
+            Some("mini-fat")
+        );
+        match &small.content {
+            ChildContent::Owned(bytes) => {
+                assert_eq!(bytes.len(), 64);
+                assert!(
+                    bytes.starts_with(b"MINI_STREAM_PAYLOAD"),
+                    "mini stream payload must be read via mini-FAT"
+                );
+            }
+            _ => panic!("stream must be owned bytes"),
+        }
     }
 }

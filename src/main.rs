@@ -33,6 +33,11 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
+    /// #7 §12.1: emit JSONL (one record per line) instead of JSON.
+    /// Stream-processable for very large graphs.
+    #[arg(long)]
+    jsonl: bool,
+
     /// Verbose diagnostics (warnings, evidence) in human output.
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -52,6 +57,10 @@ struct Cli {
     /// Optional TOML file with user-defined carving rules.
     #[arg(long)]
     carving_rules: Option<PathBuf>,
+
+    /// Password candidate for encrypted containers (7z/RAR). Repeatable.
+    #[arg(long = "password")]
+    passwords: Vec<String>,
 }
 
 fn main() {
@@ -73,6 +82,7 @@ fn run(cli: &Cli) -> i32 {
         max_depth: cli.max_depth,
         max_artifacts: cli.max_artifacts,
         max_total_expanded_bytes: cli.max_expanded_bytes,
+        passwords: cli.passwords.clone(),
         ..EngineLimits::default()
     };
 
@@ -105,6 +115,18 @@ fn run(cli: &Cli) -> i32 {
         graph,
     );
     report.entropy = entropy::analyze_bounded(&src, 64 * 1024, 16);
+    // #7 §10: transition-grouped classified regions (compact; no spam).
+    report.entropy_regions = entropy::group_regions(&report.entropy);
+
+    if cli.jsonl {
+        let jsonl = report.to_jsonl().unwrap_or_else(|e| {
+            eprintln!("error: jsonl serialization failed: {e}");
+            String::new()
+        });
+        print!("{jsonl}");
+        let _ = std::io::stdout().flush();
+        return 0;
+    }
 
     if cli.json {
         let json = report.to_json_pretty().unwrap_or_else(|e| {
@@ -117,7 +139,14 @@ fn run(cli: &Cli) -> i32 {
 
     // Compact human tree.
     print!("{}", output::render_tree(&report.graph, cli.verbose));
-    if !report.entropy.is_empty() {
+    if !report.entropy_regions.is_empty() {
+        // §10: classified regions replace the raw block list for
+        // compactness; the full block list stays in JSON/JSONL.
+        println!(
+            "regions: {}",
+            entropy::regions_line(&report.entropy_regions)
+        );
+    } else if !report.entropy.is_empty() {
         println!("entropy: {}", entropy::compact_line(&report.entropy));
     }
     let _ = std::io::stdout().flush();
@@ -169,8 +198,7 @@ fn materialize(cli: &Cli, report: &Report, engine: &RecursiveEngine) -> std::io:
                         std::fs::create_dir_all(parent)?;
                     }
                     let dest = dedup_path(&dest);
-                    if let Some(bytes) = read_artifact_bytes(child, engine) {
-                        std::fs::write(dest, bytes)?;
+                    if stream_artifact(child, engine, &dest)? {
                         wrote_any = true;
                     }
                 }
@@ -178,9 +206,12 @@ fn materialize(cli: &Cli, report: &Report, engine: &RecursiveEngine) -> std::io:
             let _ = relation;
         }
         if !wrote_any {
-            if let Some(bytes) = read_artifact_bytes(artifact, engine) {
-                let dest = dedup_path(&dir.join("body.bin"));
-                std::fs::write(dest, bytes)?;
+            let dest = dedup_path(&dir.join("body.bin"));
+            if !stream_artifact(artifact, engine, &dest)? {
+                // Fallback: owned bytes only (byte_cache).
+                if let Some(bytes) = read_artifact_bytes(artifact, engine) {
+                    std::fs::write(dest, bytes)?;
+                }
             }
         }
     }
@@ -195,6 +226,41 @@ fn materialize(cli: &Cli, report: &Report, engine: &RecursiveEngine) -> std::io:
     );
 
     Ok(out_root)
+}
+
+/// #7 §11: stream a source-backed artifact to `dest` with a bounded
+/// copy buffer (no whole-artifact Vec). Owned (decompressed) content
+/// still goes through the bounded byte cache. Returns true when bytes
+/// were written. Hash/provenance are preserved: the analysis-time
+/// BLAKE3 hash was computed over these same bytes.
+fn stream_artifact(
+    a: &ctf_tools::artifact::Artifact,
+    engine: &RecursiveEngine,
+    dest: &std::path::Path,
+) -> std::io::Result<bool> {
+    // Source-backed: stream chunk-by-chunk through the region handle.
+    if let Some(region) = engine.region_handle(&a.hash) {
+        const CHUNK: u64 = 64 * 1024;
+        let mut file = std::fs::File::create(dest)?;
+        let mut off: u64 = 0;
+        let mut buf = vec![0u8; CHUNK as usize];
+        while off < region.len() {
+            let n = region.len().saturating_sub(off).min(CHUNK) as usize;
+            region
+                .read_at(off, &mut buf[..n])
+                .map_err(std::io::Error::other)?;
+            file.write_all(&buf[..n])?;
+            off += n as u64;
+        }
+        return Ok(true);
+    }
+    // Owned bytes: bounded by expansion limits at capture time; single
+    // write is fine (they already exist in memory).
+    if let Some(bytes) = engine.cached_bytes(&a.hash) {
+        std::fs::write(dest, bytes)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn child_label_name(a: &ctf_tools::artifact::Artifact) -> Option<String> {

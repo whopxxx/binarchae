@@ -51,7 +51,7 @@ decompression (not after):
 - `max_archive_entries` bounds entry-count inflation.
 - `max_depth` and `max_artifacts` bound graph growth from nested
   recursion (zip → gzip → zip → ...).
-- M3 additions bound format-specific walks: `max_records` (PCAP
+- Format-specific walks are bounded: `max_records` (PCAP
   packets, minidump streams, SQLite rows), `max_partitions` (GPT/MBR),
   `max_streams`, `max_reconstructed_bytes` (fragmented FAT chains),
   `max_sqlite_pages`, `max_registry_cells`, `max_string_candidates`,
@@ -106,7 +106,7 @@ hardening:
   expansion; owned children (decompression output) continue to use the
   run-wide expansion budget.
 
-## Forensics & recovery handlers (M3)
+## Forensics & recovery handlers
 
 The forensics and recovery additions follow the same contract:
 
@@ -135,7 +135,7 @@ The forensics and recovery additions follow the same contract:
   bounded by `max_string_candidates`; string hints are metadata, never
   validated artifacts, and never materialized as files.
 
-## M3 hardening (round 2)
+## Hardening (round 2)
 
 - **FAT**: BPB layout arithmetic is fully checked — reserved + FAT
   sectors + root-directory sectors must fit `total_sectors`; a hostile

@@ -141,6 +141,8 @@ impl Handler for SqliteHandler {
                 metadata: meta,
                 warnings: Vec::new(),
                 entry_name: None,
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             });
             // B7: BLOB values surface as children for recursive scanning.
             for (vi, v) in row.values.iter().enumerate() {
@@ -163,6 +165,8 @@ impl Handler for SqliteHandler {
                             metadata: BTreeMap::new(),
                             warnings: Vec::new(),
                             entry_name: None,
+                            confidence: Confidence::Validated,
+                            evidence: vec!["structurally decoded by parent handler".to_string()],
                         });
                     }
                 }
@@ -227,6 +231,8 @@ impl Handler for SqliteHandler {
                     metadata: meta,
                     warnings: Vec::new(),
                     entry_name: None,
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 });
                 // B7: BLOB values surface as children so the recursive
                 // engine can scan their bytes (a PNG in a BLOB becomes a
@@ -251,7 +257,9 @@ impl Handler for SqliteHandler {
                                 metadata: BTreeMap::new(),
                                 warnings: Vec::new(),
                                 entry_name: None,
-                            });
+                            confidence: Confidence::Validated,
+                                evidence: vec!["structurally decoded by parent handler".to_string()],
+                                });
                         }
                     }
                 }
@@ -293,6 +301,7 @@ impl Handler for SqliteHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

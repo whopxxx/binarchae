@@ -49,6 +49,20 @@ pub struct EngineLimits {
     pub max_string_candidates: usize,
     /// M3/A2: maximum filesystem entries per filesystem.
     pub max_fs_entries: usize,
+    /// #7: password candidates for encrypted containers (7z/RAR/ZIP).
+    /// Users supply them via CLI `--password` (repeatable); handlers
+    /// try each candidate against password-protected entries and
+    /// surface the working one as artifact metadata.
+    pub passwords: Vec<String>,
+    /// FINAL-B4: maximum password attempts per encrypted artifact
+    /// across the shared candidate queue (CLI + auto-discovered).
+    /// Bounds the cost of trial decryption against untrusted data.
+    pub max_password_attempts: usize,
+    /// FINAL-R4: container entry filenames reported by handlers during
+    /// this run (ZIP central directory, 7z/RAR member tables). The
+    /// engine harvests password candidates from them with
+    /// PasswordSource::Filename provenance.
+    pub entry_names: Vec<String>,
 }
 
 impl Default for EngineLimits {
@@ -68,6 +82,9 @@ impl Default for EngineLimits {
             max_registry_cells: 1_000_000,
             max_string_candidates: 4_096,
             max_fs_entries: 65_536,
+            passwords: Vec::new(),
+            max_password_attempts: 32,
+            entry_names: Vec::new(),
         }
     }
 }
@@ -117,6 +134,11 @@ pub struct ArtifactDraft {
     pub errors: Vec<String>,
     /// Child artifacts decompressed/extracted by this handler.
     pub children: Vec<ChildDraft>,
+    /// FINAL-R4: container entry filenames seen by the handler (ZIP
+    /// central directory, 7z/RAR member tables). The engine harvests
+    /// password candidates from them with PasswordSource::Filename
+    /// provenance.
+    pub entry_names: Vec<String>,
 }
 
 /// Content of a handler-produced child. Firmware containers (uImage,
@@ -146,6 +168,72 @@ pub struct ChildDraft {
     pub warnings: Vec<String>,
     /// Name if extracted from an archive (used by the extraction layer).
     pub entry_name: Option<String>,
+    /// FINAL-B7: the handler's honest claim about these bytes. A
+    /// handler that RECOVERED (rather than structurally decoded) the
+    /// content must say so — the engine no longer stamps every child
+    /// as Validated on the handler's behalf.
+    pub confidence: Confidence,
+    /// Structural facts backing the confidence claim.
+    pub evidence: Vec<String>,
+}
+
+impl ChildDraft {
+    /// Convenience constructor: structurally decoded child. Handlers
+    /// that recovered damaged content should override `confidence`
+    /// afterwards (or build the struct directly).
+    #[allow(clippy::too_many_arguments)]
+    pub fn decoded(
+        relation: RelationKind,
+        label: String,
+        format_hint: &'static str,
+        content: ChildContent,
+        size: u64,
+        metadata: BTreeMap<String, String>,
+        warnings: Vec<String>,
+        entry_name: Option<String>,
+    ) -> Self {
+        ChildDraft {
+            relation,
+            label,
+            format_hint,
+            content,
+            size,
+            metadata,
+            warnings,
+            entry_name,
+            confidence: Confidence::Validated,
+            evidence: vec!["structurally decoded by parent handler".to_string()],
+        }
+    }
+
+    /// Convenience constructor: RECOVERED bytes (salvaged from damaged
+    /// input — deleted records, heuristic carving). Honest by default.
+    #[allow(clippy::too_many_arguments)]
+    pub fn recovered(
+        relation: RelationKind,
+        label: String,
+        format_hint: &'static str,
+        content: ChildContent,
+        size: u64,
+        metadata: BTreeMap<String, String>,
+        warnings: Vec<String>,
+        entry_name: Option<String>,
+    ) -> Self {
+        ChildDraft {
+            confidence: Confidence::Recovered,
+            evidence: vec!["bytes recovered from damaged/erased source".to_string()],
+            ..ChildDraft::decoded(
+                relation,
+                label,
+                format_hint,
+                content,
+                size,
+                metadata,
+                warnings,
+                entry_name,
+            )
+        }
+    }
 }
 
 impl ChildContent {
@@ -211,6 +299,7 @@ pub fn builtin_handlers() -> Vec<Box<dyn Handler>> {
         Box::new(handlers::compression::Bzip2Handler),
         Box::new(handlers::compression::ZstdHandler),
         Box::new(handlers::compression::Lz4Handler),
+        Box::new(handlers::compression::LzmaAloneHandler),
         Box::new(handlers::archives::ArHandler),
         Box::new(handlers::archives::DebHandler),
         Box::new(handlers::archives::CabHandler),
@@ -232,12 +321,22 @@ pub fn builtin_handlers() -> Vec<Box<dyn Handler>> {
         Box::new(handlers::disk::GptHandler),
         Box::new(handlers::disk::MbrHandler),
         Box::new(handlers::fat::FatHandler),
+        Box::new(handlers::exfat::ExfatHandler),
         Box::new(handlers::filesystems::SquashfsHandler),
         Box::new(handlers::filesystems::Iso9660Handler),
+        Box::new(handlers::filesystems::Jffs2Handler),
+        Box::new(handlers::ext::ExtHandler),
         Box::new(handlers::filesystems::ExtHandler),
+        Box::new(handlers::ntfs::NtfsHandler),
         Box::new(handlers::filesystems::NtfsHandler),
-        Box::new(handlers::filesystems::UbiHandler),
+        Box::new(handlers::filesystems::UbiVolumeHandler),
+        Box::new(handlers::filesystems::UbifsHandler),
+        Box::new(handlers::filesystems::Yaffs2Handler),
+        Box::new(handlers::romfs::RomfsHandler),
+        Box::new(handlers::cramfs::CramfsHandler),
         Box::new(handlers::firmware::DtbHandler),
+        Box::new(handlers::firmware::AndroidSparseHandler),
+        Box::new(handlers::firmware::Bcm63xxTagHandler),
         Box::new(handlers::firmware::AndroidBootHandler),
         Box::new(handlers::firmware::TrxHandler),
         Box::new(handlers::firmware::UefiFvHandler),
@@ -246,6 +345,7 @@ pub fn builtin_handlers() -> Vec<Box<dyn Handler>> {
         Box::new(handlers::forensics::PcapHandler),
         Box::new(handlers::forensics::PcapngHandler),
         Box::new(handlers::forensics::MinidumpHandler),
+        Box::new(handlers::forensics::Pagedu64Handler),
         Box::new(handlers::cpio::CpioHandler),
         Box::new(handlers::tar::TarHandler),
         Box::new(handlers::pdf::PdfHandler),
@@ -277,10 +377,19 @@ pub struct RecursiveEngine {
     /// exactly once, even when the region is validated multiple times
     /// (root pass, then trailing-region pass) or its draft is deferred.
     spends_by_region: std::collections::HashMap<String, u64>,
+    /// FINAL-B4: shared password-candidate vault. CLI candidates are
+    /// seeded first; handlers/engine harvest further candidates from
+    /// every scanned region (comments, strings, filenames) with
+    /// provenance. One deterministic attempt queue serves all handlers.
+    pub password_vault: crate::passwords::PasswordVault,
 }
 
 impl RecursiveEngine {
     pub fn new(limits: EngineLimits) -> Self {
+        let mut password_vault = crate::passwords::PasswordVault::new();
+        // FINAL-B4: operator-supplied candidates keep highest priority —
+        // they are seeded first and the queue is order-preserving.
+        password_vault.seed_from_cli(&limits.passwords);
         RecursiveEngine {
             limits,
             handlers: builtin_handlers(),
@@ -289,6 +398,7 @@ impl RecursiveEngine {
             byte_cache: std::collections::HashMap::new(),
             region_cache: std::collections::HashMap::new(),
             spends_by_region: std::collections::HashMap::new(),
+            password_vault,
         }
     }
 
@@ -320,7 +430,7 @@ impl RecursiveEngine {
         let mut graph = ArtifactGraph::new();
         let mut budget = Budget::default();
         let root_id = self.register_root_stub(&mut graph, src);
-        self.scan_region(src, root_id, 0, recurse, &mut graph, &mut budget);
+        self.scan_region(src, root_id, 0, recurse, &mut graph, &mut budget, 0);
         graph
     }
 
@@ -352,6 +462,7 @@ impl RecursiveEngine {
     /// Scan one region of the source with all handlers, register results,
     /// and recurse into children. Never panics on malformed candidates:
     /// every handler call is error-isolated.
+    #[allow(clippy::too_many_arguments)]
     fn scan_region(
         &mut self,
         src: &ByteSource,
@@ -360,6 +471,9 @@ impl RecursiveEngine {
         recurse: bool,
         graph: &mut ArtifactGraph,
         budget: &mut Budget,
+        // `region_start`: absolute offset of this region within the
+        // ROOT source (0 at root; > 0 for nested region scans).
+        region_start: u64,
     ) {
         if depth > self.limits.max_depth {
             if let Some(p) = graph.get_mut(parent_id) {
@@ -373,6 +487,39 @@ impl RecursiveEngine {
         if graph.len() >= self.limits.max_artifacts {
             return;
         }
+
+        // FINAL-B4: harvest password candidates from this region into
+        // the shared vault (comments, strings). CLI candidates were
+        // seeded first and keep queue priority. Dedup + caps keep this
+        // deterministic and bounded regardless of region content.
+        let harvested = crate::passwords::harvest_from_region(src, &self.limits);
+        self.password_vault.merge(harvested);
+
+        // FINAL-S2: entry-filename candidates merge AFTER the region
+        // scan loop below accepts drafts (accepted drafts carry
+        // `entry_names`). Deferred there: filenames only exist once a
+        // container handler parsed its directory.
+
+        // Effective limits for this region's handler calls: the shared
+        // vault queue is exposed through `passwords` so every encrypted-
+        // container handler (ZIP / 7z / RAR) sees ONE deterministic,
+        // bounded candidate queue without per-handler discovery.
+        let mut effective_limits = self.limits.clone();
+        effective_limits.passwords = self
+            .password_vault
+            .candidates()
+            .iter()
+            .take(self.limits.max_password_attempts)
+            .map(|c| c.password.clone())
+            .collect();
+        // Provenance lookup for accepted drafts (built before the
+        // `spends_by_region` borrow so it can be read inside the loop).
+        let password_sources: std::collections::HashMap<String, &'static str> = self
+            .password_vault
+            .candidates()
+            .iter()
+            .map(|c| (c.password.clone(), c.source.as_str()))
+            .collect();
 
         // Collect drafts from every handler; handler errors are isolated.
         // R1 (transactional accounting): each candidate is validated with
@@ -402,9 +549,9 @@ impl RecursiveEngine {
                 //     expansion is billed exactly once, even when a draft
                 //     is deferred to a trailing region and re-validated).
                 let mut shadow = Budget::default();
-                match handler.validate(src, candidate, &self.limits, &mut shadow) {
+                match handler.validate(src, candidate, &effective_limits, &mut shadow) {
                     Ok(output) => {
-                        for draft in output.artifacts {
+                        for mut draft in output.artifacts {
                             // Commit against the run-wide budget under the
                             // real limits; regions already billed commit 0.
                             // G1: when the run-wide commit FAILS, the draft
@@ -417,6 +564,20 @@ impl RecursiveEngine {
                             let already_billed = region_hash
                                 .as_ref()
                                 .is_some_and(|h| spends_by_region.contains_key(h));
+                            // FINAL-B4: enrich any working-password
+                            // metadata with vault provenance (where the
+                            // candidate came from). Handlers that already
+                            // recorded `password_source` are left alone.
+                            if let Some(p) = draft.metadata.get("password").cloned() {
+                                if !draft.metadata.contains_key("password_source") {
+                                    if let Some(s) = password_sources.get(&p) {
+                                        let source = (*s).to_string();
+                                        draft
+                                            .metadata
+                                            .insert("password_source".to_string(), source);
+                                    }
+                                }
+                            }
                             if already_billed {
                                 // One logical expansion per region: no new
                                 // charge. The draft's children still get
@@ -448,6 +609,115 @@ impl RecursiveEngine {
             }
         }
 
+        // FINAL-S2: entry filenames from accepted drafts feed the shared
+        // vault with `Filename` provenance. Merged AFTER the candidate
+        // loop so a candidate derived from this container's own entries
+        // can still serve any LATER encrypted sibling/handler in this
+        // run; the vault dedups and caps attempts. Clones are bounded:
+        // entry_names come from parsed directory listings that handlers
+        // already capped.
+        let names: Vec<String> = drafts
+            .iter()
+            .flat_map(|d| d.entry_names.iter().cloned())
+            .take(1024)
+            .collect();
+        if !names.is_empty() {
+            let had = self.password_vault.candidates().len();
+            let harvested_names = crate::passwords::harvest_from_names(&names);
+            self.password_vault.merge(harvested_names);
+            if self.password_vault.candidates().len() > had {
+                // New filename-derived candidates exist. Re-validate the
+                // encrypted drafts of THIS region that failed without a
+                // working password (chicken-and-egg: the container's own
+                // entry names only exist after its first parse). Bounded
+                // by the same shadow-budget accounting as the main loop.
+                for handler in &self.handlers {
+                    for candidate in handler.find_candidates(src) {
+                        // Only re-run candidates that produced a failed
+                        // encrypted draft at this offset. FINAL-T2a: the
+                        // encrypted marker differs per handler (ZIP:
+                        // `encrypted=true`; 7z/RAR:
+                        // `encrypted_entries=yes`) — recognize both.
+                        let retry_worthy = drafts.iter().any(|d| {
+                            d.offset == candidate.offset
+                                && (d.metadata.get("encrypted").map(String::as_str) == Some("true")
+                                    || d.metadata.get("encrypted_entries").map(String::as_str)
+                                        == Some("yes"))
+                                && !d.metadata.contains_key("password")
+                        });
+                        if !retry_worthy {
+                            continue;
+                        }
+                        let mut refreshed = effective_limits.clone();
+                        refreshed.passwords = self
+                            .password_vault
+                            .candidates()
+                            .iter()
+                            .take(self.limits.max_password_attempts)
+                            .map(|c| c.password.clone())
+                            .collect();
+                        let mut shadow = Budget::default();
+                        if let Ok(output) =
+                            handler.validate(src, candidate, &refreshed, &mut shadow)
+                        {
+                            for mut redraft in output.artifacts {
+                                // Replace the failed draft in place.
+                                if let Some(slot) = drafts.iter_mut().find(|d| {
+                                    d.offset == redraft.offset
+                                        && d.format == redraft.format
+                                        && !d.metadata.contains_key("password")
+                                }) {
+                                    // FINAL-T2b: one logical expansion per
+                                    // region, also across retries. Bill only
+                                    // the DELTA over what this region's
+                                    // first parse already spent.
+                                    let region_hash = src
+                                        .slice(redraft.offset, redraft.size)
+                                        .map(|r| r.hash_all())
+                                        .ok();
+                                    let already = region_hash
+                                        .as_ref()
+                                        .and_then(|h| spends_by_region.get(h))
+                                        .copied()
+                                        .unwrap_or(0);
+                                    let spend = shadow.expanded_bytes.saturating_sub(already);
+                                    if spend > 0 && !budget.charge(&self.limits, spend) {
+                                        continue;
+                                    }
+                                    if let Some(h) = region_hash {
+                                        spends_by_region
+                                            .insert(h, shadow.expanded_bytes.max(already));
+                                    }
+                                    redraft.warnings.push(
+                                        "decrypted after filename-derived password                                          candidates were harvested"
+                                            .to_string(),
+                                    );
+                                    // Provenance enrichment (same as the
+                                    // main loop): name the vault source.
+                                    if let Some(p) = redraft.metadata.get("password").cloned() {
+                                        if !redraft.metadata.contains_key("password_source") {
+                                            if let Some(c) = self
+                                                .password_vault
+                                                .candidates()
+                                                .iter()
+                                                .find(|c| c.password == p)
+                                            {
+                                                redraft.metadata.insert(
+                                                    "password_source".to_string(),
+                                                    c.source.as_str().to_string(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    *slot = redraft;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Generic carving fallback only when structural handlers found
         // nothing in this region.
         if drafts.is_empty() {
@@ -469,15 +739,24 @@ impl RecursiveEngine {
         // which keeps provenance hierarchical (PNG -> trailing -> ZIP).
         drafts.sort_by_key(|d| (d.offset, u64::MAX - d.size));
 
-        // Leading data before the first structure.
+        // Leading data before the first structure. At the root level
+        // (region_start == 0) this is genuine leading data; inside a
+        // nested region (trailing data scan etc.) unexplained bytes
+        // before the first structure sit BETWEEN earlier structures and
+        // this one — an INTERIOR GAP (#7 §9), labeled as such.
         if let Some(first) = drafts.first() {
             if recurse && first.offset > 0 && depth < self.limits.max_depth {
+                let relation = if region_start == 0 {
+                    RelationKind::LeadingData
+                } else {
+                    RelationKind::InteriorGap
+                };
                 self.register_unexplained(
                     src,
                     parent_id,
                     0,
                     first.offset,
-                    RelationKind::LeadingData,
+                    relation,
                     depth,
                     recurse,
                     graph,
@@ -488,6 +767,9 @@ impl RecursiveEngine {
 
         let mut first_end: Option<u64> = None;
         let mut first_artifact: Option<ArtifactId> = None;
+        // #7 §9: registered validated structures this level, for overlap
+        // edge emission (distinct VALIDATED drafts sharing bytes).
+        let mut placed: Vec<(u64, u64, ArtifactId)> = Vec::new();
 
         for draft in drafts {
             if graph.len() >= self.limits.max_artifacts {
@@ -501,6 +783,26 @@ impl RecursiveEngine {
             if let Some(end) = first_end {
                 if draft.offset >= end {
                     break;
+                }
+            }
+
+            // #7 §9: unexplained INTERIOR gap between the end of the
+            // previous validated structure and this one becomes a
+            // first-class artifact (parented to the region owner) when
+            // meaningful (> 0 bytes; tiny alignment gaps are noise).
+            if let (Some(prev_end), Some(prev_id)) = (first_end, first_artifact) {
+                if draft.offset > prev_end && recurse && depth < self.limits.max_depth {
+                    self.register_unexplained(
+                        src,
+                        prev_id,
+                        prev_end,
+                        draft.offset,
+                        RelationKind::InteriorGap,
+                        depth,
+                        recurse,
+                        graph,
+                        budget,
+                    );
                 }
             }
 
@@ -540,6 +842,27 @@ impl RecursiveEngine {
             let child_id = graph.push_child(parent_id, RelationKind::Contains, artifact);
 
             let end = draft.offset + draft.size;
+            // §9: an overlapping VALIDATED artifact coexists via an
+            // Overlap edge to the structure it overlaps (polyglots:
+            // PNG+ZIP hybrid whose ZIP starts inside the PNG chunk
+            // stream). Distinct drafts only — the dedup contract
+            // already suppresses byte-identical re-registrations.
+            if draft.confidence == Confidence::Validated {
+                for (po, pend, pid) in &placed {
+                    let overlap = draft.offset.max(*po) < end.min(*pend);
+                    if overlap {
+                        if graph.len() < self.limits.max_artifacts {
+                            graph.edges.push(crate::artifact::GraphEdge {
+                                parent: child_id,
+                                child: *pid,
+                                relation: RelationKind::Overlap,
+                            });
+                        }
+                        break;
+                    }
+                }
+                placed.push((draft.offset, end, child_id));
+            }
             first_end = Some(match first_end {
                 Some(e) => e.max(end),
                 None => end,
@@ -606,8 +929,9 @@ impl RecursiveEngine {
                     offset: 0,
                     size: child.size,
                     hash: chash,
-                    confidence: Confidence::Validated,
-                    evidence: Evidence::facts(["produced by parent handler"]),
+                    // FINAL-B7: honor the handler's confidence claim.
+                    confidence: child.confidence,
+                    evidence: Evidence::facts(child.evidence.clone()),
                     extraction: ExtractionStatus::InMemory,
                     metadata: child.metadata,
                     warnings: child.warnings,
@@ -630,11 +954,12 @@ impl RecursiveEngine {
                     // in-memory source.
                     match child.content {
                         ChildContent::Source(src) => {
-                            self.scan_region(&src, cid, depth + 1, recurse, graph, budget);
+                            let cs = src.root_offset();
+                            self.scan_region(&src, cid, depth + 1, recurse, graph, budget, cs);
                         }
                         ChildContent::Owned(bytes) => {
                             let region = ByteSource::from_vec(bytes);
-                            self.scan_region(&region, cid, depth + 1, recurse, graph, budget);
+                            self.scan_region(&region, cid, depth + 1, recurse, graph, budget, 0);
                         }
                     }
                 }
@@ -648,7 +973,8 @@ impl RecursiveEngine {
             // nested artifacts layer after layer.
             if recurse && !duplicate && depth < self.limits.max_depth {
                 if let Ok(r) = region {
-                    self.scan_region(&r, child_id, depth + 1, recurse, graph, budget);
+                    let cs = r.root_offset();
+                    self.scan_region(&r, child_id, depth + 1, recurse, graph, budget, cs);
                 }
             }
         }
@@ -709,6 +1035,7 @@ impl RecursiveEngine {
                 match relation {
                     RelationKind::TrailingData => "trailing data",
                     RelationKind::LeadingData => "leading data",
+                    RelationKind::InteriorGap => "interior gap",
                     _ => "unexplained",
                 },
                 end - start,
@@ -728,7 +1055,7 @@ impl RecursiveEngine {
         };
         let id = graph.push_child(parent_id, relation, artifact);
         if depth < self.limits.max_depth {
-            self.scan_region(&region, id, depth + 1, recurse, graph, budget);
+            self.scan_region(&region, id, depth + 1, recurse, graph, budget, start);
         }
     }
 }

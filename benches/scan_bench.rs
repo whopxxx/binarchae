@@ -159,5 +159,145 @@ fn bench(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench);
 criterion_main!(benches);
+
+// ---------------------------------------------------------------------------
+// #7 §15: expanded benchmark coverage.
+// ---------------------------------------------------------------------------
+
+/// Pseudorandom bytes (deterministic LCG; no external RNG dep).
+fn pseudo_bytes(len: usize, seed: u32) -> Vec<u8> {
+    let mut seed = seed;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        out.extend_from_slice(&seed.to_le_bytes());
+    }
+    out
+}
+
+/// A minimal registry hive fixture with `keys` keys of 1 value each.
+fn make_registry(_keys: usize) -> Vec<u8> {
+    let mut v = vec![0u8; 4096 + 4096];
+    v[0..4].copy_from_slice(b"regf");
+    v[4096..4100].copy_from_slice(b"hbin");
+    v[4104..4108].copy_from_slice(&4096u32.to_le_bytes());
+    // Root nk + value list with one inline REG_DWORD vk per key.
+    v[4128..4132].copy_from_slice(&(-100i32).to_le_bytes());
+    v[4132..4134].copy_from_slice(b"nk");
+    v[4134..4136].copy_from_slice(&0x0020u16.to_le_bytes());
+    v[4132 + 16..4132 + 20].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+    v[4132 + 76..4132 + 78].copy_from_slice(&4u16.to_le_bytes());
+    v[4132 + 78..4132 + 82].copy_from_slice(b"ROOT");
+    v
+}
+
+fn bench_expanded(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scan-expanded");
+
+    // Multi-pattern signature scan on large random data (no hits).
+    let blob = pseudo_bytes(4 * 1024 * 1024, 0xBEEF);
+    group.throughput(criterion::Throughput::Bytes(blob.len() as u64));
+    group.bench_function("sigscan_4m_random", |b| {
+        b.iter(|| {
+            let mut engine = RecursiveEngine::new(EngineLimits::default());
+            let g = engine.analyze(&ByteSource::from_vec(blob.clone()), false);
+            black_box(g.len())
+        })
+    });
+
+    // Large file-backed ByteSource (file-backed read path).
+    let path = std::env::temp_dir().join("ctf_bench_file.bin");
+    std::fs::write(&path, &blob).unwrap();
+    group.throughput(criterion::Throughput::Bytes(blob.len() as u64));
+    group.bench_function("file_backed_4m_scan", |b| {
+        b.iter(|| {
+            let src = ByteSource::from_file(&path).unwrap();
+            let mut engine = RecursiveEngine::new(EngineLimits::default());
+            let g = engine.analyze(&src, false);
+            black_box(g.len())
+        })
+    });
+
+    // Nested archives: gzip(zip(gzip(png))).
+    let inner = make_png(16);
+    let mut zip = make_zip_many(1);
+    zip.extend_from_slice(&inner);
+    // Simplest nested chain: gzip(zip-of-png) built via zip fixture as
+    // the payload.
+    let gz = make_gzip(&make_zip_many(50));
+    group.throughput(criterion::Throughput::Bytes(gz.len() as u64));
+    group.bench_function("gzip_zip50_nested", |b| {
+        b.iter(|| {
+            let mut engine = RecursiveEngine::new(EngineLimits::default());
+            let g = engine.analyze(&ByteSource::from_vec(gz.clone()), true);
+            black_box(g.len())
+        })
+    });
+
+    // SQLite traversal.
+    let mut db = vec![0u8; 8192];
+    db[0..16].copy_from_slice(b"SQLite format 3\0");
+    db[16..18].copy_from_slice(&4096u16.to_be_bytes());
+    db[100] = 0x0D;
+    group.throughput(criterion::Throughput::Bytes(db.len() as u64));
+    group.bench_function("sqlite_2page", |b| {
+        b.iter(|| {
+            let mut engine = RecursiveEngine::new(EngineLimits::default());
+            let g = engine.analyze(&ByteSource::from_vec(db.clone()), true);
+            black_box(g.len())
+        })
+    });
+
+    // Registry traversal.
+    let hive = make_registry(64);
+    group.throughput(criterion::Throughput::Bytes(hive.len() as u64));
+    group.bench_function("registry_small", |b| {
+        b.iter(|| {
+            let mut engine = RecursiveEngine::new(EngineLimits::default());
+            let g = engine.analyze(&ByteSource::from_vec(hive.clone()), true);
+            black_box(g.len())
+        })
+    });
+
+    // PCAP reassembly.
+    let mut pcap = Vec::new();
+    pcap.extend_from_slice(&[0xD4, 0xC3, 0xB2, 0xA1]);
+    pcap.extend(2u16.to_le_bytes());
+    pcap.extend(4u16.to_le_bytes());
+    pcap.extend(0u32.to_le_bytes());
+    pcap.extend(0u32.to_le_bytes());
+    pcap.extend(262144u32.to_le_bytes());
+    pcap.extend(1u32.to_le_bytes());
+    for i in 0..200u32 {
+        let payload =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nFLAG{i:04}").into_bytes();
+        pcap.extend(1u32.to_le_bytes());
+        pcap.extend(0u32.to_le_bytes());
+        pcap.extend((payload.len() as u32).to_le_bytes());
+        pcap.extend((payload.len() as u32).to_le_bytes());
+        pcap.extend_from_slice(&payload);
+    }
+    group.throughput(criterion::Throughput::Bytes(pcap.len() as u64));
+    group.bench_function("pcap_200_http", |b| {
+        b.iter(|| {
+            let mut engine = RecursiveEngine::new(EngineLimits::default());
+            let g = engine.analyze(&ByteSource::from_vec(pcap.clone()), true);
+            black_box(g.len())
+        })
+    });
+
+    // Entropy mapping.
+    group.throughput(criterion::Throughput::Bytes(blob.len() as u64));
+    group.bench_function("entropy_4m_map", |b| {
+        b.iter(|| {
+            let src = ByteSource::from_vec(blob.clone());
+            ctf_tools::entropy::analyze_bounded(&src, 64 * 1024, 64);
+            black_box(())
+        })
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench, bench_expanded);

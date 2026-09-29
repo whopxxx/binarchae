@@ -140,6 +140,7 @@ impl Handler for PngHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }

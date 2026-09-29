@@ -227,7 +227,10 @@ impl Handler for GzipHandler {
                     metadata: BTreeMap::new(),
                     warnings: Vec::new(),
                     entry_name: None,
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
                 }],
+                entry_names: Vec::new(),
             }],
         })
     }

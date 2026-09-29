@@ -13,6 +13,7 @@ pub mod error;
 pub mod extract;
 pub mod handlers;
 pub mod output;
+pub mod passwords;
 pub mod report;
 
 pub use artifact::{Artifact, ArtifactGraph, ArtifactId, Confidence, Evidence, RelationKind};

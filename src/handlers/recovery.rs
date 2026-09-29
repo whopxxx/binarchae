@@ -158,6 +158,17 @@ impl Handler for ZipSalvageHandler {
                     metadata: BTreeMap::new(),
                     warnings: Vec::new(),
                     entry_name: Some(name.clone()),
+                    // FINAL-B7: salvaged entries are RECOVERED bytes,
+                    // not structurally validated ones.
+                    confidence: Confidence::Recovered,
+                    evidence: vec![
+                        "salvaged from a truncated/damaged ZIP by header carving".to_string(),
+                        if complete {
+                            "entry fully within salvageable region".to_string()
+                        } else {
+                            "entry partial: archive truncated mid-payload".to_string()
+                        },
+                    ],
                 });
             }
 
@@ -220,6 +231,7 @@ impl Handler for ZipSalvageHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

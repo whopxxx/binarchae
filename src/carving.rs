@@ -198,6 +198,7 @@ pub fn carve_with_rules(
                 warnings: vec!["recovered by generic carving".to_string()],
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             });
         }
     }

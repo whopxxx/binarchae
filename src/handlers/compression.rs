@@ -74,7 +74,10 @@ fn decompressed_output(
                 metadata: BTreeMap::new(),
                 warnings: Vec::new(),
                 entry_name: None,
+                confidence: Confidence::Validated,
+                evidence: vec!["structurally decoded by parent handler".to_string()],
             }],
+            entry_names: Vec::new(),
         }],
     }
 }
@@ -867,6 +870,206 @@ impl Handler for BrotliHandler {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LZMA alone (.lzma)
+// ---------------------------------------------------------------------------
+
+/// LZMA-alone (.lzma) stream handler. Layout verified against the
+/// lzma-rust crate's `LZMAReader::new_mem_limit` and the LZMA SDK
+/// (lzip/lzmaalone format docs):
+/// - props byte @0: (pb*5 + lp)*9 + lc, valid range 0..=224.
+/// - dict size @1..5: u32 LE, clamped to >= 4096 internally.
+/// - uncompressed size @5..13: u64 LE; all-ones (0xFFFF_FFFF_FFFF_FFFF)
+///   means "unknown" (end-of-stream marker present).
+/// - payload @13: raw LZMA1 stream.
+pub struct LzmaAloneHandler;
+
+const LZMA_ALONE_HEADER: u64 = 13;
+const LZMA_PROPS_MAX: u8 = 224;
+const LZMA_SIZE_UNKNOWN: u64 = u64::MAX;
+
+impl Handler for LzmaAloneHandler {
+    fn format(&self) -> &'static str {
+        "lzma-alone"
+    }
+
+    fn find_candidates(&self, src: &ByteSource) -> Vec<Candidate> {
+        // No magic. Find candidates by header plausibility: props byte
+        // 0..=224, dict size a power of two in [4 KiB, 1.5 GiB], and
+        // either a known size or the all-ones sentinel. Candidate at
+        // offset 0 and at byte-scan positions is too broad, so probe
+        // 13-byte headers preceded by anything only when the whole
+        // source is consistent (typical .lzma files start at 0).
+        if src.len() < LZMA_ALONE_HEADER {
+            return Vec::new();
+        }
+        let mut props = [0u8; 1];
+        let mut dict = [0u8; 4];
+        let mut usize_ = [0u8; 8];
+        if src.read_at(0, &mut props).is_err() {
+            return Vec::new();
+        }
+        src.read_at(1, &mut dict).ok();
+        src.read_at(5, &mut usize_).ok();
+        let props = props[0];
+        let dict_size = u32::from_le_bytes(dict);
+        let uncomp = u64::from_le_bytes(usize_);
+        let props_ok = props <= LZMA_PROPS_MAX;
+        let dict_ok = dict_size.is_power_of_two() && (4096..=0x6000_0000).contains(&dict_size);
+        let size_ok = uncomp == LZMA_SIZE_UNKNOWN || uncomp <= 1 << 33;
+        if props_ok && dict_ok && size_ok {
+            vec![Candidate { offset: 0 }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn validate(
+        &self,
+        src: &ByteSource,
+        candidate: Candidate,
+        limits: &crate::engine::EngineLimits,
+        budget: &mut Budget,
+    ) -> Result<HandlerOutput> {
+        let base = candidate.offset;
+        if base + LZMA_ALONE_HEADER > src.len() {
+            return Err(Error::Validation {
+                format: "lzma-alone",
+                reason: "header truncated".into(),
+            });
+        }
+        let mut hdr = [0u8; 13];
+        src.read_at(base, &mut hdr)?;
+        let props = hdr[0];
+        if props > LZMA_PROPS_MAX {
+            return Err(Error::Validation {
+                format: "lzma-alone",
+                reason: format!("invalid props byte {props}"),
+            });
+        }
+        let dict_size = u32::from_le_bytes(hdr[1..5].try_into().unwrap());
+        let uncomp_size = u64::from_le_bytes(hdr[5..13].try_into().unwrap());
+        // FINAL-R1b: the decoder allocates the declared dictionary up
+        // front. Enforce the same plausibility gate as find_candidates
+        // (power of two, [4 KiB, 1.5 GiB]) BEFORE construction — a
+        // fuzz-found input with dict_size 0xFFFF0000 and the unknown-
+        // size sentinel previously caused a ~4 GiB malloc because
+        // validate passed `u32::MAX` (no limit) as the mem limit.
+        if !dict_size.is_power_of_two() || !(4096..=0x6000_0000).contains(&dict_size) {
+            return Err(Error::Validation {
+                format: "lzma-alone",
+                reason: format!("implausible dict size {dict_size:#x}"),
+            });
+        }
+        let size_known = uncomp_size != LZMA_SIZE_UNKNOWN;
+        if size_known && uncomp_size > limits.max_child_size {
+            return Err(Error::Validation {
+                format: "lzma-alone",
+                reason: format!("declared size {uncomp_size} exceeds max_child_size"),
+            });
+        }
+
+        // Decode via lzma-rust: new_mem_limit parses the 13-byte
+        // .lzma header itself, so hand it the stream from the
+        // candidate offset (not after the header). The mem limit is a
+        // real bound (256 MiB), not "unlimited" — the decoder's own
+        // DICT_SIZE_MAX is u32-range and would happily allocate a
+        // declared 4 GiB dictionary before any output check runs.
+        let data = src.read_all()?;
+        let mut reader = lzma_rust::LZMAReader::new_mem_limit(
+            std::io::Cursor::new(&data[base as usize..]),
+            256 * 1024,
+            None,
+        )
+        .map_err(|e| Error::Validation {
+            format: "lzma-alone",
+            reason: format!("invalid LZMA parameters: {e}"),
+        })?;
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            let n = reader.read(&mut chunk).map_err(|e| Error::Validation {
+                format: "lzma-alone",
+                reason: format!("stream decode failed: {e}"),
+            })?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+            if out.len() as u64 > limits.max_child_size {
+                return Err(Error::Validation {
+                    format: "lzma-alone",
+                    reason: "output exceeds max_child_size".into(),
+                });
+            }
+            if !budget.charge(limits, n as u64) {
+                return Err(Error::LimitExceeded {
+                    limit: "max-total-expanded-bytes",
+                    detail: "lzma-alone output".into(),
+                });
+            }
+        }
+
+        let decoded_size = out.len() as u64;
+        let mut metadata = BTreeMap::new();
+        metadata.insert("props_byte".to_string(), props.to_string());
+        metadata.insert("dict_size".to_string(), dict_size.to_string());
+        metadata.insert(
+            "declared_size".to_string(),
+            if size_known {
+                uncomp_size.to_string()
+            } else {
+                "unknown".to_string()
+            },
+        );
+        metadata.insert("decoded_size".to_string(), decoded_size.to_string());
+
+        let lc = props % 9;
+        let lp = (props / 9) % 5;
+        let pb = props / 45;
+        Ok(HandlerOutput {
+            artifacts: vec![ArtifactDraft {
+                format: "lzma-alone".to_string(),
+                label: format!(
+                    "LZMA-alone stream ({} bytes decoded, lc={lc} lp={lp} pb={pb})",
+                    decoded_size
+                ),
+                offset: base,
+                size: src.len() - base,
+                confidence: Confidence::Validated,
+                evidence: Evidence::facts([
+                    "LZMA-alone header validated (props/dict/size)".to_string(),
+                    format!(
+                        "uncompressed size {}",
+                        if size_known {
+                            uncomp_size.to_string()
+                        } else {
+                            "unknown (end marker)".to_string()
+                        }
+                    ),
+                    format!("decoded {decoded_size} bytes via lzma-rust LZMA1"),
+                ]),
+                metadata,
+                warnings: Vec::new(),
+                errors: Vec::new(),
+                children: vec![ChildDraft {
+                    relation: RelationKind::DecompressedFrom,
+                    label: format!("decompressed payload ({decoded_size} bytes)"),
+                    format_hint: "raw",
+                    content: ChildContent::Owned(out),
+                    size: decoded_size,
+                    metadata: BTreeMap::new(),
+                    warnings: Vec::new(),
+                    entry_name: Some("payload.bin".to_string()),
+                    confidence: Confidence::Validated,
+                    evidence: vec!["structurally decoded by parent handler".to_string()],
+                }],
+                entry_names: Vec::new(),
+            }],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1113,5 +1316,80 @@ mod tests {
         // lz4 block has no magic; exercise the frame path is impossible.
         // This test documents that block data is NOT auto-discovered.
         assert!(Lz4Handler.find_candidates(&src).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod lzma_alone_tests {
+    use super::*;
+    use crate::bytesource::ByteSource;
+    use crate::engine::{Budget, Candidate};
+
+    fn validate_at(h: &dyn Handler, src: &ByteSource, off: u64) -> Result<HandlerOutput> {
+        h.validate(
+            src,
+            Candidate { offset: off },
+            &crate::engine::EngineLimits::default(),
+            &mut Budget::default(),
+        )
+    }
+
+    /// Real .lzma-alone stream from the lzma-rust crate's own doc
+    /// example: props 93, dict 8 MiB, known size 13, "Hello, world!".
+    #[test]
+    fn lzma_alone_known_size_decodes() {
+        // 93, 0, 0, 128, 0 | 13,0,0,0,0,0,0,0 | LZMA1 payload...
+        let doc_stream: [u8; 37] = [
+            93, 0, 0, 128, 0, 255, 255, 255, 255, 255, 255, 255, 255, 0, 36, 25, 73, 152, 111, 22,
+            2, 140, 232, 230, 91, 177, 71, 198, 206, 183, 99, 255, 255, 60, 172, 0, 0,
+        ];
+        // That example has size unknown (all 0xFF) — the doc calls it
+        // with unknown size semantics. Verify decode.
+        let src = ByteSource::from_vec(doc_stream.to_vec());
+        let out = validate_at(&LzmaAloneHandler, &src, 0).expect("lzma-alone decodes");
+        let art = &out.artifacts[0];
+        assert_eq!(art.confidence, Confidence::Validated);
+        assert_eq!(art.children.len(), 1);
+        match &art.children[0].content {
+            ChildContent::Owned(d) => assert_eq!(d, b"Hello, world!"),
+            _ => panic!("payload must decode"),
+        }
+    }
+
+    /// Invalid props byte is rejected, not silently accepted.
+    #[test]
+    fn lzma_alone_bad_props_rejected() {
+        let mut blob = vec![225u8]; // 225 > 224
+        blob.extend_from_slice(&[0, 0, 128, 0]); // dict
+        blob.extend_from_slice(&13u64.to_le_bytes());
+        blob.extend_from_slice(b"junk");
+        let src = ByteSource::from_vec(blob);
+        assert!(validate_at(&LzmaAloneHandler, &src, 0).is_err());
+    }
+
+    /// FINAL-R1b (fuzz-found OOM): dict_size 0xFFFF0000 with the
+    /// unknown-size sentinel must be rejected BEFORE decoder
+    /// construction — the previous code passed an unlimited mem limit
+    /// and the decoder malloc'd the full ~4 GiB dictionary.
+    #[test]
+    fn lzma_alone_hostile_dict_size_rejected() {
+        // props 0, dict 0xFFFF0000 (LE), size sentinel all-FF, no body.
+        let blob: Vec<u8> = std::iter::once(0u8)
+            .chain(0xFFFF_0000u32.to_le_bytes())
+            .chain(0xFFFF_FFFF_FFFF_FFFFu64.to_le_bytes())
+            .chain(std::iter::repeat(0u8).take(5))
+            .collect();
+        let src = ByteSource::from_vec(blob);
+        assert!(
+            validate_at(&LzmaAloneHandler, &src, 0).is_err(),
+            "implausible dict size must fail fast, not allocate"
+        );
+        // A non-power-of-two dict in range is equally rejected.
+        let mut blob2 = vec![93u8];
+        blob2.extend_from_slice(&0x0FFF_0000u32.to_le_bytes());
+        blob2.extend_from_slice(&13u64.to_le_bytes());
+        blob2.extend_from_slice(b"junk");
+        let src2 = ByteSource::from_vec(blob2);
+        assert!(validate_at(&LzmaAloneHandler, &src2, 0).is_err());
     }
 }

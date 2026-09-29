@@ -16,6 +16,9 @@ pub struct Report {
     /// Coarse entropy summary (bounded block count).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub entropy: Vec<EntropyBlock>,
+    /// #7 §10: classified entropy regions (transition-grouped).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub entropy_regions: Vec<crate::entropy::EntropyRegion>,
     /// Non-fatal engine diagnostics.
     pub warnings: Vec<String>,
 }
@@ -27,6 +30,7 @@ impl Report {
             source_size,
             graph,
             entropy: Vec::new(),
+            entropy_regions: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -40,6 +44,48 @@ impl Report {
         serde_json::from_str(text)
             .map_err(|e| crate::error::Error::Decompression(format!("json: {e}")))
     }
+}
+
+impl Report {
+    /// #7 §12.1: JSONL — one JSON record per line, stable IDs and
+    /// provenance. Suitable for very large graphs (stream-processable
+    /// with line-oriented tools); the existing JSON mode is unchanged.
+    pub fn to_jsonl(&self) -> crate::error::Result<String> {
+        use std::fmt::Write;
+        let mut out = String::new();
+        // Header record: run-level info.
+        writeln!(
+            out,
+            "{{\"type\":\"run\",\"source\":{:?},\"source_size\":{}}}",
+            self.source, self.source_size
+        )
+        .map_err(jsonl_err)?;
+        // Artifact records: id/provenance/claims per line.
+        for a in &self.graph.artifacts {
+            let json = serde_json::to_string(a).map_err(json_err)?;
+            writeln!(out, "{{\"type\":\"artifact\",\"artifact\":{}}}", json).map_err(jsonl_err)?;
+        }
+        // Edge records: one provenance edge per line.
+        for e in &self.graph.edges {
+            let json = serde_json::to_string(e).map_err(json_err)?;
+            writeln!(out, "{{\"type\":\"edge\",\"edge\":{}}}", json).map_err(jsonl_err)?;
+        }
+        // Entropy regions (§10) if present.
+        for r in &self.entropy_regions {
+            let json = serde_json::to_string(r).map_err(json_err)?;
+            writeln!(out, "{{\"type\":\"entropy_region\",\"region\":{}}}", json)
+                .map_err(jsonl_err)?;
+        }
+        Ok(out)
+    }
+}
+
+fn jsonl_err(e: std::fmt::Error) -> crate::error::Error {
+    crate::error::Error::Decompression(format!("jsonl: {e}"))
+}
+
+fn json_err(e: serde_json::Error) -> crate::error::Error {
+    crate::error::Error::Decompression(format!("jsonl: {e}"))
 }
 
 #[cfg(test)]
