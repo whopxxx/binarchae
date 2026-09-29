@@ -11,7 +11,7 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let limits = binarchae::engine::EngineLimits {
+    let limits = binwalkx::engine::EngineLimits {
         // Tighter than production defaults so the fuzzer explores deep
         // paths instead of drowning in one huge expansion.
         max_total_expanded_bytes: 1 << 20,
@@ -29,8 +29,8 @@ fuzz_target!(|data: &[u8]| {
         ..Default::default()
     };
     let max_artifacts = limits.max_artifacts;
-    let src = binarchae::bytesource::ByteSource::from_vec(data.to_vec());
-    let mut engine = binarchae::engine::RecursiveEngine::new(limits);
+    let src = binwalkx::bytesource::ByteSource::from_vec(data.to_vec());
+    let mut engine = binwalkx::engine::RecursiveEngine::new(limits);
     // The engine is panic-isolated by contract; a panic here is a bug
     // and libFuzzer records it via the panic hook.
     let graph = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {

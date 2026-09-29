@@ -2,9 +2,9 @@
 //! asserting per-hop provenance (relation kinds + parent chain) on the
 //! artifact graph, not merely artifact existence.
 
-use binarchae::artifact::{Confidence, RelationKind};
-use binarchae::bytesource::ByteSource;
-use binarchae::engine::{EngineLimits, RecursiveEngine};
+use binwalkx::artifact::{Confidence, RelationKind};
+use binwalkx::bytesource::ByteSource;
+use binwalkx::engine::{EngineLimits, RecursiveEngine};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::io::Write;
@@ -80,7 +80,7 @@ fn make_zip(name: &str, content: &[u8]) -> Vec<u8> {
 
 /// Assert the parent chain of `id` matches `expected_formats` root-first.
 fn assert_parent_chain(
-    graph: &binarchae::artifact::ArtifactGraph,
+    graph: &binwalkx::artifact::ArtifactGraph,
     id: u64,
     expected_formats: &[&str],
 ) {
@@ -1280,7 +1280,7 @@ fn b8_recovered_record_chain_confidence() {
             "confidence must be an explicit claim, not a default"
         );
         assert!(
-            matches!(&c.1.evidence, binarchae::artifact::Evidence::Facts(v) if !v.is_empty()),
+            matches!(&c.1.evidence, binwalkx::artifact::Evidence::Facts(v) if !v.is_empty()),
             "evidence must be present"
         );
     }
@@ -2005,7 +2005,7 @@ fn u1_rar_filename_password_retry() {
 
 // ---------- graph helpers ----------
 
-fn has_ancestor(graph: &binarchae::artifact::ArtifactGraph, id: u64, ancestor: u64) -> bool {
+fn has_ancestor(graph: &binwalkx::artifact::ArtifactGraph, id: u64, ancestor: u64) -> bool {
     let mut cur = graph.get(id).and_then(|a| a.parent);
     while let Some(p) = cur {
         if p == ancestor {

@@ -25,8 +25,8 @@ fuzz_target!(|data: &[u8]| {
     if body.len() > 0x9015 {
         body[0x9001..0x9006].copy_from_slice(b"CD001"); // ISO PVD
     }
-    let src = binarchae::bytesource::ByteSource::from_vec(body);
-    let limits = binarchae::engine::EngineLimits {
+    let src = binwalkx::bytesource::ByteSource::from_vec(body);
+    let limits = binwalkx::engine::EngineLimits {
         max_child_size: 64 * 1024,
         max_total_expanded_bytes: 1 << 20,
         max_records: 256,
@@ -34,14 +34,14 @@ fuzz_target!(|data: &[u8]| {
         max_registry_cells: 1024,
         ..Default::default()
     };
-    let mut budget = binarchae::engine::Budget::default();
+    let mut budget = binwalkx::engine::Budget::default();
     const FORMATS: &[&str] = &[
         "fat", "exfat", "ntfs", "ext", "squashfs", "iso9660", "jffs2",
         "ubi", "ubifs", "yaffs2", "romfs", "cramfs",
     ];
-    for handler in binarchae::engine::builtin_handlers() {
+    for handler in binwalkx::engine::builtin_handlers() {
         if FORMATS.contains(&handler.format()) {
-            let c = binarchae::engine::Candidate { offset };
+            let c = binwalkx::engine::Candidate { offset };
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = handler.validate(&src, c, &limits, &mut budget);
             }));

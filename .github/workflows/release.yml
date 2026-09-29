@@ -19,13 +19,13 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: binarchae-linux-x86_64.tar.gz
+            artifact: binwalkx-linux-x86_64.tar.gz
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            artifact: binarchae-linux-x86_64-musl.tar.gz
+            artifact: binwalkx-linux-x86_64-musl.tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact: binarchae-windows-x86_64.zip
+            artifact: binwalkx-windows-x86_64.zip
     steps:
       - uses: actions/checkout@v4
 
@@ -45,7 +45,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/binarchae dist/
+          cp target/${{ matrix.target }}/release/binwalkx dist/
           cp README.md LICENSE-MIT LICENSE-APACHE dist/
           tar -czf ${{ matrix.artifact }} -C dist .
           sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
@@ -55,7 +55,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/binarchae.exe dist/
+          Copy-Item target/${{ matrix.target }}/release/binwalkx.exe dist/
           Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE dist/
           Compress-Archive -Path dist/* -DestinationPath ${{ matrix.artifact }}
           $hash = (Get-FileHash ${{ matrix.artifact }} -Algorithm SHA256).Hash.ToLower()

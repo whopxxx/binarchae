@@ -1,19 +1,19 @@
 [package]
-name = "binarchae"
+name = "binwalkx"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Recursive binary archaeology: analysis, extraction, recovery, and provenance over arbitrary binary data"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/whopxxx/binarchae"
+repository = "https://github.com/whopxxx/binwalkx"
 readme = "README.md"
 
 [lib]
-name = "binarchae"
+name = "binwalkx"
 path = "src/lib.rs"
 
 [[bin]]
-name = "binarchae"
+name = "binwalkx"
 path = "src/main.rs"
 
 [dependencies]

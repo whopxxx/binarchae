@@ -30,20 +30,20 @@ fuzz_target!(|data: &[u8]| {
     if body.len() > 262 {
         body[257..262].copy_from_slice(b"ustar");
     }
-    let src = binarchae::bytesource::ByteSource::from_vec(body);
-    let limits = binarchae::engine::EngineLimits {
+    let src = binwalkx::bytesource::ByteSource::from_vec(body);
+    let limits = binwalkx::engine::EngineLimits {
         max_child_size: 64 * 1024,
         max_total_expanded_bytes: 1 << 20,
         max_records: 256,
         max_archive_entries: 128,
         ..Default::default()
     };
-    let mut budget = binarchae::engine::Budget::default();
+    let mut budget = binwalkx::engine::Budget::default();
     const FORMATS: &[&str] = &["zip", "zip-salvage", "7z", "rar", "tar", "cpio"];
-    for handler in binarchae::engine::builtin_handlers() {
+    for handler in binwalkx::engine::builtin_handlers() {
         if FORMATS.contains(&handler.format()) {
             for off in [0u64, offset] {
-                let c = binarchae::engine::Candidate { offset: off };
+                let c = binwalkx::engine::Candidate { offset: off };
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let _ = handler.validate(&src, c, &limits, &mut budget);
                 }));

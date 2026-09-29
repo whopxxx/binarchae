@@ -2,7 +2,7 @@
 
 ## Overview
 
-binarchae is built around one invariant: **every useful thing discovered from
+binwalkx is built around one invariant: **every useful thing discovered from
 input data is an Artifact, and every parser/extractor exists to discover
 additional artifacts.**
 
@@ -172,7 +172,7 @@ handlers check it before accepting expansion.
 
 ## Extraction layout
 
-`binarchae -e input` writes deterministically:
+`binwalkx -e input` writes deterministically:
 
 ```text
 <input>.extracted/

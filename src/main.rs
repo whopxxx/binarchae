@@ -1,19 +1,19 @@
-//! binarchae CLI: analyze / extract / recurse over binary artifacts.
+//! binwalkx CLI: analyze / extract / recurse over binary artifacts.
 
-use binarchae::artifact::{ExtractionStatus, RelationKind};
-use binarchae::bytesource::ByteSource;
-use binarchae::entropy;
-use binarchae::extract::{dedup_path, safe_join};
-use binarchae::output;
-use binarchae::report::Report;
-use binarchae::{EngineLimits, RecursiveEngine};
+use binwalkx::artifact::{ExtractionStatus, RelationKind};
+use binwalkx::bytesource::ByteSource;
+use binwalkx::entropy;
+use binwalkx::extract::{dedup_path, safe_join};
+use binwalkx::output;
+use binwalkx::report::Report;
+use binwalkx::{EngineLimits, RecursiveEngine};
 use clap::Parser;
 use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "binarchae",
+    name = "binwalkx",
     version,
     about = "CTF-first binary analysis and extraction (artifact graph over nested/trailing/carved data)"
 )]
@@ -90,7 +90,7 @@ fn run(cli: &Cli) -> i32 {
     // B5: --carving-rules is real — TOML is loaded and fed to the engine.
     if let Some(rules_path) = &cli.carving_rules {
         match std::fs::read_to_string(rules_path) {
-            Ok(text) => match binarchae::carving::parse_user_rules(&text) {
+            Ok(text) => match binwalkx::carving::parse_user_rules(&text) {
                 Ok(rules) => engine.carving_rules = rules,
                 Err(e) => {
                     eprintln!("error: invalid carving rules {}: {e}", rules_path.display());
@@ -234,7 +234,7 @@ fn materialize(cli: &Cli, report: &Report, engine: &RecursiveEngine) -> std::io:
 /// were written. Hash/provenance are preserved: the analysis-time
 /// BLAKE3 hash was computed over these same bytes.
 fn stream_artifact(
-    a: &binarchae::artifact::Artifact,
+    a: &binwalkx::artifact::Artifact,
     engine: &RecursiveEngine,
     dest: &std::path::Path,
 ) -> std::io::Result<bool> {
@@ -263,7 +263,7 @@ fn stream_artifact(
     Ok(false)
 }
 
-fn child_label_name(a: &binarchae::artifact::Artifact) -> Option<String> {
+fn child_label_name(a: &binwalkx::artifact::Artifact) -> Option<String> {
     // Prefer an explicit entry name recorded in metadata by handlers.
     a.metadata
         .get("entry_name")
@@ -290,7 +290,7 @@ fn child_label_name(a: &binarchae::artifact::Artifact) -> Option<String> {
 }
 
 fn read_artifact_bytes(
-    a: &binarchae::artifact::Artifact,
+    a: &binwalkx::artifact::Artifact,
     engine: &RecursiveEngine,
 ) -> Option<Vec<u8>> {
     // B1: bytes are pulled lazily at materialization time. Owned
