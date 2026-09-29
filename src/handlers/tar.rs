@@ -116,10 +116,12 @@ impl Handler for TarHandler {
                 })?;
             if data_end > src.len() {
                 // Truncated final entry: salvage the bytes that exist.
-                // FINAL-B1: `have` is bounded by the SOURCE length (an
-                // honest already-in-memory bound, not a declared one),
-                // and the budget is charged before the allocation.
-                let have = src.len() - data_start;
+                // FINAL-B1/R1: `have` is bounded by BOTH the source
+                // length and max_child_size (an attacker-declared huge
+                // size at the end of a large source must not materialize
+                // a per-entry buffer past the child cap), and the budget
+                // is charged before the allocation.
+                let have = (src.len() - data_start).min(limits.max_child_size);
                 if !budget.charge(limits, have) {
                     return Err(Error::LimitExceeded {
                         limit: "max-total-expanded-bytes",
@@ -147,8 +149,13 @@ impl Handler for TarHandler {
                         have, size
                     )],
                     entry_name: Some(name),
-                    confidence: Confidence::Validated,
-                    evidence: vec!["structurally decoded by parent handler".to_string()],
+                    // FINAL-R6: a truncated entry is PARTIAL bytes, not
+                    // a structurally complete decode — never Validated.
+                    confidence: Confidence::Partial,
+                    evidence: vec![
+                        "entry header valid but payload truncated at source end".to_string(),
+                        format!("{} of {} declared bytes present", have, size),
+                    ],
                 });
                 complete_entries += 1;
                 corrupt = true;

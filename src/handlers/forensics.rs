@@ -849,10 +849,14 @@ impl Handler for PcapHandler {
                                 u16::from_be_bytes(b)
                             };
                             if dport == 53 {
-                                let mut dns =
-                                    vec![0u8; incl_len as usize - 14 - (ihl + 8) as usize];
-                                if src.read_at(udp_start + 8, &mut dns).is_ok() && dns.len() <= 512
-                                {
+                                // FINAL-R1: bound the buffer BEFORE
+                                // allocating — `incl_len` is attacker
+                                // controlled, and the old code allocated
+                                // first and checked the 512-byte DNS cap
+                                // after (fuzz found a ~4 GiB malloc).
+                                let dns_len = (incl_len - 14 - ihl - 8).min(512);
+                                let mut dns = vec![0u8; dns_len as usize];
+                                if src.read_at(udp_start + 8, &mut dns).is_ok() {
                                     udp_dns.push((udp_dns.len() as u16, dns));
                                 }
                             }
@@ -2664,6 +2668,60 @@ E\r\n7\r\nFGHIJKL\r\n0\r\n\r\n";
             Some("e"),
             "question name parsed"
         );
+    }
+
+    /// FINAL-R1: a lying record header with a huge incl_len must not
+    /// trigger a pre-check allocation (fuzz found a ~4 GiB malloc in
+    /// the DNS quick-probe). The capture is tiny; the probe must cap
+    /// the DNS buffer before allocating.
+    #[test]
+    fn pcap_huge_incl_len_no_huge_allocation() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&[0xD4, 0xC3, 0xB2, 0xA1]);
+        p.extend(2u16.to_le_bytes());
+        p.extend(4u16.to_le_bytes());
+        p.extend(0u32.to_le_bytes());
+        p.extend(0u32.to_le_bytes());
+        p.extend(262_144u32.to_le_bytes());
+        p.extend(1u32.to_le_bytes());
+        // Record header claiming 0xFFFF0000 captured bytes; the actual
+        // frame is a minimal Ethernet+IPv4+UDP-53 shell with no body.
+        let declared: u32 = 0xFFFF_0000;
+        p.extend(1u32.to_le_bytes());
+        p.extend(0u32.to_le_bytes());
+        p.extend(declared.to_le_bytes());
+        p.extend(declared.to_le_bytes());
+        // Minimal frame: eth(14) + IPv4 ihl=5 proto=17 (20) + UDP dport 53 (8).
+        let mut f = Vec::new();
+        f.extend([0x02u8; 6]);
+        f.extend([0x01u8; 6]);
+        f.extend(0x0800u16.to_be_bytes());
+        f.extend(0x45u8.to_be_bytes());
+        f.extend(0u8.to_be_bytes());
+        f.extend(28u16.to_be_bytes()); // total_length
+        f.extend(1u16.to_be_bytes());
+        f.extend(0u16.to_be_bytes());
+        f.extend(64u8.to_be_bytes());
+        f.extend(17u8.to_be_bytes());
+        f.extend(0u16.to_be_bytes());
+        f.extend([10u8, 0, 0, 1]);
+        f.extend([10u8, 0, 0, 2]);
+        f.extend(40000u16.to_be_bytes());
+        f.extend(53u16.to_be_bytes());
+        f.extend(0u16.to_be_bytes());
+        f.extend(0u16.to_be_bytes());
+        p.extend_from_slice(&f);
+        let src = ByteSource::from_vec(p);
+        // Must validate (or reject) without any huge allocation; under
+        // debug this panics on malloc failure rather than OOM-killing.
+        let out = PcapHandler.validate(
+            &src,
+            Candidate { offset: 0 },
+            &crate::engine::EngineLimits::default(),
+            &mut Budget::default(),
+        );
+        // Either outcome is fine as long as it returns.
+        let _ = out;
     }
 
     /// #7 §7.4: USB HID reports on linktype 220 reconstruct to text.
