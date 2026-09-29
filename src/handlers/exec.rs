@@ -842,12 +842,45 @@ impl OleHandler {
         }
         let mini_fat_start = u32::from_le_bytes(hdr[0x3C..0x40].try_into().unwrap());
         let num_mini_fat = u32::from_le_bytes(hdr[0x40..0x44].try_into().unwrap());
-        // DIFAT: 109 u32 entries in the header.
+        // DIFAT: 109 u32 entries in the header, then (FINAL-R5) the
+        // EXTERNAL DIFAT chain at 0x44/0x48 for images with more than
+        // 109 FAT sectors — each DIFAT sector holds (ss/4 - 1) FAT
+        // sector numbers, and its last entry is the next DIFAT sector
+        // (ENDOFCHAIN terminates the chain).
+        let first_difat = u32::from_le_bytes(hdr[0x44..0x48].try_into().unwrap());
+        let num_difat = u32::from_le_bytes(hdr[0x48..0x4C].try_into().unwrap());
+        let ss = 1u64 << sector_shift;
         let mut fat_sectors = Vec::new();
         for i in 0..109usize {
             let s = u32::from_le_bytes(hdr[0x4C + i * 4..0x4C + i * 4 + 4].try_into().unwrap());
             if s != 0xFFFF_FFFF {
                 fat_sectors.push(s);
+            }
+        }
+        if first_difat != 0xFFFF_FFFF && num_difat > 0 {
+            let per_sector = (ss / 4) as usize;
+            let mut cur = first_difat;
+            let mut seen = 0u32;
+            while cur != 0xFFFF_FFFE && cur != 0xFFFF_FFFF && seen < num_difat {
+                seen += 1;
+                if seen > 65536 {
+                    return Err(Error::Validation {
+                        format: "ole",
+                        reason: "external DIFAT chain too long".into(),
+                    });
+                }
+                let sec_abs = base + (1 + u64::from(cur)) * ss;
+                let mut raw = vec![0u8; ss as usize];
+                src.read_at(sec_abs, &mut raw)?;
+                for k in 0..per_sector {
+                    let v = u32::from_le_bytes(raw[k * 4..k * 4 + 4].try_into().unwrap());
+                    // Last entry of the sector is the NEXT DIFAT sector.
+                    if k + 1 == per_sector {
+                        cur = v;
+                    } else if v != 0xFFFF_FFFF && v != 0xFFFF_FFFE {
+                        fat_sectors.push(v);
+                    }
+                }
             }
         }
         if fat_sectors.len() as u32 != num_fat {
@@ -860,7 +893,7 @@ impl OleHandler {
             });
         }
         Ok(OleHeader {
-            sector_size: 1u64 << sector_shift,
+            sector_size: ss,
             mini_sector_size: 1u64 << mini_shift,
             first_dir_sector,
             mini_fat_start,
@@ -1740,6 +1773,89 @@ mod exec_tests {
             f.extend(v.to_le_bytes());
         }
         f
+    }
+
+    /// FINAL-R5: a CFB with more than 109 FAT sectors must be accepted
+    /// via the external DIFAT chain (0x44/0x48). Fixture: 110 FAT
+    /// sectors — 109 in the header DIFAT + 1 via a single external
+    /// DIFAT sector.
+    #[test]
+    fn ole_external_difat_chain_walked() {
+        const SS: usize = 512;
+        let n_fat_sectors = 110usize;
+        let mut f: Vec<u8> = Vec::new();
+        f.extend_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
+        f.extend([0u8; 16]);
+        f.extend(0x003Eu16.to_le_bytes());
+        f.extend(0x0003u16.to_le_bytes());
+        f.extend(0xFFFEu16.to_le_bytes());
+        f.extend(9u16.to_le_bytes()); // 512B sectors
+        f.extend(6u16.to_le_bytes()); // 64B mini
+        f.extend([0u8; 6]);
+        f.extend(0u32.to_le_bytes()); // num dir sectors
+        f.extend((n_fat_sectors as u32).to_le_bytes()); // num FAT sectors
+        f.extend(((1 + n_fat_sectors) as u32).to_le_bytes()); // first dir sector
+        f.extend(0u32.to_le_bytes()); // transaction
+        f.extend(4096u32.to_le_bytes()); // mini cutoff
+        f.extend(0xFFFF_FFFFu32.to_le_bytes()); // first mini FAT
+        f.extend(0u32.to_le_bytes()); // num mini FAT
+        f.extend((n_fat_sectors as u32).to_le_bytes()); // first DIFAT sector (110: after the 110 FAT sectors)
+        f.extend(1u32.to_le_bytes()); // num DIFAT sectors
+                                      // Header DIFAT: 109 entries = FAT sectors 0..108; the LAST slot
+                                      // (index 108) must hold the next-DIFAT pointer? No — the header
+                                      // DIFAT holds only FAT sectors; external chain starts at 0x44.
+        for i in 0..109u32 {
+            f.extend(i.to_le_bytes());
+        }
+        assert_eq!(f.len(), 512);
+        // FAT sectors 0..109: all FATSECT markers; entry for dir sector
+        // and the external DIFAT sector marked FATSECT too.
+        // Each FAT sector: every entry is a FATSECT marker (the chain
+        // layout itself is irrelevant to the DIFAT count assertion).
+        for _ in 0..n_fat_sectors {
+            let mut raw: Vec<u8> = Vec::with_capacity(SS);
+            for _ in 0..SS / 4 {
+                raw.extend(0xFFFF_FFFDu32.to_le_bytes());
+            }
+            f.extend_from_slice(&raw);
+        }
+        // Sector 110: external DIFAT sector. 127 FAT-sector entries + 1
+        // next pointer. We need FAT sector 109 (the 110th) listed here;
+        // the rest FREESECT; last slot = ENDOFCHAIN.
+        let mut difat: Vec<u8> = Vec::new();
+        difat.extend(109u32.to_le_bytes());
+        for _ in 1..SS / 4 - 1 {
+            difat.extend(0xFFFF_FFFFu32.to_le_bytes());
+        }
+        difat.extend(0xFFFF_FFFEu32.to_le_bytes()); // next DIFAT: end
+        f.extend_from_slice(&difat);
+        // Sector 111: directory sector — 4 unused entries (all-zero,
+        // obj_type 0 = unused): parse yields an empty dir -> validation
+        // fails on "first directory entry is not the root"? A zeroed
+        // dir produces no entries; that's fine — the point of this test
+        // is that parse_header accepts 110 FAT sectors.
+        let dir = vec![0u8; SS];
+        f.extend_from_slice(&dir);
+
+        let src = ByteSource::from_vec(f);
+        // Header must parse: num_fat (110) == header DIFAT (109) +
+        // external (1). Validation may fail later (empty dir) but the
+        // DIFAT mismatch error must NOT occur.
+        let err = OleHandler
+            .validate(
+                &src,
+                Candidate { offset: 0 },
+                &EngineLimits::default(),
+                &mut Budget::default(),
+            )
+            .err();
+        if let Some(e) = &err {
+            let msg = format!("{e}");
+            assert!(
+                !msg.contains("DIFAT lists"),
+                "external DIFAT chain must be walked: {msg}"
+            );
+        }
     }
 
     #[test]
