@@ -1087,6 +1087,7 @@ impl Handler for SquashfsHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -1657,6 +1658,7 @@ impl Handler for Iso9660Handler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -1750,6 +1752,7 @@ impl Handler for ExtHandler {
                 ],
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -1822,6 +1825,7 @@ impl Handler for NtfsHandler {
                 ],
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -2349,6 +2353,7 @@ impl Handler for Jffs2Handler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -2927,6 +2932,7 @@ impl Handler for UbiVolumeHandler {
                 warnings,
                 errors: Vec::new(),
                 children: owned_children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -3505,6 +3511,7 @@ impl Handler for UbifsHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -4033,6 +4040,7 @@ impl Handler for Yaffs2Handler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

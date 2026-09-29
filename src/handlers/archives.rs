@@ -76,6 +76,7 @@ impl Handler for ArHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children: walk_ar_children(src, base, limits)?,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -259,6 +260,7 @@ impl Handler for DebHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -378,6 +380,7 @@ impl Handler for CabHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -679,6 +682,7 @@ impl Handler for SevenZHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -895,6 +899,7 @@ impl Handler for RarHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

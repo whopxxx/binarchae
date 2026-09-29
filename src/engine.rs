@@ -58,6 +58,11 @@ pub struct EngineLimits {
     /// across the shared candidate queue (CLI + auto-discovered).
     /// Bounds the cost of trial decryption against untrusted data.
     pub max_password_attempts: usize,
+    /// FINAL-R4: container entry filenames reported by handlers during
+    /// this run (ZIP central directory, 7z/RAR member tables). The
+    /// engine harvests password candidates from them with
+    /// PasswordSource::Filename provenance.
+    pub entry_names: Vec<String>,
 }
 
 impl Default for EngineLimits {
@@ -79,6 +84,7 @@ impl Default for EngineLimits {
             max_fs_entries: 65_536,
             passwords: Vec::new(),
             max_password_attempts: 32,
+            entry_names: Vec::new(),
         }
     }
 }
@@ -128,6 +134,11 @@ pub struct ArtifactDraft {
     pub errors: Vec<String>,
     /// Child artifacts decompressed/extracted by this handler.
     pub children: Vec<ChildDraft>,
+    /// FINAL-R4: container entry filenames seen by the handler (ZIP
+    /// central directory, 7z/RAR member tables). The engine harvests
+    /// password candidates from them with PasswordSource::Filename
+    /// provenance.
+    pub entry_names: Vec<String>,
 }
 
 /// Content of a handler-produced child. Firmware containers (uImage,
@@ -483,6 +494,7 @@ impl RecursiveEngine {
         // deterministic and bounded regardless of region content.
         let harvested = crate::passwords::harvest_from_region(src, &self.limits);
         self.password_vault.merge(harvested);
+
         // Effective limits for this region's handler calls: the shared
         // vault queue is exposed through `passwords` so every encrypted-
         // container handler (ZIP / 7z / RAR) sees ONE deterministic,

@@ -976,6 +976,7 @@ impl Handler for ExtHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

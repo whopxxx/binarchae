@@ -157,6 +157,42 @@ pub fn printable_strings(data: &[u8], min: usize, max: usize) -> Vec<String> {
     out
 }
 
+/// FINAL-R4: harvest candidates from CONTAINER ENTRY FILENAMES.
+/// Filenames are a classic password source (e.g. an archive containing
+/// a single entry named "password.txt"); each name is attributed to
+/// [`PasswordSource::Filename`] so provenance stays auditable.
+/// `EngineLimits::entry_names` is fed by handlers (ZIP/7z/RAR) after
+/// they read their central directories / member tables.
+pub fn harvest_from_names(names: &[String]) -> PasswordVault {
+    let mut vault = PasswordVault::new();
+    for name in names {
+        // Skip directory entries (trailing slash) and noise.
+        if name.ends_with('/') || name.ends_with(chr(92)) || name.is_empty() {
+            continue;
+        }
+        // Use the final path component (handle both separators).
+        let stem = name
+            .rsplit(|c| c == '/' || c == chr(92))
+            .next()
+            .unwrap_or(name);
+        vault.push(stem.to_string(), PasswordSource::Filename);
+        // Extension-stripped stem (classic: an entry named
+        // "password.txt" hides the password in the stem).
+        if let Some((base, _ext)) = stem.rsplit_once('.') {
+            if !base.is_empty() {
+                vault.push(base.to_string(), PasswordSource::Filename);
+            }
+        }
+        // The full name (with extension) is also a plausible candidate.
+        vault.push(name.to_string(), PasswordSource::Filename);
+    }
+    vault
+}
+
+fn chr(n: u8) -> char {
+    n as char
+}
+
 /// Harvest password-like candidates from a byte region: the ZIP EOCD
 /// comment (when present), printable strings, and entry filenames.
 /// Returns candidates in a fresh vault for the engine to merge.
@@ -298,6 +334,30 @@ mod tests {
         let data = b"xx password123 \x00\x01 another-one yy";
         let s = printable_strings(data, 4, 16);
         assert_eq!(s, vec!["xx password123 ", " another-one yy"]);
+    }
+
+    #[test]
+    fn filename_harvest_has_filename_provenance() {
+        // FINAL-R4: entry filenames are harvested with explicit
+        // Filename provenance (never misattributed to region strings),
+        // directories skipped, both stem and full name considered.
+        let v = harvest_from_names(&[
+            "password.txt".to_string(),
+            "secret/".to_string(),
+            r"C:\users\pw123".to_string(),
+        ]);
+        let q: Vec<(&str, &str)> = v
+            .candidates()
+            .iter()
+            .map(|c| (c.password.as_str(), c.source.as_str()))
+            .collect();
+        assert!(q.contains(&("password.txt", "entry filename")));
+        assert!(q.contains(&("password", "entry filename")));
+        assert!(q.contains(&("pw123", "entry filename")));
+        assert!(
+            !q.iter().any(|(p, _)| *p == "secret"),
+            "directory entries are skipped"
+        );
     }
 
     #[test]

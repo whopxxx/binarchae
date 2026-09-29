@@ -494,6 +494,7 @@ impl Handler for RomfsHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

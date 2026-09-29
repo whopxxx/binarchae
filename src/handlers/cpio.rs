@@ -429,6 +429,7 @@ impl Handler for CpioHandler {
                 },
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

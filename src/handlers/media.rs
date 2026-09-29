@@ -198,6 +198,7 @@ impl Handler for GifHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -308,6 +309,7 @@ impl Handler for BmpHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -459,6 +461,7 @@ impl Handler for TiffHandler {
                 },
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -547,6 +550,7 @@ impl Handler for WebPHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -637,6 +641,7 @@ impl Handler for RiffHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -827,6 +832,7 @@ impl Handler for Mp3Handler {
                     ],
                     errors: Vec::new(),
                     children: Vec::new(),
+                    entry_names: Vec::new(),
                 }],
             });
         }
@@ -852,6 +858,7 @@ impl Handler for Mp3Handler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -942,6 +949,7 @@ impl Handler for FlacHandler {
                 ],
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }

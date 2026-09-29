@@ -209,6 +209,9 @@ impl Handler for ZipHandler {
                 }
             };
             names.push(raw_name.clone());
+            // FINAL-R4: report entry filenames to the engine's shared
+            // candidate harvester (PasswordSource::Filename provenance).
+            // FINAL-R4: names are attached to the draft below.
             let buf = match read_result {
                 EntryOutcome::Bytes(b) => b,
                 EntryOutcome::NoPassword | EntryOutcome::Decode => continue,
@@ -254,6 +257,9 @@ impl Handler for ZipHandler {
             metadata.insert("entry_names".to_string(), names.join("\n"));
         }
 
+        // FINAL-R4: filenames ride on the draft for the engine's
+        // candidate harvester (PasswordSource::Filename provenance).
+        let entry_names = names.clone();
         // B7: exact boundary — from the first signature to the EOCD end.
         let size = (archive_end - rel) as u64;
 
@@ -273,6 +279,7 @@ impl Handler for ZipHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names,
             }],
         })
     }

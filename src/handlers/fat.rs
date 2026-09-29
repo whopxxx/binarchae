@@ -658,6 +658,7 @@ impl Handler for FatHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

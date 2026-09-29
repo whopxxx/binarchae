@@ -535,6 +535,7 @@ impl Handler for RegistryHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -1154,6 +1155,7 @@ impl Handler for PcapHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children: packets,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -1304,6 +1306,7 @@ impl Handler for PcapngHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children: packets,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -1644,6 +1647,7 @@ impl Handler for MinidumpHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -1908,6 +1912,7 @@ impl Handler for Pagedu64Handler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -2028,6 +2033,7 @@ impl Handler for StringsHandler {
                         evidence: vec!["structurally decoded by parent handler".to_string()],
                     })
                     .collect(),
+                entry_names: Vec::new(),
             }],
         })
     }

@@ -231,6 +231,7 @@ impl Handler for ZipSalvageHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

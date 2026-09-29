@@ -243,6 +243,7 @@ impl Handler for TarHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

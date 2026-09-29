@@ -245,6 +245,7 @@ impl Handler for ElfHandler {
                 },
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -471,6 +472,7 @@ impl Handler for PeHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -624,6 +626,7 @@ impl Handler for MachOHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -731,6 +734,7 @@ impl Handler for WasmHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -1283,6 +1287,7 @@ impl Handler for OleHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -1382,6 +1387,7 @@ impl Handler for RtfHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }

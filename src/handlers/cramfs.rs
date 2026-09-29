@@ -569,6 +569,7 @@ impl Handler for CramfsHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

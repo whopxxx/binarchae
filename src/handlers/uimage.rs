@@ -237,6 +237,7 @@ impl Handler for UImageHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

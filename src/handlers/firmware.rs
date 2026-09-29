@@ -231,6 +231,7 @@ impl Handler for DtbHandler {
                 warnings: Vec::new(),
                 errors: Vec::new(),
                 children: Vec::new(),
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -364,6 +365,7 @@ impl Handler for AndroidBootHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -472,6 +474,7 @@ impl Handler for TrxHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -580,6 +583,7 @@ impl Handler for UefiFvHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -1196,6 +1200,7 @@ impl Handler for AndroidSparseHandler {
                     confidence: Confidence::Validated,
                     evidence: vec!["structurally decoded by parent handler".to_string()],
                 }],
+                entry_names: Vec::new(),
             }],
         })
     }
@@ -1375,6 +1380,7 @@ impl Handler for Bcm63xxTagHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

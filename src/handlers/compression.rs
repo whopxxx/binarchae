@@ -77,6 +77,7 @@ fn decompressed_output(
                 confidence: Confidence::Validated,
                 evidence: vec!["structurally decoded by parent handler".to_string()],
             }],
+            entry_names: Vec::new(),
         }],
     }
 }
@@ -1048,6 +1049,7 @@ impl Handler for LzmaAloneHandler {
                     confidence: Confidence::Validated,
                     evidence: vec!["structurally decoded by parent handler".to_string()],
                 }],
+                entry_names: Vec::new(),
             }],
         })
     }

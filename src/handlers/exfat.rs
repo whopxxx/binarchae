@@ -720,6 +720,7 @@ impl Handler for ExfatHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

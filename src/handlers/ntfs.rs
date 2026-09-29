@@ -835,6 +835,7 @@ impl Handler for NtfsHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
+                entry_names: Vec::new(),
             }],
         })
     }

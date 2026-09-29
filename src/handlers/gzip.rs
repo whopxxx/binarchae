@@ -230,6 +230,7 @@ impl Handler for GzipHandler {
                     confidence: Confidence::Validated,
                     evidence: vec!["structurally decoded by parent handler".to_string()],
                 }],
+                entry_names: Vec::new(),
             }],
         })
     }
