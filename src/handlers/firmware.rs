@@ -668,7 +668,17 @@ impl UefiFvHandler {
             } else {
                 (u64::from(size24), FFS_HEADER_SIZE)
             };
-            if file_size < header_size || pos + file_size > end {
+            // FUZZ: pos + file_size must not overflow — a 24-bit file
+            // size combined with a hostile `pos` could wrap. The
+            // alignment advance below has the same hazard.
+            let file_end = match pos.checked_add(file_size) {
+                Some(v) => v,
+                None => {
+                    warnings.push("FFS file with invalid size; walk stopped".to_string());
+                    return Ok(());
+                }
+            };
+            if file_size < header_size || file_end > end {
                 warnings.push("FFS file with invalid size; walk stopped".to_string());
                 return Ok(());
             }

@@ -589,11 +589,12 @@ impl Handler for SevenZHandler {
                     }
                 }
             }
-            // FINAL-T2: with a plaintext header the empty password
-            // always OPENS (decryption happens per-entry), so an
-            // encrypted archive first parses with garbage output. When
-            // AES coders are present and we hold more candidates,
-            // re-open with each until entries actually decode.
+            // FINAL-T2: with a plaintext header ANY password "opens"
+            // the archive (decryption happens per-entry), so the first
+            // open succeeds regardless of correctness. When AES coders
+            // are present, try EVERY candidate — None (already opened)
+            // first, then each vault candidate — until entries actually
+            // decode. Without AES, the single opened reader suffices.
             let opened_somewhere = opened.is_some();
             let mut open_attempts: Vec<Option<String>> = opened
                 .as_ref()
@@ -610,8 +611,8 @@ impl Handler for SevenZHandler {
                         })
                     })
                     .unwrap_or(false);
-                if has_aes && opened.as_ref().is_some_and(|(_, pw)| pw.is_none()) {
-                    open_attempts = limits.passwords.iter().cloned().map(Some).collect();
+                if has_aes {
+                    open_attempts.extend(limits.passwords.iter().cloned().map(Some));
                 }
             }
             let mut reused = opened.map(|(r, _)| r);
@@ -699,6 +700,27 @@ impl Handler for SevenZHandler {
                     break 'open_walk;
                 }
                 working_password = None;
+            }
+            // FINAL-U2: entry NAMES are metadata — they exist even
+            // when content decryption failed and the entry walk died
+            // before visiting a single entry. Without them the engine
+            // has no filename candidates to merge and the retry can
+            // never fire. Enumerate the (header-decoded) file list via
+            // a fresh metadata-only open.
+            if entry_names.is_empty() {
+                let cursor = std::io::Cursor::new(&data[..]);
+                if let Ok(meta_reader) =
+                    sevenz_rust2::ArchiveReader::new(cursor, sevenz_rust2::Password::empty())
+                {
+                    for f in &meta_reader.archive().files {
+                        if entry_names.len() >= 1024 {
+                            break;
+                        }
+                        if !f.name().is_empty() {
+                            entry_names.push(f.name().to_string());
+                        }
+                    }
+                }
             }
             if !opened_somewhere {
                 if let Some(e) = last_err {
