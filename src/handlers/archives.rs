@@ -877,6 +877,15 @@ impl Handler for RarHandler {
                     member_count += 1;
                     let name = member.meta.name_lossy();
                     let declared = member.meta.unpacked_size;
+                    // FINAL-U1: the member metadata already KNOWS the
+                    // payload is encrypted — flag it before any decode
+                    // attempt, not only after a password succeeds.
+                    // Without this, a first pass with no candidates
+                    // produces an unflagged draft and the engine's
+                    // filename-candidate retry never fires for RAR.
+                    if member.meta.is_encrypted {
+                        encrypted_hits = true;
+                    }
                     match Self::decode_member(&archive, index, limits, declared)? {
                         Some(member_bytes) => {
                             if let Some(p) = member_bytes.password {

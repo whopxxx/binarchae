@@ -1962,6 +1962,47 @@ fn t2_sevenz_filename_password_retry() {
     assert!(has_ancestor(&graph, gz, sz.id));
 }
 
+/// FINAL-U1: RAR filename-password retry. A RAR50 archive with a
+/// plaintext header (name visible), AES-encrypted content, password
+/// derivable only from the entry name. First parse reports
+/// `encrypted_entries=yes` from member metadata without a working
+/// password; the engine merges filename candidates and re-validates,
+/// decrypting with provenance "entry filename".
+#[test]
+fn u1_rar_filename_password_retry() {
+    let secret = make_gzip(b"FLAG{rar-name-pw}");
+    let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50)
+        .password(Some(b"r4rpw".to_vec()))
+        .header_encryption(false);
+    builder
+        .add_bytes(b"r4rpw.bin".to_vec(), secret, None, None)
+        .expect("add member");
+    let archive = builder.to_bytes().expect("rar build");
+    let graph = engine().analyze(&ByteSource::from_vec(archive), true);
+    let rar = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "rar")
+        .expect("rar validated");
+    assert_eq!(
+        rar.metadata.get("password").map(String::as_str),
+        Some("r4rpw"),
+        "filename-derived password must decrypt the RAR"
+    );
+    assert_eq!(
+        rar.metadata.get("password_source").map(String::as_str),
+        Some("entry filename"),
+        "provenance: retry used the filename candidate"
+    );
+    let gz = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "gzip" && has_ancestor(&graph, a.id, rar.id))
+        .map(|a| a.id)
+        .expect("decrypted content recursed");
+    assert!(has_ancestor(&graph, gz, rar.id));
+}
+
 // ---------- graph helpers ----------
 
 fn has_ancestor(graph: &ctf_tools::artifact::ArtifactGraph, id: u64, ancestor: u64) -> bool {
