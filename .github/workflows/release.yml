@@ -81,6 +81,7 @@ jobs:
             dist/Cargo.lock
             dist/dependency-tree.txt
             dist/sbom.json
+            dist/dependency-inventory.sha256
           if-no-files-found: ignore
 
   release:
