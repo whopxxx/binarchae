@@ -1668,6 +1668,40 @@ fn r7_dns_cross_message_channel_aggregation() {
     assert_eq!(bytes, b"FLAG{dnsagg}".to_vec());
 }
 
+/// FINAL-S2: the entry FILENAME is the password. No comment, no
+/// strings — the only source is the entry name. The engine must merge
+/// `harvest_from_names` candidates into the vault and the ZIP handler
+/// must decrypt with provenance "entry filename".
+#[test]
+fn s2_filename_password_source_e2e() {
+    let secret = make_gzip(b"FLAG{filename-pw}");
+    // Entry name "p4ssw0rd.bin": stem candidate = "p4ssw0rd".
+    let zip = make_encrypted_zip("p4ssw0rd.bin", &secret, "p4ssw0rd", "");
+    let graph = engine().analyze(&ByteSource::from_vec(zip), true);
+    let zip_art = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "zip")
+        .expect("zip validated");
+    assert_eq!(
+        zip_art.metadata.get("password").map(String::as_str),
+        Some("p4ssw0rd"),
+        "filename-derived password must decrypt"
+    );
+    assert_eq!(
+        zip_art.metadata.get("password_source").map(String::as_str),
+        Some("entry filename"),
+        "provenance must name the filename source"
+    );
+    let gz = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "gzip" && has_ancestor(&graph, a.id, zip_art.id))
+        .map(|a| a.id)
+        .expect("decrypted content recursed");
+    assert!(has_ancestor(&graph, gz, zip_art.id));
+}
+
 // ---------- graph helpers ----------
 
 fn has_ancestor(graph: &ctf_tools::artifact::ArtifactGraph, id: u64, ancestor: u64) -> bool {

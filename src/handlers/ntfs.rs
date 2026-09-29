@@ -359,7 +359,13 @@ impl NtfsHandler {
                 break;
             }
             if offset_size == 0 {
-                out.push((None, len * cluster_size)); // sparse
+                // FINAL-S1: byte length is checked — a hostile 8-byte
+                // run length must not panic (debug) or wrap (release).
+                let byte_len = match len.checked_mul(cluster_size) {
+                    Some(v) if v <= i64::MAX as u64 => v,
+                    _ => break, // implausible run: abort the walk
+                };
+                out.push((None, byte_len)); // sparse
                 continue;
             }
             if pos + offset_size > runs.len() {
@@ -397,7 +403,13 @@ impl NtfsHandler {
                 // Zero delta with nonzero offset field is invalid; stop.
                 break;
             }
-            out.push((Some(prev_lcn as u64), len * cluster_size));
+            // FINAL-S1: the byte length is checked like the LCN — a
+            // hostile 8-byte length must abort, not panic/wrap.
+            let byte_len = match len.checked_mul(cluster_size) {
+                Some(v) if v <= i64::MAX as u64 => v,
+                _ => break,
+            };
+            out.push((Some(prev_lcn as u64), byte_len));
         }
         out
     }
@@ -423,11 +435,29 @@ impl NtfsHandler {
             }
             match lcn {
                 None => {
-                    off_vcn += len; // sparse stays zero
+                    // FINAL-S1: sparse advance is checked — a run longer
+                    // than the remaining buffer just ends the walk (the
+                    // output is already zero-filled).
+                    off_vcn = match off_vcn.checked_add(len) {
+                        Some(v) => v,
+                        None => break,
+                    };
                 }
                 Some(l) => {
                     let take = len.min(total - off_vcn);
-                    let off = base + l * boot.cluster_size();
+                    // FINAL-S1: physical offset = base + LCN * cluster
+                    // is checked — a hostile LCN must not wrap into a
+                    // small "valid" offset in release builds.
+                    let off = match l
+                        .checked_mul(boot.cluster_size())
+                        .and_then(|p| p.checked_add(base))
+                    {
+                        Some(v) => v,
+                        None => {
+                            warnings.push("run offset overflow; run skipped".to_string());
+                            continue;
+                        }
+                    };
                     if off + take <= src.len() {
                         src.read_at(off, &mut out[off_vcn as usize..(off_vcn + take) as usize])?;
                     } else {
@@ -1054,6 +1084,33 @@ mod tests {
         assert_eq!(parsed[0], (None, 1024), "sparse run");
         // LCN raw (5), length in bytes (3 * 512).
         assert_eq!(parsed[1], (Some(5), 3 * 512), "normal run");
+    }
+
+    /// FINAL-S1: a hostile 8-byte run length (len * cluster_size would
+    /// overflow u64) must ABORT the walk — no panic in debug, no wrap
+    /// in release, and the runs before the hostile one survive.
+    #[test]
+    fn ntfs_runlist_hostile_length_aborts() {
+        // Run 0: valid (len 1, offset +1). Run 1: 8-byte len = u64::MAX
+        // (header 0x18: size field 8 bytes, offset 1 byte) with offset
+        // +1 — len * 512 overflows, the walk must stop there.
+        let mut runs = vec![0x81u8];
+        runs.push(1);
+        runs.extend_from_slice(&1i64.to_le_bytes());
+        runs.push(0x18);
+        runs.extend_from_slice(&u64::MAX.to_le_bytes()); // len
+        runs.push(1); // offset
+        let parsed = NtfsHandler::unpack_runs(&runs, 512);
+        assert_eq!(
+            parsed,
+            vec![(Some(1), 512)],
+            "valid run survives; overflow run aborts silently: {parsed:?}"
+        );
+        // Same for the sparse branch: 8-byte len = u64::MAX sparse run.
+        let mut sparse = vec![0x08u8];
+        sparse.extend_from_slice(&u64::MAX.to_le_bytes());
+        let parsed2 = NtfsHandler::unpack_runs(&sparse, 512);
+        assert!(parsed2.is_empty(), "overflowing sparse run aborts");
     }
 
     #[test]

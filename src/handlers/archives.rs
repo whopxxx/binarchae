@@ -540,7 +540,9 @@ impl Handler for SevenZHandler {
         let mut warnings = Vec::new();
         let mut encrypted = false;
         let mut working_password: Option<String> = None;
-
+        // FINAL-S2: entry names feed the password vault (Filename
+        // provenance) via the engine.
+        let mut entry_names: Vec<String> = Vec::new();
         if base == 0 {
             // Native decode from a whole-file source via ArchiveReader.
             // Try the empty password first, then each CLI candidate; the
@@ -589,6 +591,9 @@ impl Handler for SevenZHandler {
                     let max_children = limits.max_archive_entries;
                     let max_size = limits.max_child_size as usize;
                     if let Err(e) = reader.for_each_entries(|entry, stream| {
+                        if entry_names.len() < 1024 {
+                            entry_names.push(entry.name().to_string());
+                        }
                         if children.len() >= max_children {
                             return Ok(false);
                         }
@@ -682,7 +687,7 @@ impl Handler for SevenZHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
-                entry_names: Vec::new(),
+                entry_names,
             }],
         })
     }
@@ -800,10 +805,16 @@ impl Handler for RarHandler {
         let mut working_password: Option<String> = None;
         let mut encrypted_hits = false;
         let mut member_count = 0usize;
+        // FINAL-S2: member names feed the password vault (Filename
+        // provenance) via the engine.
+        let mut entry_names: Vec<String> = Vec::new();
 
         match rars::ArchiveReader::read_with_options(&data, rars::ArchiveReadOptions::default()) {
             Ok(archive) => {
                 for (index, member) in archive.members().enumerate() {
+                    if entry_names.len() < 1024 {
+                        entry_names.push(member.meta.name_lossy());
+                    }
                     if member_count >= limits.max_archive_entries {
                         warnings
                             .push("max_archive_entries reached; entry list truncated".to_string());
@@ -899,7 +910,7 @@ impl Handler for RarHandler {
                 warnings,
                 errors: Vec::new(),
                 children,
-                entry_names: Vec::new(),
+                entry_names,
             }],
         })
     }

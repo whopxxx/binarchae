@@ -495,6 +495,11 @@ impl RecursiveEngine {
         let harvested = crate::passwords::harvest_from_region(src, &self.limits);
         self.password_vault.merge(harvested);
 
+        // FINAL-S2: entry-filename candidates merge AFTER the region
+        // scan loop below accepts drafts (accepted drafts carry
+        // `entry_names`). Deferred there: filenames only exist once a
+        // container handler parsed its directory.
+
         // Effective limits for this region's handler calls: the shared
         // vault queue is exposed through `passwords` so every encrypted-
         // container handler (ZIP / 7z / RAR) sees ONE deterministic,
@@ -599,6 +604,93 @@ impl RecursiveEngine {
                     Err(_e) => {
                         // Rejected candidate: shadow spend discarded, real
                         // budget untouched.
+                    }
+                }
+            }
+        }
+
+        // FINAL-S2: entry filenames from accepted drafts feed the shared
+        // vault with `Filename` provenance. Merged AFTER the candidate
+        // loop so a candidate derived from this container's own entries
+        // can still serve any LATER encrypted sibling/handler in this
+        // run; the vault dedups and caps attempts. Clones are bounded:
+        // entry_names come from parsed directory listings that handlers
+        // already capped.
+        let names: Vec<String> = drafts
+            .iter()
+            .flat_map(|d| d.entry_names.iter().cloned())
+            .take(1024)
+            .collect();
+        if !names.is_empty() {
+            let had = self.password_vault.candidates().len();
+            let harvested_names = crate::passwords::harvest_from_names(&names);
+            self.password_vault.merge(harvested_names);
+            if self.password_vault.candidates().len() > had {
+                // New filename-derived candidates exist. Re-validate the
+                // encrypted drafts of THIS region that failed without a
+                // working password (chicken-and-egg: the container's own
+                // entry names only exist after its first parse). Bounded
+                // by the same shadow-budget accounting as the main loop.
+                for handler in &self.handlers {
+                    for candidate in handler.find_candidates(src) {
+                        // Only re-run candidates that produced a failed
+                        // encrypted draft at this offset.
+                        let retry_worthy = drafts.iter().any(|d| {
+                            d.offset == candidate.offset
+                                && d.metadata.get("encrypted").map(String::as_str) == Some("true")
+                                && !d.metadata.contains_key("password")
+                        });
+                        if !retry_worthy {
+                            continue;
+                        }
+                        let mut refreshed = effective_limits.clone();
+                        refreshed.passwords = self
+                            .password_vault
+                            .candidates()
+                            .iter()
+                            .take(self.limits.max_password_attempts)
+                            .map(|c| c.password.clone())
+                            .collect();
+                        let mut shadow = Budget::default();
+                        if let Ok(output) =
+                            handler.validate(src, candidate, &refreshed, &mut shadow)
+                        {
+                            for mut redraft in output.artifacts {
+                                // Replace the failed draft in place.
+                                if let Some(slot) = drafts.iter_mut().find(|d| {
+                                    d.offset == redraft.offset
+                                        && d.format == redraft.format
+                                        && !d.metadata.contains_key("password")
+                                }) {
+                                    let spend = shadow.expanded_bytes;
+                                    if spend > 0 && !budget.charge(&self.limits, spend) {
+                                        continue;
+                                    }
+                                    redraft.warnings.push(
+                                        "decrypted after filename-derived password                                          candidates were harvested"
+                                            .to_string(),
+                                    );
+                                    // Provenance enrichment (same as the
+                                    // main loop): name the vault source.
+                                    if let Some(p) = redraft.metadata.get("password").cloned() {
+                                        if !redraft.metadata.contains_key("password_source") {
+                                            if let Some(c) = self
+                                                .password_vault
+                                                .candidates()
+                                                .iter()
+                                                .find(|c| c.password == p)
+                                            {
+                                                redraft.metadata.insert(
+                                                    "password_source".to_string(),
+                                                    c.source.as_str().to_string(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    *slot = redraft;
+                                }
+                            }
+                        }
                     }
                 }
             }
