@@ -17,18 +17,18 @@ fuzz_target!(|data: &[u8]| {
     if body.len() > 20 {
         body[10..16].copy_from_slice(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1]); // OLE
     }
-    let src = binarchae::bytesource::ByteSource::from_vec(body);
-    let limits = binarchae::engine::EngineLimits {
+    let src = binwalkx::bytesource::ByteSource::from_vec(body);
+    let limits = binwalkx::engine::EngineLimits {
         max_child_size: 64 * 1024,
         max_total_expanded_bytes: 1 << 20,
         max_records: 256,
         ..Default::default()
     };
-    let mut budget = binarchae::engine::Budget::default();
+    let mut budget = binwalkx::engine::Budget::default();
     const FORMATS: &[&str] = &["pdf", "ole", "rtf"];
-    for handler in binarchae::engine::builtin_handlers() {
+    for handler in binwalkx::engine::builtin_handlers() {
         if FORMATS.contains(&handler.format()) {
-            let c = binarchae::engine::Candidate { offset: 0 };
+            let c = binwalkx::engine::Candidate { offset: 0 };
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = handler.validate(&src, c, &limits, &mut budget);
             }));

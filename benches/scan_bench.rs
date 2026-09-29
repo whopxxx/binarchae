@@ -2,8 +2,8 @@
 //! fixture classes — single image, nested containers, archive with many
 //! entries, and high-entropy blob (worst case for signature scanning).
 
-use binarchae::bytesource::ByteSource;
-use binarchae::engine::{EngineLimits, RecursiveEngine};
+use binwalkx::bytesource::ByteSource;
+use binwalkx::engine::{EngineLimits, RecursiveEngine};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -292,7 +292,7 @@ fn bench_expanded(c: &mut Criterion) {
     group.bench_function("entropy_4m_map", |b| {
         b.iter(|| {
             let src = ByteSource::from_vec(blob.clone());
-            binarchae::entropy::analyze_bounded(&src, 64 * 1024, 64);
+            binwalkx::entropy::analyze_bounded(&src, 64 * 1024, 64);
             black_box(())
         })
     });
