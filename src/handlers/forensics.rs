@@ -551,7 +551,32 @@ impl RegistryHandler {
         cell_off: u32,
         limits: &crate::engine::EngineLimits,
     ) -> Result<(Vec<u32>, &'static str)> {
+        let mut visited: Vec<u32> = Vec::new();
+        Self::parse_subkey_list_inner(src, base, cell_off, limits, 0, &mut visited)
+    }
+
+    /// FINAL-R3: internal recursive walk for `ri` indirection with an
+    /// explicit DEPTH cap and a VISITED set — the previous one-level
+    /// recursion had neither, so a self-referential `ri -> ri` list
+    /// blew the stack before the outer walk's visited set could
+    /// protect it.
+    fn parse_subkey_list_inner(
+        src: &ByteSource,
+        base: u64,
+        cell_off: u32,
+        limits: &crate::engine::EngineLimits,
+        depth: usize,
+        visited: &mut Vec<u32>,
+    ) -> Result<(Vec<u32>, &'static str)> {
         const LIST_BASE: u64 = 0x1000;
+        const MAX_RI_DEPTH: usize = 8;
+        if depth > MAX_RI_DEPTH || visited.contains(&cell_off) {
+            return Ok((Vec::new(), "ri"));
+        }
+        visited.push(cell_off);
+        if visited.len() > 4096 {
+            return Ok((Vec::new(), "ri"));
+        }
         let cell = base + LIST_BASE + u64::from(cell_off);
         let mut sig = [0u8; 2];
         src.read_at(cell + 4, &mut sig)
@@ -592,9 +617,16 @@ impl RegistryHandler {
             }
             let target = le32(src, ent).unwrap_or(0);
             if kind == "ri" {
-                // Nested list: parse one level deeper.
+                // Nested list: recurse with depth + visited guards.
                 if out.len() < limits.max_records {
-                    let (mut nested, _) = Self::parse_subkey_list(src, base, target, limits)?;
+                    let (mut nested, _) = Self::parse_subkey_list_inner(
+                        src,
+                        base,
+                        target,
+                        limits,
+                        depth + 1,
+                        visited,
+                    )?;
                     out.append(&mut nested);
                 }
             } else {
@@ -2330,6 +2362,43 @@ mod tests {
             bin_child.metadata.get("key_path").map(String::as_str),
             Some("ROOT"),
             "value must be attributed to its key path"
+        );
+    }
+
+    /// FINAL-R3: a self-referential `ri` list (ri -> ri cell) must be
+    /// rejected by the depth/visited guards — the walk returns without
+    /// a stack overflow and the hive still validates.
+    #[test]
+    fn registry_self_referential_ri_no_stack_overflow() {
+        let mut v = vec![0u8; 8192];
+        v[0..4].copy_from_slice(b"regf");
+        v[4096..4100].copy_from_slice(b"hbin");
+        v[4104..4108].copy_from_slice(&4096u32.to_le_bytes());
+        // Root nk CELL at 4128 (record 4132) with a subkey list.
+        let rec: usize = 4132;
+        v[4128..4132].copy_from_slice(&(-(4 + 88i32)).to_le_bytes());
+        v[rec..rec + 2].copy_from_slice(b"nk");
+        v[rec + 2..rec + 4].copy_from_slice(&0x0020u16.to_le_bytes());
+        v[rec + 16..rec + 20].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        v[rec + 20..rec + 24].copy_from_slice(&0u32.to_le_bytes());
+        let ri_cell: usize = 4228;
+        v[rec + 28..rec + 32].copy_from_slice(&((ri_cell - 4096) as u32).to_le_bytes());
+        v[rec + 72..rec + 74].copy_from_slice(&4u16.to_le_bytes());
+        v[rec + 76..rec + 80].copy_from_slice(b"ROOT");
+        // ri list cell at 4228 whose single entry points at ITSELF.
+        v[ri_cell..ri_cell + 4].copy_from_slice(&(-(4 + 4i32)).to_le_bytes());
+        v[ri_cell + 4..ri_cell + 6].copy_from_slice(b"ri");
+        v[ri_cell + 6..ri_cell + 8].copy_from_slice(&1u16.to_le_bytes());
+        v[ri_cell + 8..ri_cell + 12].copy_from_slice(&((ri_cell - 4096) as u32).to_le_bytes());
+        let src = ByteSource::from_vec(v);
+        let out = validate_at(&RegistryHandler, &src, 0).expect("hive validates");
+        assert_eq!(
+            out.artifacts[0]
+                .metadata
+                .get("subkeys_reachable")
+                .map(String::as_str),
+            Some("0"),
+            "self-referential ri must yield no reachable subkeys"
         );
     }
 
