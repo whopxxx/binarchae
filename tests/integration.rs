@@ -1,10 +1,10 @@
 //! End-to-end integration tests over synthetic fixtures, covering the
 //! acceptance criteria from Issue #1.
 
-use ctf_tools::artifact::{Confidence, ExtractionStatus, RelationKind};
-use ctf_tools::bytesource::ByteSource;
-use ctf_tools::carving::parse_user_rules;
-use ctf_tools::engine::{EngineLimits, RecursiveEngine};
+use binarchae::artifact::{Confidence, ExtractionStatus, RelationKind};
+use binarchae::bytesource::ByteSource;
+use binarchae::carving::parse_user_rules;
+use binarchae::engine::{EngineLimits, RecursiveEngine};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::io::Write;
@@ -306,8 +306,8 @@ fn zip_nested_path_entries() {
 /// (4) ZIP traversal attempt is contained/rejected by safe-path rules.
 #[test]
 fn zip_traversal_contained() {
-    use ctf_tools::extract::safe_join;
-    let root = std::env::temp_dir().join("ctf-tools-test-traversal");
+    use binarchae::extract::safe_join;
+    let root = std::env::temp_dir().join("binarchae-test-traversal");
     let err = safe_join(&root, "../escape.txt");
     assert!(err.is_err(), "../ must be rejected");
     let err2 = safe_join(&root, "a/../../b");
@@ -524,7 +524,7 @@ fn jsonl_output_stable_records() {
     let src = ByteSource::from_vec(blob);
     let mut e = engine();
     let g = e.analyze(&src, true);
-    let report = ctf_tools::report::Report::new("blob.bin", blob_len, g);
+    let report = binarchae::report::Report::new("blob.bin", blob_len, g);
     let jsonl = report.to_jsonl().unwrap();
     let lines: Vec<&str> = jsonl.lines().collect();
     assert!(lines[0].starts_with("{\"type\":\"run\""), "header first");
@@ -858,9 +858,9 @@ fn json_round_trip() {
     let src = ByteSource::from_vec(gz);
     let mut e = engine();
     let graph = e.analyze(&src, true);
-    let report = ctf_tools::report::Report::new("fixture.gz", src.len(), graph);
+    let report = binarchae::report::Report::new("fixture.gz", src.len(), graph);
     let json = report.to_json_pretty().unwrap();
-    let back = ctf_tools::report::Report::from_json(&json).unwrap();
+    let back = binarchae::report::Report::from_json(&json).unwrap();
     assert_eq!(back.graph.artifacts.len(), report.graph.artifacts.len());
     assert_eq!(back.graph.edges.len(), report.graph.edges.len());
     for (a, b) in back.graph.artifacts.iter().zip(&report.graph.artifacts) {
