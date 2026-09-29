@@ -1052,6 +1052,12 @@ impl Handler for PcapHandler {
             // DNS answers with payload material (TXT/NULL/others) as
             // children; the engine recurses into Owned bytes so
             // base64/hex payloads are picked up by other handlers.
+            // FINAL-R7: cross-message DNS channel aggregation — TXT/NULL
+            // fragments arriving in SEPARATE messages that share a query
+            // (covert channel) are concatenated in packet order and, when
+            // the aggregate decodes (base64/hex), the reconstructed
+            // payload is emitted so the engine recurses into it.
+            let mut dns_channels: BTreeMap<String, (usize, Vec<u8>)> = BTreeMap::new();
             for (_idx, dns_bytes) in &udp_dns {
                 if let Some(msg) = crate::handlers::net::parse_dns(dns_bytes) {
                     for ans in &msg.answers {
@@ -1090,11 +1096,70 @@ impl Handler for PcapHandler {
                             meta,
                         ));
                         stream_objects += 1;
+                        // FINAL-R7: aggregate by shared query name. The
+                        // per-message child above keeps one-hop
+                        // provenance; the aggregated channel below makes
+                        // split payloads recoverable.
+                        if ans.rtype == 16 || ans.rtype == 10 {
+                            let ch = dns_channels
+                                .entry(msg.queries.first().cloned().unwrap_or_default())
+                                .or_insert((0usize, Vec::new()));
+                            ch.1.extend_from_slice(&ans.rdata);
+                            ch.0 += 1;
+                        }
                     }
                 }
             }
-
-            // USB HID keystrokes as one reconstructed text child.
+            // FINAL-R7: emit aggregated DNS channels (multi-message
+            // TXT/NULL reassembly keyed by query name) and their decoded
+            // payloads so the engine recurses into the reconstruction.
+            for (query, (msgs, data)) in &dns_channels {
+                if *msgs < 2 || data.is_empty() {
+                    continue; // single-message payloads stay one-hop
+                }
+                if stream_objects >= limits.max_records {
+                    break;
+                }
+                let mut meta = BTreeMap::new();
+                meta.insert("query".to_string(), query.clone());
+                meta.insert("messages".to_string(), msgs.to_string());
+                meta.insert("size".to_string(), data.len().to_string());
+                packets.push(crate::handlers::net::owned_child(
+                    RelationKind::ReconstructedFrom,
+                    format!(
+                        "DNS channel aggregate {} ({} messages, {} bytes)",
+                        query,
+                        msgs,
+                        data.len()
+                    ),
+                    "raw",
+                    data.clone(),
+                    meta,
+                ));
+                stream_objects += 1;
+                if let Some((codec, decoded)) = crate::handlers::net::decode_channel(data) {
+                    if stream_objects >= limits.max_records {
+                        break;
+                    }
+                    let mut dmeta = BTreeMap::new();
+                    dmeta.insert("codec".to_string(), codec.to_string());
+                    dmeta.insert("query".to_string(), query.clone());
+                    dmeta.insert("messages".to_string(), msgs.to_string());
+                    dmeta.insert("size".to_string(), decoded.len().to_string());
+                    packets.push(crate::handlers::net::owned_child(
+                        RelationKind::ReconstructedFrom,
+                        format!(
+                            "Decoded {} payload from DNS channel aggregate ({} bytes)",
+                            codec,
+                            decoded.len()
+                        ),
+                        "raw",
+                        decoded,
+                        dmeta,
+                    ));
+                    stream_objects += 1;
+                }
+            }
             let text = hid.text();
             if hid_hits > 0 && !text.is_empty() {
                 let mut meta = BTreeMap::new();

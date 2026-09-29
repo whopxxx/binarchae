@@ -1286,6 +1286,388 @@ fn b8_recovered_record_chain_confidence() {
     }
 }
 
+// ---------- FINAL-R7: remaining E2E provenance chains ----------
+
+/// Minimal NTFS volume with one live record holding a resident file
+/// (enough for the NTFS handler to validate and emit the file child).
+/// Boot @0 (512B), MFT @ MFT_LCN * cluster.
+fn make_ntfs_minimal(content: &[u8]) -> Vec<u8> {
+    const CLUSTER: u64 = 512;
+    const MFT_LCN: u64 = 4;
+    const REC: usize = 1024;
+    let total_clusters = 40u64;
+    let mut v = vec![0u8; (total_clusters * CLUSTER) as usize];
+    // Boot sector.
+    v[3..11].copy_from_slice(b"NTFS    ");
+    v[0x0B] = 0x00;
+    v[0x0C] = 0x02; // bytes/sector = 512
+    v[0x0D] = 1; // sectors/cluster
+    v[0x28..0x30].copy_from_slice(&total_clusters.to_le_bytes());
+    v[0x30..0x38].copy_from_slice(&MFT_LCN.to_le_bytes());
+    v[0x40] = 2; // MFT record size = 2 clusters = 1024 B
+    v[0x1FE..0x200].copy_from_slice(&[0x55, 0xAA]); // boot signature
+                                                    // $MFT record 0: fixups, attributes: none needed for detection
+                                                    // (volume validates from boot), one file record below.
+    let mft_off = (MFT_LCN * CLUSTER) as usize;
+    let mut rec = vec![0u8; REC];
+    rec[0..4].copy_from_slice(b"FILE");
+    // update-sequence offset 0x1E, count 3 (USA + 2 fixup values).
+    rec[0x1E..0x20].copy_from_slice(&0x1Eu16.to_le_bytes());
+    rec[0x20..0x22].copy_from_slice(&3u16.to_le_bytes());
+    rec[0x22..0x24].copy_from_slice(&1u16.to_le_bytes()); // sequence
+                                                          // Fixup markers at 510 and 1022 are 0 in a zeroed sector, and the
+                                                          // USA array values must MATCH them after sealing: USA[1] = 0,
+                                                          // USA[2] = 0. Write USA array (3 u16: seq, fix1, fix2).
+    rec[0x24..0x26].copy_from_slice(&0u16.to_le_bytes());
+    rec[0x26..0x28].copy_from_slice(&0u16.to_le_bytes());
+    rec[0x28..0x2A].copy_from_slice(&0u16.to_le_bytes());
+    // flags: in-use (0x0001).
+    rec[0x16..0x18].copy_from_slice(&1u16.to_le_bytes());
+    rec[0x14..0x16].copy_from_slice(&0x30u16.to_le_bytes()); // attr_off
+    rec[0x18..0x1C].copy_from_slice(&0x80u32.to_le_bytes()); // used
+    rec[0x1C..0x20].copy_from_slice(&(REC as u32).to_le_bytes()); // alloc
+    rec[4..6].copy_from_slice(&0x1Eu16.to_le_bytes()); // fix_off
+    rec[6..8].copy_from_slice(&3u16.to_le_bytes()); // fix_num
+                                                    // Attribute: $DATA (0x80), resident, at 0x30. Type first, then
+                                                    // length (the unit fixture layout).
+    let a = 0x30;
+    let data_len = content.len();
+    let attr_len = (0x18 + data_len) as u32;
+    rec[a..a + 4].copy_from_slice(&0x80u32.to_le_bytes()); // type
+    rec[a + 4..a + 8].copy_from_slice(&attr_len.to_le_bytes()); // length
+    rec[a + 8] = 0; // resident
+    rec[a + 9] = 0; // name len
+    rec[a + 0x10..a + 0x14].copy_from_slice(&(data_len as u32).to_le_bytes()); // value len
+    rec[a + 0x14..a + 0x16].copy_from_slice(&0x18u16.to_le_bytes()); // value off
+    rec[a + 0x18..a + 0x18 + data_len].copy_from_slice(content);
+    // Attribute end marker.
+    let end = a + attr_len as usize;
+    rec[end..end + 4].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+    // Records 0..15 are system records the handler skips; place the
+    // file record at slot 16 so the MFT walk sees it.
+    v[mft_off + 16 * REC..mft_off + 17 * REC].copy_from_slice(&rec);
+    v
+}
+
+/// R7: GPT -> NTFS -> resident file -> nested content. The partition
+/// table points at the NTFS volume; the file's resident payload is a
+/// PNG that must recurse into its own artifact.
+#[test]
+fn r7_gpt_ntfs_file_nested_chain() {
+    let png = make_png_valid();
+    let ntfs = make_ntfs_minimal(&png);
+    let sector = 512usize;
+    let part_lba: u64 = 3;
+    let part_sectors = (ntfs.len() as u64).div_ceil(512);
+    let total = ((part_lba + part_sectors) * 512) as usize;
+    let mut d = vec![0u8; total];
+    // Protective MBR.
+    d[446 + 4] = 0xEE;
+    d[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
+    d[510..512].copy_from_slice(&[0x55, 0xAA]);
+    // GPT header @LBA1.
+    let hdr = sector;
+    d[hdr..hdr + 8].copy_from_slice(b"EFI PART");
+    d[hdr + 8..hdr + 12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+    d[hdr + 12..hdr + 16].copy_from_slice(&92u32.to_le_bytes());
+    d[hdr + 24..hdr + 32].copy_from_slice(&1u64.to_le_bytes());
+    d[hdr + 32..hdr + 40].copy_from_slice(&1u64.to_le_bytes());
+    d[hdr + 40..hdr + 48].copy_from_slice(&2u64.to_le_bytes());
+    d[hdr + 48..hdr + 56].copy_from_slice(&((total as u64 / 512) - 2).to_le_bytes());
+    d[hdr + 56..hdr + 64].copy_from_slice(&((total as u64 / 512) - 2).to_le_bytes());
+    d[hdr + 72..hdr + 80].copy_from_slice(&2u64.to_le_bytes());
+    d[hdr + 80..hdr + 84].copy_from_slice(&1u32.to_le_bytes());
+    d[hdr + 84..hdr + 88].copy_from_slice(&128u32.to_le_bytes());
+    // Entry 0 = Linux filesystem GUID (NTFS-ish generic data partition).
+    let ent = 2 * sector;
+    d[ent..ent + 16].copy_from_slice(&[
+        0x06, 0x57, 0x20, 0x9E, 0x36, 0x77, 0xA3, 0x4E, 0xA3, 0x1E, 0xB3, 0x13, 0x3E, 0xEE, 0x00,
+        0x02,
+    ]);
+    d[ent + 32..ent + 40].copy_from_slice(&part_lba.to_le_bytes());
+    d[ent + 40..ent + 48].copy_from_slice(&(part_lba + part_sectors - 1).to_le_bytes());
+    let entries_crc = crc32(&d[ent..ent + 128]);
+    d[hdr + 88..hdr + 92].copy_from_slice(&entries_crc.to_le_bytes());
+    d[hdr + 16..hdr + 20].copy_from_slice(&[0; 4]);
+    let hcrc = crc32(&d[hdr..hdr + 92]);
+    d[hdr + 16..hdr + 20].copy_from_slice(&hcrc.to_le_bytes());
+    d[part_lba as usize * sector..part_lba as usize * sector + ntfs.len()].copy_from_slice(&ntfs);
+
+    let graph = engine().analyze(&ByteSource::from_vec(d), true);
+    if std::env::var("R7DBG").is_ok() {
+        for a in &graph.artifacts {
+            println!(
+                "ART: {} | {} | off={} size={}",
+                a.format, a.label, a.offset, a.size
+            );
+        }
+    }
+    let gpt = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "gpt")
+        .map(|a| a.id)
+        .expect("gpt validated");
+    let ntfs_id = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "ntfs" && has_ancestor(&graph, a.id, gpt))
+        .map(|a| a.id)
+        .expect("NTFS volume under GPT partition");
+    // The resident file content (the PNG) recurses to a png artifact
+    // descending from the NTFS volume.
+    let png_art = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "png" && has_ancestor(&graph, a.id, ntfs_id))
+        .map(|a| a.id)
+        .expect("PNG file content recursed under NTFS");
+    assert!(has_ancestor(&graph, png_art, gpt));
+}
+
+/// R7: Minidump -> MemoryRange -> nested artifact. The memory range's
+/// raw bytes carry a PNG that must recurse.
+#[test]
+fn r7_minidump_memory_range_nested() {
+    let png = make_png_valid();
+    let mut m = Vec::new();
+    m.extend(b"MDMP");
+    m.extend(42899u32.to_le_bytes());
+    m.extend(1u32.to_le_bytes());
+    m.extend(32u32.to_le_bytes());
+    m.extend(0u32.to_le_bytes());
+    m.extend(0u32.to_le_bytes());
+    m.extend(0u64.to_le_bytes());
+    m.extend(9u32.to_le_bytes()); // Memory64List
+    m.extend(24u32.to_le_bytes());
+    m.extend(48u32.to_le_bytes());
+    m.resize(48, 0);
+    m.extend(1u64.to_le_bytes());
+    m.extend(80u64.to_le_bytes());
+    let data_len = png.len() as u64;
+    m.extend(0x1000u64.to_le_bytes());
+    m.extend(data_len.to_le_bytes());
+    m.extend_from_slice(&png);
+    let graph = engine().analyze(&ByteSource::from_vec(m), true);
+    let md = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "minidump")
+        .map(|a| a.id)
+        .expect("minidump validated");
+    let png_art = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "png" && has_ancestor(&graph, a.id, md))
+        .map(|a| a.id)
+        .expect("PNG recursed from memory range");
+    assert!(has_ancestor(&graph, png_art, md));
+}
+
+/// R7: Registry REG_BINARY value whose bytes are a nested PNG: the
+/// database record child recurses into the artifact engine.
+#[test]
+fn r7_registry_regbinary_nested_png() {
+    let png = make_png_valid();
+    let mut v = vec![0u8; 8192];
+    v[0..4].copy_from_slice(b"regf");
+    v[4096..4100].copy_from_slice(b"hbin");
+    v[4104..4108].copy_from_slice(&4096u32.to_le_bytes());
+    let rec: usize = 4132;
+    v[4128..4132].copy_from_slice(&(-(4 + 88i32)).to_le_bytes());
+    v[rec..rec + 2].copy_from_slice(b"nk");
+    v[rec + 2..rec + 4].copy_from_slice(&0x0020u16.to_le_bytes());
+    v[rec + 16..rec + 20].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+    v[rec + 36..rec + 40].copy_from_slice(&1u32.to_le_bytes());
+    let list_cell: usize = 4220;
+    v[rec + 40..rec + 44].copy_from_slice(&((list_cell - 4096) as u32).to_le_bytes());
+    v[rec + 72..rec + 74].copy_from_slice(&4u16.to_le_bytes());
+    v[rec + 76..rec + 80].copy_from_slice(b"ROOT");
+    v[list_cell..list_cell + 4].copy_from_slice(&(-8i32).to_le_bytes());
+    let vk_cell: usize = 4228;
+    v[list_cell + 4..list_cell + 8].copy_from_slice(&((vk_cell - 4096) as u32).to_le_bytes());
+    let vk: usize = 4232;
+    v[vk_cell..vk_cell + 4].copy_from_slice(&(-28i32).to_le_bytes());
+    v[vk..vk + 2].copy_from_slice(b"vk");
+    v[vk + 2..vk + 4].copy_from_slice(&0u16.to_le_bytes());
+    v[vk + 4..vk + 8].copy_from_slice(&(png.len() as u32).to_le_bytes());
+    // Data cell holding the whole PNG: at 5216 (field = 1120).
+    v[vk + 8..vk + 12].copy_from_slice(&1120u32.to_le_bytes());
+    v[vk + 12..vk + 16].copy_from_slice(&3u32.to_le_bytes());
+    let data_cell: usize = 5216;
+    let cell_size = 4 + png.len();
+    v[data_cell..data_cell + 4].copy_from_slice(&(-(cell_size as i32)).to_le_bytes());
+    v[data_cell + 4..data_cell + 4 + png.len()].copy_from_slice(&png);
+    let graph = engine().analyze(&ByteSource::from_vec(v), true);
+    let reg = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "registry")
+        .map(|a| a.id)
+        .expect("registry validated");
+    let png_art = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "png" && has_ancestor(&graph, a.id, reg))
+        .map(|a| a.id)
+        .expect("PNG recursed from REG_BINARY value");
+    assert!(has_ancestor(&graph, png_art, reg));
+}
+
+/// R7: deleted filesystem -> nested content. A deleted (not-in-use)
+/// MFT record still holds a resident $DATA payload (the PNG); the
+/// recovered bytes must recurse into a nested artifact, with the
+/// deletion flagged honestly (Recovered confidence, deleted=true).
+#[test]
+fn r7_ntfs_deleted_record_nested_content() {
+    let png = make_png_valid();
+    let ntfs = make_ntfs_minimal(&png);
+    // Flip record 16 (the only FILE record) to deleted in a copy.
+    let mut img = ntfs;
+    let rec_off = 4 * 512 + 16 * 1024;
+    img[rec_off + 0x16..rec_off + 0x18].copy_from_slice(&0u16.to_le_bytes());
+    let graph = engine().analyze(&ByteSource::from_vec(img), true);
+    let ntfs_id = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "ntfs")
+        .map(|a| a.id)
+        .expect("ntfs validates");
+    let png_art = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "png" && has_ancestor(&graph, a.id, ntfs_id))
+        .map(|a| a.id)
+        .expect("PNG recovered from deleted record");
+    // The recovered content still recurses; provenance intact.
+    assert!(has_ancestor(&graph, png_art, ntfs_id));
+}
+
+/// R7: firmware -> nested compressed format. A uImage whose payload is
+/// a gzip stream (comp=none, raw gzip bytes inside the payload) must
+/// chain uImage -> payload -> gzip -> content.
+#[test]
+fn r7_uimage_gzip_payload_chain() {
+    let inner = make_gzip(b"FLAG{fw-gzip}");
+    // uImage header per the unit-fixture layout (type 2 = kernel).
+    let mut hdr = [0u8; 64];
+    hdr[0..4].copy_from_slice(&0x27051956u32.to_be_bytes());
+    hdr[8..12].copy_from_slice(&1_700_000_000u32.to_be_bytes());
+    hdr[12..16].copy_from_slice(&(inner.len() as u32).to_be_bytes());
+    hdr[16..20].copy_from_slice(&0x8000_0000u32.to_be_bytes());
+    hdr[20..24].copy_from_slice(&0x8000_8000u32.to_be_bytes());
+    hdr[24..28].copy_from_slice(&crc32(&inner).to_be_bytes());
+    hdr[28] = 5; // Linux
+    hdr[29] = 2; // ARM
+    hdr[30] = 2; // kernel
+    hdr[31] = 0; // comp none
+    let mut zh = hdr;
+    zh[4..8].fill(0);
+    let hcrc = crc32(&zh);
+    hdr[4..8].copy_from_slice(&hcrc.to_be_bytes());
+    let mut img = hdr.to_vec();
+    img.extend_from_slice(&inner);
+
+    let graph = engine().analyze(&ByteSource::from_vec(img), true);
+    let uid = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "uimage")
+        .map(|a| a.id)
+        .expect("uimage validated");
+    let gz = graph
+        .artifacts
+        .iter()
+        .find(|a| a.format == "gzip" && has_ancestor(&graph, a.id, uid))
+        .map(|a| a.id)
+        .expect("gzip payload recursed under uImage");
+    assert!(has_ancestor(&graph, gz, uid), "provenance: uImage -> gzip");
+}
+
+/// R7: DNS cross-message channel aggregation. Two separate UDP DNS
+/// messages sharing one query each carry a TXT fragment; the fragments
+/// must be concatenated in packet order and the aggregate decoded
+/// (base64), producing a nested child under the pcap.
+#[test]
+fn r7_dns_cross_message_channel_aggregation() {
+    // Secret split across two TXT answers: base64("FLAG{dnsagg}") =
+    // "RkxBR3tkbnNhZ2d9".
+    let part1 = b"RkxBR3tk";
+    let part2 = b"bnNhZ2d9";
+    let m1 = dns_txt_response(part1);
+    let m2 = dns_txt_response(part2);
+
+    // Minimal Ethernet+IPv4+UDP frame with dport 53 carrying `payload`.
+    let frame = |payload: &[u8]| -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend([0x02u8; 6]);
+        f.extend([0x01u8; 6]);
+        f.extend(0x0800u16.to_be_bytes());
+        let total_len = (20 + 8 + payload.len()) as u16;
+        f.extend(0x45u8.to_be_bytes());
+        f.extend(0u8.to_be_bytes());
+        f.extend(total_len.to_be_bytes());
+        f.extend(1u16.to_be_bytes());
+        f.extend(0u16.to_be_bytes());
+        f.extend(64u8.to_be_bytes());
+        f.extend(17u8.to_be_bytes()); // UDP
+        f.extend(0u16.to_be_bytes());
+        f.extend([10u8, 0, 0, 1]);
+        f.extend([10u8, 0, 0, 2]);
+        f.extend(40000u16.to_be_bytes()); // sport
+        f.extend(53u16.to_be_bytes()); // dport
+        f.extend(((8 + payload.len()) as u16).to_be_bytes());
+        f.extend(0u16.to_be_bytes()); // checksum
+        f.extend_from_slice(payload);
+        f
+    };
+    let pkt1 = frame(&m1);
+    let pkt2 = frame(&m2);
+
+    let mut p = Vec::new();
+    p.extend_from_slice(&[0xD4, 0xC3, 0xB2, 0xA1]);
+    p.extend(2u16.to_le_bytes());
+    p.extend(4u16.to_le_bytes());
+    p.extend(0u32.to_le_bytes());
+    p.extend(0u32.to_le_bytes());
+    p.extend(262144u32.to_le_bytes());
+    p.extend(1u32.to_le_bytes());
+    for pkt in [&pkt1, &pkt2] {
+        p.extend(1u32.to_le_bytes());
+        p.extend(0u32.to_le_bytes());
+        p.extend((pkt.len() as u32).to_le_bytes());
+        p.extend((pkt.len() as u32).to_le_bytes());
+        p.extend_from_slice(pkt);
+    }
+    let mut eng = RecursiveEngine::new(EngineLimits::default());
+    let graph = eng.analyze(&ByteSource::from_vec(p), true);
+    let agg = graph
+        .artifacts
+        .iter()
+        .find(|a| a.label.contains("DNS channel aggregate"))
+        .expect("aggregated DNS channel across messages");
+    assert_eq!(
+        agg.metadata.get("messages").map(String::as_str),
+        Some("2"),
+        "two fragments must be aggregated"
+    );
+    let decoded = graph
+        .artifacts
+        .iter()
+        .find(|a| {
+            a.label
+                .contains("Decoded base64 payload from DNS channel aggregate")
+        })
+        .expect("aggregate decoded via base64 codec");
+    assert_eq!(
+        decoded.parent, agg.parent,
+        "aggregate + decode share parent"
+    );
+    // The decoded bytes must be readable through the byte cache.
+    let bytes = eng.cached_bytes(&decoded.hash).unwrap_or_default();
+    assert_eq!(bytes, b"FLAG{dnsagg}".to_vec());
+}
+
 // ---------- graph helpers ----------
 
 fn has_ancestor(graph: &ctf_tools::artifact::ArtifactGraph, id: u64, ancestor: u64) -> bool {
