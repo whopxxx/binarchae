@@ -1,4 +1,4 @@
-//! ctf-tools: CTF-first binary analysis and extraction engine.
+//! binarchae: CTF-first binary analysis and extraction engine.
 //!
 //! Core invariant: every useful thing discovered from input data is an
 //! [`Artifact`], and every parser/extractor exists to discover additional

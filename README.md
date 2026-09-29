@@ -1,6 +1,6 @@
-# ctf-tools
+# binarchae
 
-CTF-first binary analysis and extraction tool in Rust.
+Recursive binary archaeology for extraction, recovery, and artifact analysis in Rust.
 
 Core invariant: **every useful thing discovered from input data is an
 Artifact, and every parser/extractor exists to discover additional
@@ -17,35 +17,35 @@ of CTF binary challenges.
 Requires a current stable Rust toolchain.
 
 ```bash
-git clone https://github.com/whopxxx/ctf-tools
-cd ctf-tools
+git clone https://github.com/whopxxx/binarchae
+cd binarchae
 cargo build --release
-# binary at target/release/ctf-tools
+# binary at target/release/binarchae
 ```
 
 ## CLI examples
 
 ```bash
 # Analyze and print a compact artifact tree
-ctf-tools file.bin
+binarchae file.bin
 
 # Materialize recoverable/extractable artifacts under file.bin.extracted/
-ctf-tools -e file.bin
+binarchae -e file.bin
 
 # Recursively analyze child artifacts
-ctf-tools -r file.bin
+binarchae -r file.bin
 
 # Recursive analysis + extraction
-ctf-tools -er file.bin
+binarchae -er file.bin
 
 # Stable JSON output (graph with IDs, provenance, offsets, hashes, evidence)
-ctf-tools --json file.bin
+binarchae --json file.bin
 
 # Verbose diagnostics (warnings + evidence facts)
-ctf-tools -v file.bin
+binarchae -v file.bin
 
 # Custom carving rules
-ctf-tools --carving-rules rules.toml file.bin
+binarchae --carving-rules rules.toml file.bin
 ```
 
 Example output on a PNG with an appended ZIP:

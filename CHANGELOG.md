@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to ctf-tools. Format based on
+All notable changes to binarchae. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 `0.x` until the first stable tag.
 

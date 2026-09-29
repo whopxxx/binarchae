@@ -76,4 +76,4 @@ jobs:
       - name: Installed binary analyzes a fixture
         run: |
           printf 'CTF{install-smoke}' > /tmp/fixture.bin
-          ~/.cargo/bin/ctf-tools /tmp/fixture.bin -r
+          ~/.cargo/bin/binarchae /tmp/fixture.bin -r
